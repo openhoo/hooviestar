@@ -1,0 +1,66 @@
+[package]
+name = "hooviestar-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ash = { version = "0.38", default-features = false, features = ["loaded"] }
+ash-window = "0.13"
+ashpd = { version = "0.13.13", default-features = false, features = ["tokio", "screencast", "raw_handle", "wayland"] }
+pipewire = { version = "0.9.2", features = ["v0_3_77"] }
+raw-window-handle = "0.6"
+gstreamer = "=0.25.3"
+gstreamer-app = "=0.25.2"
+gstreamer-video = { version = "=0.25.3", features = ["v1_24"] }
+gstreamer-audio = "=0.25.3"
+gstreamer-allocators = "=0.25.3"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
+fontdue = "0.9"
+fontdb = "0.23"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_Storage_FileSystem"] }
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Foundation_Numerics",
+    "Win32_Security",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Imaging",
+    "Win32_Media_MediaFoundation",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_System_Variant",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics",
+    "Win32_System_WinRT_Graphics_Capture",
+] }
+windows-core = "0.61.2"
+
+windows-numerics = "0.2"
+[dev-dependencies]
+tempfile = "3.21"

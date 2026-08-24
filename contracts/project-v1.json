@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "output": { "width": 1280, "height": 720, "fps": 30, "background": "#101418" },
+  "sources": [
+    { "type": "window", "id": "00000000-0000-4000-8000-000000000001", "name": "Spiel", "binding": { "processPath": "C:\\Games\\game.exe", "windowTitle": "Game" } },
+    { "type": "display", "id": "00000000-0000-4000-8000-000000000002", "name": "Monitor", "binding": { "adapterLuid": "0:1", "outputId": 0 } },
+    { "type": "image", "id": "00000000-0000-4000-8000-000000000003", "name": "Bild", "path": "/tmp/image.png" },
+    { "type": "text", "id": "00000000-0000-4000-8000-000000000004", "name": "Text", "text": "Hallo", "fontFamily": "Inter", "fontSizePx": 32, "fontWeight": 600, "color": "#ffffff", "backgroundColor": "#000000", "align": "center" },
+    { "type": "media", "id": "00000000-0000-4000-8000-000000000005", "name": "Video", "path": "/tmp/video.mp4", "loop": true, "continueWhenHidden": false, "restartOnShow": false, "volume": 1, "muted": false },
+    { "type": "application_audio", "id": "00000000-0000-4000-8000-000000000006", "name": "Audio", "binding": { "processPath": "/usr/bin/game", "sessionGroupingId": "game" }, "volume": 0.5, "muted": false }
+  ],
+  "scenes": [{
+    "id": "00000000-0000-4000-8000-000000000010",
+    "name": "Beides",
+    "hotkey": "Ctrl+Alt+1",
+    "items": [{ "id": "00000000-0000-4000-8000-000000000011", "sourceId": "00000000-0000-4000-8000-000000000001", "visible": true, "locked": false, "transform": { "x": 0, "y": 0, "width": 1280, "height": 720, "rotationDegrees": 0, "cropTop": 0, "cropRight": 0, "cropBottom": 0, "cropLeft": 0, "opacity": 1 } }]
+  }],
+  "activeSceneId": "00000000-0000-4000-8000-000000000010"
+}

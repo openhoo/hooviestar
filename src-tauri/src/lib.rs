@@ -1,0 +1,403 @@
+mod platform;
+
+use std::{
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::{self, JoinHandle},
+    time::Duration,
+};
+
+use hooviestar_engine::{
+    EngineCommand, EngineEvent, EngineHandle, NativeSurfaces, OutputConfig, ProjectV1,
+    SourceEnumeration,
+};
+use platform::NativePreview;
+#[cfg(target_os = "linux")]
+use tauri::WindowEvent;
+use tauri::{AppHandle, Emitter, Manager, RunEvent, State, window::WindowBuilder};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+use uuid::Uuid;
+
+struct AppState {
+    engine: Arc<EngineHandle>,
+    preview: usize,
+    surfaces: NativeSurfaces,
+    hotkey_mutations: Mutex<()>,
+}
+
+struct RuntimeResources {
+    engine: Mutex<Option<Arc<EngineHandle>>>,
+    preview: Mutex<Option<NativePreview>>,
+    event_thread: Mutex<Option<JoinHandle<()>>>,
+    stop_events: Arc<AtomicBool>,
+    cleaned: AtomicBool,
+    portal: platform::PortalResources,
+}
+
+impl RuntimeResources {
+    fn new() -> Self {
+        Self {
+            engine: Mutex::new(None),
+            preview: Mutex::new(None),
+            event_thread: Mutex::new(None),
+            stop_events: Arc::new(AtomicBool::new(false)),
+            cleaned: AtomicBool::new(false),
+            portal: platform::PortalResources::new(),
+        }
+    }
+
+    fn cleanup(&self, app: &AppHandle) {
+        if self.cleaned.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let _ = app.global_shortcut().unregister_all();
+        self.stop_events.store(true, Ordering::Release);
+        if let Some(engine) = self.engine.lock().expect("engine mutex poisoned").take() {
+            let _ = engine.shutdown();
+        }
+        if let Some(thread) = self
+            .event_thread
+            .lock()
+            .expect("event thread mutex poisoned")
+            .take()
+        {
+            let _ = thread.join();
+        }
+        if let Some(preview) = self.preview.lock().expect("preview mutex poisoned").take() {
+            let _ = preview.destroy();
+        }
+        self.portal.clear();
+    }
+}
+
+#[tauri::command]
+fn get_snapshot(state: State<'_, AppState>) -> ProjectV1 {
+    state.inner().engine.snapshot()
+}
+
+#[tauri::command]
+fn dispatch(
+    command: EngineCommand,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    if let EngineCommand::SetSceneHotkey { scene_id, hotkey } = &command {
+        return update_scene_hotkey(
+            &app,
+            state.inner().engine.clone(),
+            &state.inner().hotkey_mutations,
+            *scene_id,
+            hotkey.clone(),
+        );
+    }
+    if let EngineCommand::RemoveScene { scene_id } = &command {
+        let _hotkey_guard = state
+            .inner()
+            .hotkey_mutations
+            .lock()
+            .expect("hotkey mutex poisoned");
+        let shortcut = state
+            .inner()
+            .engine
+            .snapshot()
+            .scenes
+            .into_iter()
+            .find(|scene| scene.id == *scene_id)
+            .and_then(|scene| scene.hotkey);
+        state
+            .inner()
+            .engine
+            .command(command)
+            .map_err(|error| error.to_string())?;
+        if let Some(shortcut) = shortcut {
+            app.global_shortcut()
+                .unregister(shortcut.as_str())
+                .map_err(|error| error.to_string())?;
+        }
+        return Ok(());
+    }
+    state
+        .inner()
+        .engine
+        .command(command)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn engine_status() -> &'static str {
+    "running"
+}
+
+#[tauri::command]
+fn enumerate_sources(state: State<'_, AppState>) -> Result<SourceEnumeration, String> {
+    platform::enumerate_sources(state.inner().surfaces)
+}
+
+#[tauri::command]
+async fn select_portal_sources(
+    resources: State<'_, Arc<RuntimeResources>>,
+) -> Result<SourceEnumeration, String> {
+    resources.inner().portal.select().await
+}
+
+#[tauri::command]
+fn canonicalize_file(path: String) -> Result<String, String> {
+    let canonical = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
+    if !canonical.is_file() {
+        return Err("selected path is not a regular file".into());
+    }
+    canonical
+        .into_os_string()
+        .into_string()
+        .map_err(|_| "selected path is not valid Unicode".to_string())
+}
+
+#[tauri::command]
+fn set_preview_bounds(
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let studio = app
+        .get_webview_window("studio")
+        .ok_or_else(|| "Studio window unavailable".to_string())?;
+    let scale = studio.scale_factor().map_err(|error| error.to_string())?;
+    let physical = |value: f64| (value * scale).round() as i32;
+    platform::set_preview_bounds(
+        state.inner().preview,
+        physical(x),
+        physical(y),
+        physical(width),
+        physical(height),
+    )
+}
+
+pub fn run() {
+    let resources = Arc::new(RuntimeResources::new());
+    let setup_resources = resources.clone();
+    let app = tauri::Builder::default()
+        .manage(resources.clone())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .invoke_handler(tauri::generate_handler![
+            get_snapshot,
+            dispatch,
+            engine_status,
+            enumerate_sources,
+            select_portal_sources,
+            canonicalize_file,
+            set_preview_bounds
+        ])
+        .setup(move |app| {
+            let studio = app
+                .get_webview_window("studio")
+                .ok_or_else(|| "Studio window unavailable".to_string())?;
+            let program = WindowBuilder::new(app, "program")
+                .title("Hooviestar – Program")
+                .inner_size(1280.0, 720.0)
+                .visible(true)
+                .build()
+                .map_err(|error| error.to_string())?;
+            spawn_audio_watchdog()?;
+            let (preview, surfaces) = NativePreview::create(&studio, &program)?;
+            let preview_handle = preview.hwnd();
+            let engine = Arc::new(
+                EngineHandle::start(surfaces, OutputConfig::default())
+                    .map_err(|error| error.to_string())?,
+            );
+            #[cfg(target_os = "linux")]
+            setup_resources.portal.set_link(engine.portal_link());
+            let events = engine.take_events().map_err(|error| error.to_string())?;
+            app.manage(AppState {
+                engine: engine.clone(),
+                preview: preview_handle,
+                surfaces,
+                hotkey_mutations: Mutex::new(()),
+            });
+            register_initial_hotkeys(app.handle(), engine.clone());
+
+            let handle = app.handle().clone();
+            let stop_events = setup_resources.stop_events.clone();
+            let event_thread = thread::Builder::new()
+                .name("engine-events".into())
+                .spawn(move || {
+                    while !stop_events.load(Ordering::Acquire) {
+                        match events.recv_timeout(Duration::from_millis(100)) {
+                            Ok(event) => {
+                                if handle.emit("engine-event", event).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
+                    }
+                })
+                .map_err(|error| error.to_string())?;
+            *setup_resources
+                .engine
+                .lock()
+                .expect("engine mutex poisoned") = Some(engine);
+            *setup_resources
+                .preview
+                .lock()
+                .expect("preview mutex poisoned") = Some(preview);
+            *setup_resources
+                .event_thread
+                .lock()
+                .expect("event thread mutex poisoned") = Some(event_thread);
+            Ok(())
+        })
+        .build(tauri::generate_context!())
+        .expect("Tauri build failed");
+    let app_handle = app.handle().clone();
+    let run_resources = resources.clone();
+    app.run(move |handle, event| match event {
+        RunEvent::ExitRequested { .. } | RunEvent::Exit => run_resources.cleanup(handle),
+        #[cfg(target_os = "linux")]
+        RunEvent::WindowEvent {
+            label,
+            event: WindowEvent::Resized(size),
+            ..
+        } if label == "program" || label == "preview" => {
+            if let Some(state) = handle.try_state::<AppState>() {
+                state
+                    .inner()
+                    .engine
+                    .set_surface_size(&label, size.width, size.height);
+            }
+        }
+        _ => {}
+    });
+    resources.cleanup(&app_handle);
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_audio_watchdog() -> Result<(), String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let journal = hooviestar_engine::audio::journal::default_journal_path()
+        .map_err(|error| error.to_string())?;
+    std::process::Command::new(executable)
+        .arg("--audio-watchdog")
+        .arg(std::process::id().to_string())
+        .arg(journal)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn spawn_audio_watchdog() -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+pub fn run_audio_watchdog(parent_process_id: u32, journal: &std::path::Path) {
+    use windows::Win32::{
+        Foundation::CloseHandle,
+        System::Threading::{INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
+    };
+
+    if let Ok(parent) = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, parent_process_id) } {
+        unsafe { WaitForSingleObject(parent, INFINITE) };
+        let _ = unsafe { CloseHandle(parent) };
+    }
+    let _ = hooviestar_engine::discovery::windows::repair_audio_journal(journal);
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn run_audio_watchdog(_parent_process_id: u32, _journal: &std::path::Path) {}
+
+fn register_initial_hotkeys(app: &AppHandle, engine: Arc<EngineHandle>) {
+    for scene in engine.snapshot().scenes {
+        let Some(shortcut) = scene.hotkey else {
+            continue;
+        };
+        if let Err(error) = register_hotkey(app, engine.clone(), scene.id, &shortcut) {
+            let _ = app.emit(
+                "engine-event",
+                EngineEvent::HotkeyError {
+                    scene_id: scene.id,
+                    message: format!("{shortcut}: {error}"),
+                },
+            );
+        }
+    }
+}
+
+fn update_scene_hotkey(
+    app: &AppHandle,
+    engine: Arc<EngineHandle>,
+    hotkey_mutations: &Mutex<()>,
+    scene_id: Uuid,
+    new_shortcut: Option<String>,
+) -> Result<(), String> {
+    let _hotkey_guard = hotkey_mutations.lock().expect("hotkey mutex poisoned");
+    let old_shortcut = engine
+        .snapshot()
+        .scenes
+        .into_iter()
+        .find(|scene| scene.id == scene_id)
+        .ok_or_else(|| "scene not found".to_string())?
+        .hotkey;
+    if old_shortcut == new_shortcut {
+        return Ok(());
+    }
+
+    if let Some(shortcut) = &new_shortcut
+        && let Err(error) = register_hotkey(app, engine.clone(), scene_id, shortcut)
+    {
+        let message = format!("{shortcut}: {error}");
+        let _ = app.emit(
+            "engine-event",
+            EngineEvent::HotkeyError {
+                scene_id,
+                message: message.clone(),
+            },
+        );
+        return Err(message);
+    }
+    if let Some(shortcut) = &old_shortcut
+        && let Err(error) = app.global_shortcut().unregister(shortcut.as_str())
+    {
+        if let Some(new_shortcut) = &new_shortcut {
+            let _ = app.global_shortcut().unregister(new_shortcut.as_str());
+        }
+        return Err(error.to_string());
+    }
+
+    let command = EngineCommand::SetSceneHotkey {
+        scene_id,
+        hotkey: new_shortcut.clone(),
+    };
+    if let Err(error) = engine.command(command) {
+        if let Some(shortcut) = &new_shortcut {
+            let _ = app.global_shortcut().unregister(shortcut.as_str());
+        }
+        if let Some(shortcut) = &old_shortcut {
+            let _ = register_hotkey(app, engine, scene_id, shortcut);
+        }
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
+fn register_hotkey(
+    app: &AppHandle,
+    engine: Arc<EngineHandle>,
+    scene_id: Uuid,
+    shortcut: &str,
+) -> Result<(), String> {
+    app.global_shortcut()
+        .on_shortcut(shortcut, move |_app, _shortcut, event| {
+            if event.state == ShortcutState::Pressed {
+                let _ = engine.command(EngineCommand::SetActiveScene { scene_id });
+            }
+        })
+        .map_err(|error| error.to_string())
+}

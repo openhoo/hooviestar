@@ -1,0 +1,14 @@
+node_modules/
+dist/
+target/
+.DS_Store
+*.log
+*.pdb
+*.ilk
+*.dSYM/
+src-tauri/gen/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+Thumbs.db
