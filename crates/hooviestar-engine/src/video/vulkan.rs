@@ -40,7 +40,7 @@ use super::{
 use crate::{
     audio::MediaAudioBus,
     engine::{DeviceRecoveryPhase, EngineEvent, NativeSurfaceKind, NativeSurfaces},
-    project::{ProjectV1, Source, Transform},
+    project::{OutputConfig, ProjectV1, Scene, Source, Transform},
 };
 
 const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
@@ -208,6 +208,34 @@ struct StaticCaches {
     static_failures: HashMap<Uuid, String>,
 }
 
+/// Grouped NV12 media sampling state: the shared YCbCr conversion, its
+/// sampler, the dedicated descriptor layout, and the media item pipeline
+/// with its layout and descriptor sets. Destroyed as one unit via
+/// [`MediaYcbcrPipeline::destroy`] from `VulkanCompositor::Drop`; the
+/// `PartialVulkan` staging error path mirrors the same member order.
+struct MediaYcbcrPipeline {
+    sampler: vk::Sampler,
+    conversion: vk::SamplerYcbcrConversion,
+    sampler_layout: vk::DescriptorSetLayout,
+    item_descriptors: Vec<vk::DescriptorSet>,
+    item_pipeline: vk::Pipeline,
+    item_pipeline_layout: vk::PipelineLayout,
+}
+
+impl MediaYcbcrPipeline {
+    /// Destroys the group (descriptor sets are freed with the descriptor
+    /// pool, which is destroyed separately).
+    fn destroy(&self, device: &Device) {
+        unsafe {
+            device.destroy_pipeline(self.item_pipeline, None);
+            device.destroy_pipeline_layout(self.item_pipeline_layout, None);
+            device.destroy_sampler(self.sampler, None);
+            device.destroy_sampler_ycbcr_conversion(self.conversion, None);
+            device.destroy_descriptor_set_layout(self.sampler_layout, None);
+        }
+    }
+}
+
 struct VulkanCompositor {
     // Keeps the dynamically loaded Vulkan loader alive for every dispatch table.
     _entry: Entry,
@@ -243,16 +271,25 @@ struct VulkanCompositor {
     /// non-YCbCr so portal/static/placeholder views keep using it
     /// (VUID-VkWriteDescriptorSet-01948: view and immutable-sampler
     /// conversions must match).
-    media_sampler: vk::Sampler,
-    media_conversion: vk::SamplerYcbcrConversion,
-    media_sampler_layout: vk::DescriptorSetLayout,
-    media_item_descriptors: Vec<vk::DescriptorSet>,
-    media_item_pipeline: vk::Pipeline,
-    media_item_pipeline_layout: vk::PipelineLayout,
+    media_ycbcr: MediaYcbcrPipeline,
     program: SwapchainTarget,
     preview: SwapchainTarget,
     output_width: u32,
     output_height: u32,
+}
+
+/// Owned core handles produced by [`PartialVulkan::build_core`] and consumed
+/// by [`PartialVulkan::build_scene_pipeline`]. The staging slots in
+/// `PartialVulkan` keep independent clones for the error path.
+struct VulkanCore {
+    instance: Instance,
+    surface_loader: khr::surface::Instance,
+    physical: vk::PhysicalDevice,
+    device: Device,
+    queue: vk::Queue,
+    command_pool: vk::CommandPool,
+    program_surface: vk::SurfaceKHR,
+    preview_surface: vk::SurfaceKHR,
 }
 
 /// Staging state for [`VulkanCompositor::create`]. Every fallible step registers
@@ -330,6 +367,17 @@ impl PartialVulkan {
 
     fn build(&mut self, surfaces: NativeSurfaces, width: u32, height: u32) -> Result<(), String> {
         let (display, program_window, preview_window) = raw_handles(surfaces)?;
+        let core = self.build_core(display, program_window, preview_window)?;
+        self.build_scene_pipeline(&core, surfaces, width, height)?;
+        Ok(())
+    }
+
+    fn build_core(
+        &mut self,
+        display: RawDisplayHandle,
+        program_window: RawWindowHandle,
+        preview_window: RawWindowHandle,
+    ) -> Result<VulkanCore, String> {
         let entry = unsafe { Entry::load() }.map_err(|error| format!("load Vulkan: {error}"))?;
         let app_name = CString::new("Hooviestar").map_err(|error| error.to_string())?;
         let app = vk::ApplicationInfo::default()
@@ -389,7 +437,7 @@ impl PartialVulkan {
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
         self.queue = queue;
         let external_memory_fd = khr::external_memory_fd::Device::new(&instance, &device);
-        self.external_memory_fd = Some(external_memory_fd);
+        self.external_memory_fd = Some(external_memory_fd.clone());
         let command_pool = unsafe {
             device.create_command_pool(
                 &vk::CommandPoolCreateInfo::default()
@@ -420,9 +468,36 @@ impl PartialVulkan {
         }
         .map_err(|error| format!("frame fence: {error}"))?;
         self.frame_fence = Some(frame_fence);
+        Ok(VulkanCore {
+            instance,
+            surface_loader,
+            physical,
+            device,
+            queue,
+            command_pool,
+            program_surface,
+            preview_surface,
+        })
+    }
+
+    fn build_scene_pipeline(
+        &mut self,
+        core: &VulkanCore,
+        surfaces: NativeSurfaces,
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
+        let instance = &core.instance;
+        let device = &core.device;
+        let physical = core.physical;
+        let queue = core.queue;
+        let command_pool = core.command_pool;
+        let surface_loader = &core.surface_loader;
+        let program_surface = core.program_surface;
+        let preview_surface = core.preview_surface;
         let placeholder = upload_rgba_texture(
-            &instance,
-            &device,
+            instance,
+            device,
             physical,
             queue,
             command_pool,
@@ -532,42 +607,35 @@ impl PartialVulkan {
         }
         .map_err(|error| format!("media descriptor sets: {error}"))?;
         self.media_item_descriptors = media_sets;
-        let scene_sampler = create_sampler(&device)?;
+        let scene_sampler = create_sampler(device)?;
         self.scene_sampler = Some(scene_sampler);
-        let item_sampler = create_sampler(&device)?;
+        let item_sampler = create_sampler(device)?;
         self.item_sampler = Some(item_sampler);
-        let scene_render_pass = create_render_pass(&device, vk::Format::R16G16B16A16_SFLOAT)?;
-        let scene = create_scene_target(
-            &instance,
-            &device,
-            physical,
-            scene_render_pass,
-            width,
-            height,
-        )?;
+        let scene_render_pass = create_render_pass(device, vk::Format::R16G16B16A16_SFLOAT)?;
+        let scene =
+            create_scene_target(instance, device, physical, scene_render_pass, width, height)?;
         update_descriptor(
-            &device,
+            device,
             scene_descriptor,
             scene.view,
             scene_sampler,
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         );
         self.scene = Some(scene);
-        let item_pipeline_layout = create_item_pipeline_layout(&device, sampler_layout)?;
+        let item_pipeline_layout = create_item_pipeline_layout(device, sampler_layout)?;
         self.item_pipeline_layout = Some(item_pipeline_layout);
-        let item_pipeline = create_item_pipeline(&device, scene_render_pass, item_pipeline_layout)?;
+        let item_pipeline = create_item_pipeline(device, scene_render_pass, item_pipeline_layout)?;
         self.item_pipeline = Some(item_pipeline);
-        let media_item_pipeline_layout =
-            create_item_pipeline_layout(&device, media_sampler_layout)?;
+        let media_item_pipeline_layout = create_item_pipeline_layout(device, media_sampler_layout)?;
         self.media_item_pipeline_layout = Some(media_item_pipeline_layout);
         let media_item_pipeline =
-            create_item_pipeline(&device, scene_render_pass, media_item_pipeline_layout)?;
+            create_item_pipeline(device, scene_render_pass, media_item_pipeline_layout)?;
         self.media_item_pipeline = Some(media_item_pipeline);
         let program = create_swapchain(
-            &instance,
-            &device,
+            instance,
+            device,
             physical,
-            &surface_loader,
+            surface_loader,
             program_surface,
             surfaces.program_width.max(1),
             surfaces.program_height.max(1),
@@ -578,10 +646,10 @@ impl PartialVulkan {
         // The swapchain target adopted the surface; drop our tracking entry.
         self.program_surface = None;
         let preview = create_swapchain(
-            &instance,
-            &device,
+            instance,
+            device,
             physical,
-            &surface_loader,
+            surface_loader,
             preview_surface,
             surfaces.preview_width.max(1),
             surfaces.preview_height.max(1),
@@ -626,24 +694,26 @@ impl PartialVulkan {
                 .item_pipeline_layout
                 .take()
                 .expect("item pipeline layout built"),
-            media_sampler: self.media_sampler.take().expect("media sampler built"),
-            media_conversion: self
-                .media_conversion
-                .take()
-                .expect("media YCbCr conversion built"),
-            media_sampler_layout: self
-                .media_sampler_layout
-                .take()
-                .expect("media sampler layout built"),
-            media_item_descriptors: std::mem::take(&mut self.media_item_descriptors),
-            media_item_pipeline: self
-                .media_item_pipeline
-                .take()
-                .expect("media item pipeline built"),
-            media_item_pipeline_layout: self
-                .media_item_pipeline_layout
-                .take()
-                .expect("media item pipeline layout built"),
+            media_ycbcr: MediaYcbcrPipeline {
+                sampler: self.media_sampler.take().expect("media sampler built"),
+                conversion: self
+                    .media_conversion
+                    .take()
+                    .expect("media YCbCr conversion built"),
+                sampler_layout: self
+                    .media_sampler_layout
+                    .take()
+                    .expect("media sampler layout built"),
+                item_descriptors: std::mem::take(&mut self.media_item_descriptors),
+                item_pipeline: self
+                    .media_item_pipeline
+                    .take()
+                    .expect("media item pipeline built"),
+                item_pipeline_layout: self
+                    .media_item_pipeline_layout
+                    .take()
+                    .expect("media item pipeline layout built"),
+            },
             program: self.program.take().expect("program swapchain built"),
             preview: self.preview.take().expect("preview swapchain built"),
             output_width: width,
@@ -677,11 +747,22 @@ impl PartialVulkan {
                 if let Some(layout) = self.item_pipeline_layout.take() {
                     device.destroy_pipeline_layout(layout, None);
                 }
+                // Mirror of `MediaYcbcrPipeline::destroy`: the media group's
+                // members, in the same order, on partially built state.
                 if let Some(pipeline) = self.media_item_pipeline.take() {
                     device.destroy_pipeline(pipeline, None);
                 }
                 if let Some(layout) = self.media_item_pipeline_layout.take() {
                     device.destroy_pipeline_layout(layout, None);
+                }
+                if let Some(sampler) = self.media_sampler.take() {
+                    device.destroy_sampler(sampler, None);
+                }
+                if let Some(conversion) = self.media_conversion.take() {
+                    device.destroy_sampler_ycbcr_conversion(conversion, None);
+                }
+                if let Some(layout) = self.media_sampler_layout.take() {
+                    device.destroy_descriptor_set_layout(layout, None);
                 }
                 if let Some(mut scene) = self.scene.take() {
                     destroy_scene(&device, &mut scene);
@@ -692,19 +773,10 @@ impl PartialVulkan {
                 if let Some(sampler) = self.item_sampler.take() {
                     device.destroy_sampler(sampler, None);
                 }
-                if let Some(conversion) = self.media_conversion.take() {
-                    device.destroy_sampler_ycbcr_conversion(conversion, None);
-                }
-                if let Some(sampler) = self.media_sampler.take() {
-                    device.destroy_sampler(sampler, None);
-                }
                 if let Some(pool) = self.descriptor_pool.take() {
                     device.destroy_descriptor_pool(pool, None);
                 }
                 if let Some(layout) = self.sampler_layout.take() {
-                    device.destroy_descriptor_set_layout(layout, None);
-                }
-                if let Some(layout) = self.media_sampler_layout.take() {
                     device.destroy_descriptor_set_layout(layout, None);
                 }
                 if let Some(pool) = self.command_pool.take() {
@@ -1084,7 +1156,7 @@ impl VulkanCompositor {
                 &self.device,
                 &self.external_memory_fd,
                 self.physical,
-                self.media_conversion,
+                self.media_ycbcr.conversion,
                 frame,
             ) {
                 Ok(texture) => {
@@ -1240,6 +1312,87 @@ impl VulkanCompositor {
         self.synchronize_portal_textures(frames, import_failures, events);
         self.synchronize_media_textures(media_frames, import_failures, events);
         self.synchronize_static_textures(caches, project, events);
+        let (external_images, external_count) = self.collect_external_images(scene);
+        unsafe {
+            // Acquire both swapchain images before resetting the fence: a
+            // timeout skip then leaves the fence signaled and no semaphores
+            // pending, so the next frame stays in sync.
+            program_index = acquire(&self.program)?;
+            preview_index = match acquire(&self.preview) {
+                Ok(index) => index,
+                Err(RenderError::AcquireTimeout) => {
+                    return self.handle_acquire_timeout(program_index);
+                }
+                Err(other) => return Err(other),
+            };
+            self.device
+                .reset_fences(&[self.frame_fence])
+                .map_err(RenderError::Vk)?;
+            self.device
+                .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())
+                .map_err(RenderError::Vk)?;
+            self.device
+                .begin_command_buffer(self.command_buffer, &vk::CommandBufferBeginInfo::default())
+                .map_err(RenderError::Vk)?;
+            self.record_item_pass(scene, project, &external_images, external_count);
+            self.record_composite_passes(program_index, preview_index);
+            self.device
+                .end_command_buffer(self.command_buffer)
+                .map_err(RenderError::Vk)?;
+            let waits = [self.program.available, self.preview.available];
+            let stages = [
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            ];
+            let signals = [
+                self.program.rendered[program_index as usize],
+                self.preview.rendered[preview_index as usize],
+            ];
+            self.device
+                .queue_submit(
+                    self.queue,
+                    &[vk::SubmitInfo::default()
+                        .wait_semaphores(&waits)
+                        .wait_dst_stage_mask(&stages)
+                        .command_buffers(&[self.command_buffer])
+                        .signal_semaphores(&signals)],
+                    self.frame_fence,
+                )
+                .map_err(RenderError::Vk)?;
+            // The first-acquire barriers live only in this command
+            // buffer; commit the flags only after the submit succeeded so
+            // an acquire timeout or earlier failure makes the next frame
+            // re-issue the UNDEFINED -> SHADER_READ_ONLY transition.
+            for external in &external_images[..external_count] {
+                if !external.first_acquire {
+                    continue;
+                }
+                for cached in self
+                    .portal_textures
+                    .values_mut()
+                    .chain(self.media_textures.values_mut())
+                {
+                    if cached.texture.image == external.image {
+                        cached.acquired = true;
+                    }
+                }
+            }
+        }
+        present(&self.program, self.queue, program_index)?;
+        present(&self.preview, self.queue, preview_index)?;
+        unsafe {
+            self.device
+                .wait_for_fences(&[self.frame_fence], true, u64::MAX)
+                .map_err(RenderError::Vk)?;
+        }
+        Ok(())
+    }
+    /// Pure-move extraction of the external-image ownership-range collection
+    /// from `render`.
+    fn collect_external_images(
+        &mut self,
+        scene: &Scene,
+    ) -> ([ExternalImageState; MAX_SCENE_ITEMS], usize) {
         let mut external_images: [ExternalImageState; MAX_SCENE_ITEMS] =
             std::array::from_fn(|_| ExternalImageState {
                 image: vk::Image::null(),
@@ -1285,47 +1438,45 @@ impl VulkanCompositor {
                 external_count += 1;
             }
         }
+        (external_images, external_count)
+    }
+
+    /// Pure-move extraction of the preview `AcquireTimeout` arm from
+    /// `render`: the program image was acquired but will not be rendered
+    /// this frame; consume its acquire semaphore with an empty submit and
+    /// present the untouched image so the next acquire stays synchronized.
+    fn handle_acquire_timeout(&mut self, program_index: u32) -> Result<(), RenderError> {
         unsafe {
-            // Acquire both swapchain images before resetting the fence: a
-            // timeout skip then leaves the fence signaled and no semaphores
-            // pending, so the next frame stays in sync.
-            program_index = acquire(&self.program)?;
-            preview_index = match acquire(&self.preview) {
-                Ok(index) => index,
-                Err(RenderError::AcquireTimeout) => {
-                    // The program image was acquired but will not be rendered
-                    // this frame; consume its acquire semaphore with an empty
-                    // submit and present the untouched image so the next
-                    // acquire stays synchronized.
-                    self.device
-                        .reset_fences(&[self.frame_fence])
-                        .map_err(RenderError::Vk)?;
-                    self.device
-                        .queue_submit(
-                            self.queue,
-                            &[vk::SubmitInfo::default()
-                                .wait_semaphores(std::slice::from_ref(&self.program.available))
-                                .wait_dst_stage_mask(&[vk::PipelineStageFlags::TOP_OF_PIPE])
-                                .signal_semaphores(&[
-                                    self.program.rendered[program_index as usize]
-                                ])],
-                            self.frame_fence,
-                        )
-                        .map_err(RenderError::Vk)?;
-                    present(&self.program, self.queue, program_index)?;
-                    return Ok(());
-                }
-                Err(other) => return Err(other),
-            };
             self.device
                 .reset_fences(&[self.frame_fence])
                 .map_err(RenderError::Vk)?;
             self.device
-                .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())
+                .queue_submit(
+                    self.queue,
+                    &[vk::SubmitInfo::default()
+                        .wait_semaphores(std::slice::from_ref(&self.program.available))
+                        .wait_dst_stage_mask(&[vk::PipelineStageFlags::TOP_OF_PIPE])
+                        .signal_semaphores(&[self.program.rendered[program_index as usize]])],
+                    self.frame_fence,
+                )
                 .map_err(RenderError::Vk)?;
-            self.device
-                .begin_command_buffer(self.command_buffer, &vk::CommandBufferBeginInfo::default())
-                .map_err(RenderError::Vk)?;
+        }
+        present(&self.program, self.queue, program_index)?;
+        Ok(())
+    }
+
+    /// Pure-move extraction of the scene-pass recording from `render`:
+    /// ownership acquire barriers, the scene render pass with all visible
+    /// items, and the ownership release barriers. Runs between
+    /// `begin_command_buffer` and the composite passes.
+    fn record_item_pass(
+        &self,
+        scene: &Scene,
+        project: &ProjectV1,
+        external_images: &[ExternalImageState; MAX_SCENE_ITEMS],
+        external_count: usize,
+    ) {
+        unsafe {
             let mut acquire_barriers = [vk::ImageMemoryBarrier::default(); MAX_SCENE_ITEMS * 2];
             let mut acquire_count = 0usize;
             for external in &external_images[..external_count] {
@@ -1424,7 +1575,7 @@ impl VulkanCompositor {
                     // pipeline-creation time.
                     update_descriptor(
                         &self.device,
-                        self.media_item_descriptors[draw_index],
+                        self.media_ycbcr.item_descriptors[draw_index],
                         cached.texture.view,
                         vk::Sampler::null(),
                         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
@@ -1453,7 +1604,7 @@ impl VulkanCompositor {
                         self.command_buffer,
                         vk::PipelineBindPoint::GRAPHICS,
                         if media_draw {
-                            self.media_item_pipeline
+                            self.media_ycbcr.item_pipeline
                         } else {
                             self.item_pipeline
                         },
@@ -1462,8 +1613,8 @@ impl VulkanCompositor {
                 }
                 let (item_descriptor, draw_pipeline_layout) = if media_draw {
                     (
-                        self.media_item_descriptors[draw_index],
-                        self.media_item_pipeline_layout,
+                        self.media_ycbcr.item_descriptors[draw_index],
+                        self.media_ycbcr.item_pipeline_layout,
                     )
                 } else {
                     (self.item_descriptors[draw_index], self.item_pipeline_layout)
@@ -1515,70 +1666,26 @@ impl VulkanCompositor {
                 &[],
                 &release_barriers[..release_count],
             );
-            composite_target(
-                &self.device,
-                self.command_buffer,
-                &self.program,
-                program_index,
-                self.scene.extent,
-            );
-            composite_target(
-                &self.device,
-                self.command_buffer,
-                &self.preview,
-                preview_index,
-                self.scene.extent,
-            );
-            self.device
-                .end_command_buffer(self.command_buffer)
-                .map_err(RenderError::Vk)?;
-            let waits = [self.program.available, self.preview.available];
-            let stages = [
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            ];
-            let signals = [
-                self.program.rendered[program_index as usize],
-                self.preview.rendered[preview_index as usize],
-            ];
-            self.device
-                .queue_submit(
-                    self.queue,
-                    &[vk::SubmitInfo::default()
-                        .wait_semaphores(&waits)
-                        .wait_dst_stage_mask(&stages)
-                        .command_buffers(&[self.command_buffer])
-                        .signal_semaphores(&signals)],
-                    self.frame_fence,
-                )
-                .map_err(RenderError::Vk)?;
-            // The first-acquire barriers live only in this command
-            // buffer; commit the flags only after the submit succeeded so
-            // an acquire timeout or earlier failure makes the next frame
-            // re-issue the UNDEFINED -> SHADER_READ_ONLY transition.
-            for external in &external_images[..external_count] {
-                if !external.first_acquire {
-                    continue;
-                }
-                for cached in self
-                    .portal_textures
-                    .values_mut()
-                    .chain(self.media_textures.values_mut())
-                {
-                    if cached.texture.image == external.image {
-                        cached.acquired = true;
-                    }
-                }
-            }
         }
-        present(&self.program, self.queue, program_index)?;
-        present(&self.preview, self.queue, preview_index)?;
-        unsafe {
-            self.device
-                .wait_for_fences(&[self.frame_fence], true, u64::MAX)
-                .map_err(RenderError::Vk)?;
-        }
-        Ok(())
+    }
+
+    /// Pure-move extraction of the composite pair from `render`: blit the
+    /// finished scene target into both presentation targets.
+    fn record_composite_passes(&self, program_index: u32, preview_index: u32) {
+        composite_target(
+            &self.device,
+            self.command_buffer,
+            &self.program,
+            program_index,
+            self.scene.extent,
+        );
+        composite_target(
+            &self.device,
+            self.command_buffer,
+            &self.preview,
+            preview_index,
+            self.scene.extent,
+        );
     }
 }
 
@@ -1586,20 +1693,15 @@ impl Drop for VulkanCompositor {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            self.media_ycbcr.destroy(&self.device);
             for (_, cached) in self.portal_textures.drain() {
                 destroy_imported(&self.device, cached.texture);
             }
-            self.device.destroy_pipeline(self.media_item_pipeline, None);
-            self.device
-                .destroy_pipeline_layout(self.media_item_pipeline_layout, None);
             for (_, cached) in self.media_textures.drain() {
                 destroy_imported(&self.device, cached.texture);
             }
             destroy_target(&self.device, &self.surface_loader, &mut self.program);
             destroy_target(&self.device, &self.surface_loader, &mut self.preview);
-            self.device.destroy_sampler(self.media_sampler, None);
-            self.device
-                .destroy_sampler_ycbcr_conversion(self.media_conversion, None);
             for (_, cached) in self.static_textures.drain() {
                 destroy_imported(&self.device, cached.texture);
             }
@@ -1620,8 +1722,6 @@ impl Drop for VulkanCompositor {
                 .destroy_descriptor_set_layout(self.sampler_layout, None);
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_fence(self.frame_fence, None);
-            self.device
-                .destroy_descriptor_set_layout(self.media_sampler_layout, None);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
@@ -1670,305 +1770,79 @@ impl RenderRuntime {
             .name("vulkan-render".into())
             .spawn(move || {
                 let initial = project.read().output.clone();
-                let mut compositor = Some(match VulkanCompositor::create(
-                    surfaces,
-                    initial.width,
-                    initial.height,
-                ) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        let _ = ready_tx.send(Err(error.clone()));
-                        let _ = events.send(EngineEvent::DeviceRecovery {
-                            phase: DeviceRecoveryPhase::Failed,
-                            detail: Some(error),
-                        });
-                        return;
-                    }
-                });
-                let mut capture = match CaptureHandle::spawn() {
-                    Ok(value) => value,
-                    Err(error) => {
-                        // The ready channel must resolve even when startup
-                        // fails, or `start` blocks until its timeout while
-                        // the thread dies silently.
-                        let _ = ready_tx.send(Err(error.to_string()));
-                        let _ = events.send(EngineEvent::EngineError {
-                            message: error.to_string(),
-                        });
-                        return;
-                    }
+                let Some((mut compositor, mut capture, media)) =
+                    start_render_services(surfaces, &initial, &events, &ready_tx)
+                else {
+                    return;
                 };
-                let media = match LinuxMedia::start(events.clone()) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        let _ = ready_tx.send(Err(format!("GStreamer nicht verfügbar: {error}")));
-                        let _ = events.send(EngineEvent::EngineError { message: format!("GStreamer nicht verfügbar: {error}") });
-                        return;
-                    }
+                let mut state = RenderLoopState {
+                    media_sources: HashMap::new(),
+                    media_frames: HashMap::new(),
+                    frames: HashMap::new(),
+                    nodes: HashMap::new(),
+                    available: HashSet::new(),
+                    import_failures: HashMap::new(),
+                    capture_started: HashMap::new(),
+                    restart_backoff: HashMap::new(),
+                    portal_lost: HashSet::new(),
+                    evict_notified: HashMap::new(),
+                    recovery_failures: 0,
+                    generation: 0,
+                    output: initial,
+                    static_caches: StaticCaches::default(),
+                    deadline: Instant::now(),
                 };
-                // Every startup step succeeded; unblock the waiting caller.
-                let _ = ready_tx.send(Ok(()));
-                let mut media_sources: HashMap<Uuid, MediaRuntimeBinding> = HashMap::new();
-                let mut media_frames: HashMap<Uuid, MediaVideoFrame> = HashMap::new();
-                let mut frames: HashMap<Uuid, CapturedFrame> = HashMap::new();
-                let mut nodes: HashMap<Uuid, u32> = HashMap::new();
-                let mut available = HashSet::new();
-                // Import-failure streaks live on the render thread (not on
-                // the compositor) so backoff state survives device/surface
-                // recreations.
-                let mut import_failures: HashMap<Uuid, Instant> = HashMap::new();
-                let mut capture_started: HashMap<Uuid, Instant> = HashMap::new();
-                // Restart-Rückfallebene für frische Starts: Eine Quelle,
-                // deren capture.start fehlschlägt, wird erst nach
-                // IMPORT_RETRY_INTERVAL erneut versucht, statt die
-                // Capture-Verbindung jede Schleifenrunde neu aufzureißen.
-                let mut restart_backoff: HashMap<Uuid, Instant> = HashMap::new();
-                // Terminaler Portal-Verlust pro Quelle: Solange gesetzt,
-                // startet die Wanted-Schleife diese Quelle nicht erneut;
-                // erst ein Generationswechsel (neue Auswahl, neues fd)
-                // räumt die Sperre weg.
-                let mut portal_lost: HashSet<Uuid> = HashSet::new();
-                // Eviction/failure-report dedup: identical consecutive
-                // reasons are reported once until frames recover
-                // (mirrors windows.rs should_report_failure philosophy).
-                let mut evict_notified: HashMap<Uuid, String> = HashMap::new();
-                let mut recovery_failures: u32 = 0;
-                let mut generation = 0;
-                let mut output = initial;
-                let mut static_caches = StaticCaches::default();
-                let mut deadline = Instant::now();
+                let RenderLoopState {
+                    media_sources,
+                    media_frames,
+                    frames,
+                    nodes,
+                    available,
+                    import_failures,
+                    capture_started,
+                    restart_backoff,
+                    portal_lost,
+                    evict_notified,
+                    recovery_failures,
+                    generation,
+                    output,
+                    static_caches,
+                    deadline,
+                } = &mut state;
                 while !thread_stop.load(Ordering::Acquire) {
                     let snapshot = project.read().clone();
                     if compositor.is_none() {
                         // Bounded recovery: retry the failed creation instead
                         // of exiting the thread (mirrors the Windows loop).
-                        match VulkanCompositor::create(
+                        match recover_compositor(
+                            &mut compositor,
                             *surface_state.read(),
                             snapshot.output.width,
                             snapshot.output.height,
+                            recovery_failures,
+                            &events,
                         ) {
-                            Ok(next) => {
-                                compositor = Some(next);
-                                recovery_failures = 0;
-                                output = snapshot.output.clone();
-                                let _ = events.send(EngineEvent::DeviceRecovery {
-                                    phase: DeviceRecoveryPhase::Succeeded,
-                                    detail: None,
-                                });
+                            RecoveryOutcome::Recovered => {
+                                *output = snapshot.output.clone();
                             }
-                            Err(error) => {
-                                recovery_failures += 1;
-                                let _ = events.send(EngineEvent::DeviceRecovery {
-                                    phase: DeviceRecoveryPhase::Failed,
-                                    detail: Some(error.clone()),
-                                });
-                                if recovery_failures >= MAX_RECOVERY_FAILURES {
-                                    let _ = events.send(EngineEvent::EngineError {
-                                        message: format!(
-                                            "Vulkan-Renderer nach {MAX_RECOVERY_FAILURES} Wiederherstellungsversuchen aufgegeben: {error}"
-                                        ),
-                                    });
-                                    break;
-                                }
-                                sleep_backoff(&thread_stop, recovery_failures);
+                            RecoveryOutcome::RetryAfterBackoff => {
+                                sleep_backoff(&thread_stop, *recovery_failures);
                             }
+                            RecoveryOutcome::GiveUp => break,
                         }
                         continue;
                     }
-                    let wanted_media: HashSet<Uuid> = snapshot
-                        .sources
-                        .iter()
-                        .filter_map(|source| match source {
-                            Source::Media { id, .. } => Some(*id),
-                            _ => None,
-                        })
-                        .collect();
-                    for source in &snapshot.sources {
-                        let Source::Media {
-                            id,
-                            path,
-                            looped,
-                            continue_when_hidden,
-                            restart_on_show,
-                            ..
-                        } = source
-                        else {
-                            continue;
-                        };
-                        let visible = snapshot
-                            .scenes
-                            .iter()
-                            .find(|scene| scene.id == snapshot.active_scene_id)
-                            .is_some_and(|scene| {
-                                scene
-                                    .items
-                                    .iter()
-                                    .any(|item| item.source_id == *id && item.visible)
-                            });
-                        let path_changed = media_sources
-                            .get(id)
-                            .is_some_and(|runtime| runtime.path != *path);
-                        if path_changed {
-                            if media_sources.get(id).is_some_and(|runtime| runtime.opened) {
-                                media.remove(*id, &media_audio);
-                            }
-                            media_sources.remove(id);
-                            media_frames.remove(id);
-                        }
-                        // Bounded self-heal: once the cooldown elapsed, drop
-                        // the failed binding so the open below runs a fresh
-                        // session (fresh ReopenBudget + latch) instead of the
-                        // binding staying dead forever. Path changes keep
-                        // their immediate-tick behavior above.
-                        let retry_due = media_sources.get(id).is_some_and(|runtime| {
-                            !runtime.opened
-                                && runtime
-                                    .retry_after
-                                    .is_some_and(|deadline| Instant::now() >= deadline)
-                        });
-                        if retry_due {
-                            // The Unsupported arm already tore the session
-                            // down (opened == false); only bookkeeping remains.
-                            media_sources.remove(id);
-                            media_frames.remove(id);
-                        }
-                        if !media_sources.contains_key(id) {
-                            let opened = match media.open(*id, path, *looped, &media_audio) {
-                                Ok(()) => true,
-                                Err(reason) => {
-                                    let _ = events.send(EngineEvent::UnsupportedMedia {
-                                        source_id: *id,
-                                        reason,
-                                    });
-                                    false
-                                }
-                            };
-                            media_sources.insert(
-                                *id,
-                                MediaRuntimeBinding {
-                                    path: path.clone(),
-                                    looped: *looped,
-                                    visible,
-                                    playing: true,
-                                    opened,
-                                    retry_after: if opened {
-                                        None
-                                    } else {
-                                        Some(Instant::now() + MEDIA_RETRY_COOLDOWN)
-                                    },
-                                    control_epoch: 0,
-                                },
-                            );
-                        }
-                        let runtime = media_sources.get_mut(id).expect("media runtime inserted");
-                        if !runtime.opened {
-                            continue;
-                        }
-                        if runtime.looped != *looped {
-                            media.command(*id, MediaCommand::SetLoop(*looped));
-                            runtime.looped = *looped;
-                        }
-                        if visible && !runtime.visible && *restart_on_show {
-                            media.command(*id, MediaCommand::Seek(0.0));
-                        }
-                        let control = media_control.read().get(id).copied().unwrap_or_default();
-                        runtime.control_epoch = control.epoch;
-                        let should_play =
-                            control.playing && (visible || *continue_when_hidden);
-                        if runtime.playing != should_play {
-                            media.command(
-                                *id,
-                                if should_play {
-                                    MediaCommand::Play
-                                } else {
-                                    MediaCommand::Pause
-                                },
-                            );
-                            runtime.playing = should_play;
-                        }
-                        runtime.visible = visible;
-                        // Atomar entnehmen: ein zwischen Snapshot und
-                        // Loeschen ankommender Seek darf nicht verloren
-                        // gehen (Windows-Paritaet: take unter einem Lock).
-                        let seek = media_control
-                            .write()
-                            .entry(*id)
-                            .or_default()
-                            .seek_seconds
-                            .take();
-                        if let Some(position) = seek {
-                            media.command(*id, MediaCommand::Seek(position));
-                        }
-                    }
-                    for id in media_sources.keys().copied().collect::<Vec<_>>() {
-                        if !wanted_media.contains(&id) {
-                            if media_sources.get(&id).is_some_and(|runtime| runtime.opened) {
-                                media.remove(id, &media_audio);
-                            }
-                            media_sources.remove(&id);
-                            media_frames.remove(&id);
-                        }
-                    }
-                    for notice in media.drain_notices() {
-                        match notice {
-                            MediaNotice::State { source_id, state } => {
-                                if let Some(runtime) = media_sources.get_mut(&source_id) {
-                                    runtime.playing = state.playing;
-                                    // Windows-Paritaet: das vom Worker selbst
-                                    // ausgeloeste Pausieren am Dateiende muss
-                                    // den Bus zurueckschreiben, sonst bleibt
-                                    // playing=true haengen und Play erzeugt
-                                    // keine Kante mehr. Der Epoch-Vergleich
-                                    // schuetzt ein gleichzeitiges Nutzer-Play.
-                                    if !state.playing {
-                                        let mut bus = media_control.write();
-                                        let entry = bus.entry(source_id).or_default();
-                                        if entry.epoch == runtime.control_epoch {
-                                            entry.playing = false;
-                                        }
-                                    }
-                                }
-                                let _ = events.send(EngineEvent::MediaState { source_id, state });
-                            }
-                            MediaNotice::Unsupported { source_id, reason } => {
-                                media.remove(source_id, &media_audio);
-                                if let Some(runtime) = media_sources.get_mut(&source_id) {
-                                    runtime.opened = false;
-                                    runtime.playing = false;
-                                    runtime.retry_after =
-                                        Some(Instant::now() + MEDIA_RETRY_COOLDOWN);
-                                }
-                                media_frames.remove(&source_id);
-                                available.remove(&source_id);
-                                let _ = events.send(EngineEvent::UnsupportedMedia {
-                                    source_id,
-                                    reason,
-                                });
-                            }
-                            MediaNotice::SeekFailed { source_id, reason } => {
-                                // Windows-Paritaet: ein fehlgeschlagener Seek
-                                // meldet den Grund als UnsupportedMedia-Event,
-                                // ohne die Sitzung zu verwerfen. Ein separater
-                                // MediaState-Dedup existiert auf diesem Pfad
-                                // nicht; die Pipeline dedupliziert workerseitig
-                                // und ein erfolgreicher Seek ändert die Position
-                                // ohnehin, sodass das nächste State-Event fließt.
-                                let _ = events.send(EngineEvent::UnsupportedMedia {
-                                    source_id,
-                                    reason,
-                                });
-                            }
-                            MediaNotice::Video(frame) => {
-                                let source_id = frame.source_id;
-                                media_frames.insert(source_id, frame);
-                                if available.insert(source_id)
-                                    && !import_failures.contains_key(&source_id)
-                                {
-                                    let _ = events.send(EngineEvent::SourceAvailable { source_id });
-                                }
-                            }
-                        }
-                    }
+                    reconcile_media_state(
+                        &snapshot,
+                        &media,
+                        &media_audio,
+                        &media_control,
+                        &events,
+                        media_sources,
+                        media_frames,
+                        available,
+                        import_failures,
+                    );
                     let current_surfaces = *surface_state.read();
                     let active_compositor =
                         compositor.as_ref().expect("Vulkan compositor initialized");
@@ -2000,8 +1874,8 @@ impl RenderRuntime {
                         );
                         match recreated {
                             Ok(()) => {
-                                recovery_failures = 0;
-                                output = snapshot.output.clone();
+                                *recovery_failures = 0;
+                                *output = snapshot.output.clone();
                                 let _ = events.send(EngineEvent::DeviceRecovery {
                                     phase: DeviceRecoveryPhase::Succeeded,
                                     detail: None,
@@ -2012,12 +1886,12 @@ impl RenderRuntime {
                                 // the full device rebuild with the same
                                 // bounded-retry accounting as a failed create.
                                 drop(compositor.take());
-                                recovery_failures += 1;
+                                *recovery_failures += 1;
                                 let _ = events.send(EngineEvent::DeviceRecovery {
                                     phase: DeviceRecoveryPhase::Failed,
                                     detail: Some(error.clone()),
                                 });
-                                if recovery_failures >= MAX_RECOVERY_FAILURES {
+                                if *recovery_failures >= MAX_RECOVERY_FAILURES {
                                     let _ = events.send(EngineEvent::EngineError {
                                         message: format!(
                                         "Vulkan-Renderer nach {MAX_RECOVERY_FAILURES} Wiederherstellungsversuchen aufgegeben: {error}"
@@ -2027,13 +1901,13 @@ impl RenderRuntime {
                                 }
                                 // The compositor stays None; the loop head
                                 // retries the creation after the backoff.
-                                sleep_backoff(&thread_stop, recovery_failures);
+                                sleep_backoff(&thread_stop, *recovery_failures);
                                 continue;
                             }
                         }
                     }
                     let current_generation = portal.generation();
-                    if current_generation != generation {
+                    if current_generation != *generation {
                         for source_id in nodes.keys().copied().collect::<Vec<_>>() {
                             capture.stop(source_id);
                         }
@@ -2050,12 +1924,12 @@ impl RenderRuntime {
                                 // give up only past MAX_RECOVERY_FAILURES
                                 // (mirrors the compositor accounting).
                                 let respawned = loop {
-                                    recovery_failures += 1;
+                                    *recovery_failures += 1;
                                     let _ = events.send(EngineEvent::DeviceRecovery {
                                         phase: DeviceRecoveryPhase::Failed,
                                         detail: Some(error.to_string()),
                                     });
-                                    if recovery_failures >= MAX_RECOVERY_FAILURES {
+                                    if *recovery_failures >= MAX_RECOVERY_FAILURES {
                                         let _ = events.send(EngineEvent::EngineError {
                                             message: format!(
                                                 "Vulkan-Renderer nach {MAX_RECOVERY_FAILURES} Wiederherstellungsversuchen aufgegeben: {error}"
@@ -2063,7 +1937,7 @@ impl RenderRuntime {
                                         });
                                         break None;
                                     }
-                                    sleep_backoff(&thread_stop, recovery_failures);
+                                    sleep_backoff(&thread_stop, *recovery_failures);
                                     match CaptureHandle::spawn() {
                                         Ok(value) => break Some(value),
                                         Err(retry_error) => error = retry_error,
@@ -2080,7 +1954,7 @@ impl RenderRuntime {
                         evict_notified.clear();
                         restart_backoff.clear();
                         portal_lost.clear();
-                        generation = current_generation;
+                        *generation = current_generation;
                     }
                     let selected = portal.streams();
                     let marker = portal.binding_marker();
@@ -2143,14 +2017,14 @@ impl RenderRuntime {
                     }
                     drain_capture_messages(
                         &mut capture,
-                        &mut frames,
-                        &mut capture_started,
-                        &mut available,
-                        &mut nodes,
-                        &import_failures,
-                        &mut evict_notified,
-                        &mut restart_backoff,
-                        &mut portal_lost,
+                        frames,
+                        capture_started,
+                        available,
+                        nodes,
+                        import_failures,
+                        evict_notified,
+                        restart_backoff,
+                        portal_lost,
                         &events,
                     );
                     // Portal delivery is damage-driven: after a capture delivered its
@@ -2187,11 +2061,11 @@ impl RenderRuntime {
                         .as_mut()
                         .expect("Vulkan compositor initialized")
                         .render(
-                            &mut static_caches,
+                            static_caches,
                             &snapshot,
-                            &mut frames,
-                            &media_frames,
-                            &mut import_failures,
+                            frames,
+                            media_frames,
+                            import_failures,
                             &events,
                         )
                     {
@@ -2237,7 +2111,7 @@ impl RenderRuntime {
                                     true,
                                 ) {
                                     Ok(()) => {
-                                        recovery_failures = 0;
+                                        *recovery_failures = 0;
                                         let _ = events.send(EngineEvent::DeviceRecovery {
                                             phase: DeviceRecoveryPhase::Succeeded,
                                             detail: None,
@@ -2256,19 +2130,19 @@ impl RenderRuntime {
                                 ) {
                                     Ok(next) => {
                                         compositor = Some(next);
-                                        recovery_failures = 0;
+                                        *recovery_failures = 0;
                                         let _ = events.send(EngineEvent::DeviceRecovery {
                                             phase: DeviceRecoveryPhase::Succeeded,
                                             detail: None,
                                         });
                                     }
                                     Err(recovery_error) => {
-                                        recovery_failures += 1;
+                                        *recovery_failures += 1;
                                         let _ = events.send(EngineEvent::DeviceRecovery {
                                             phase: DeviceRecoveryPhase::Failed,
                                             detail: Some(recovery_error.clone()),
                                         });
-                                        if recovery_failures >= MAX_RECOVERY_FAILURES {
+                                        if *recovery_failures >= MAX_RECOVERY_FAILURES {
                                             let _ = events.send(EngineEvent::EngineError {
                                                 message: format!(
                                                     "Vulkan-Renderer nach {MAX_RECOVERY_FAILURES} Wiederherstellungsversuchen aufgegeben: {recovery_error}"
@@ -2278,7 +2152,7 @@ impl RenderRuntime {
                                         }
                                         // The compositor stays None; the loop head
                                         // retries the creation after the backoff.
-                                        sleep_backoff(&thread_stop, recovery_failures);
+                                        sleep_backoff(&thread_stop, *recovery_failures);
                                     }
                                 }
                             }
@@ -2289,11 +2163,11 @@ impl RenderRuntime {
                         }
                     }
                     let frame_time = Duration::from_secs_f64(1.0 / output.fps.max(1) as f64);
-                    deadline += frame_time;
+                    *deadline += frame_time;
                     if let Some(wait) = deadline.checked_duration_since(Instant::now()) {
                         thread::sleep(wait.min(Duration::from_millis(20)));
                     } else {
-                        deadline = Instant::now();
+                        *deadline = Instant::now();
                     }
                 }
                 if let Some(compositor) = compositor.as_mut() {
@@ -2427,6 +2301,343 @@ fn recreate_surface_sized_state(
                 false,
             )
         })
+}
+
+/// Bookkeeping locals of the render-thread main loop. Pure code motion:
+/// the previous loose closure locals, grouped so the loop owns one `mut`
+/// value whose fields are destructured as `&mut` bindings.
+struct RenderLoopState {
+    media_sources: HashMap<Uuid, MediaRuntimeBinding>,
+    media_frames: HashMap<Uuid, MediaVideoFrame>,
+    frames: HashMap<Uuid, CapturedFrame>,
+    nodes: HashMap<Uuid, u32>,
+    available: HashSet<Uuid>,
+    // Import-failure streaks live on the render thread (not on
+    // the compositor) so backoff state survives device/surface
+    // recreations.
+    import_failures: HashMap<Uuid, Instant>,
+    capture_started: HashMap<Uuid, Instant>,
+    // Restart-Rückfallebene für frische Starts: Eine Quelle,
+    // deren capture.start fehlschlägt, wird erst nach
+    // IMPORT_RETRY_INTERVAL erneut versucht, statt die
+    // Capture-Verbindung jede Schleifenrunde neu aufzureißen.
+    restart_backoff: HashMap<Uuid, Instant>,
+    // Terminaler Portal-Verlust pro Quelle: Solange gesetzt,
+    // startet die Wanted-Schleife diese Quelle nicht erneut;
+    // erst ein Generationswechsel (neue Auswahl, neues fd)
+    // räumt die Sperre weg.
+    portal_lost: HashSet<Uuid>,
+    // Eviction/failure-report dedup: identical consecutive
+    // reasons are reported once until frames recover
+    // (mirrors windows.rs should_report_failure philosophy).
+    evict_notified: HashMap<Uuid, String>,
+    recovery_failures: u32,
+    generation: u64,
+    // (mirror windows.rs output resize)
+    output: OutputConfig,
+    static_caches: StaticCaches,
+    deadline: Instant,
+}
+
+/// Pure-move extraction of the render thread's three sequential startup
+/// steps (compositor, capture, media). On failure the ready channel and
+/// the event log are fed exactly as before and `None` is returned so the
+/// caller bails out of the thread closure.
+fn start_render_services(
+    surfaces: NativeSurfaces,
+    initial: &OutputConfig,
+    events: &std::sync::mpsc::Sender<EngineEvent>,
+    ready_tx: &std::sync::mpsc::SyncSender<Result<(), String>>,
+) -> Option<(Option<VulkanCompositor>, CaptureHandle, LinuxMedia)> {
+    let compositor = Some(
+        match VulkanCompositor::create(surfaces, initial.width, initial.height) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = ready_tx.send(Err(error.clone()));
+                let _ = events.send(EngineEvent::DeviceRecovery {
+                    phase: DeviceRecoveryPhase::Failed,
+                    detail: Some(error),
+                });
+                return None;
+            }
+        },
+    );
+    let capture = match CaptureHandle::spawn() {
+        Ok(value) => value,
+        Err(error) => {
+            // The ready channel must resolve even when startup
+            // fails, or `start` blocks until its timeout while
+            // the thread dies silently.
+            let _ = ready_tx.send(Err(error.to_string()));
+            let _ = events.send(EngineEvent::EngineError {
+                message: error.to_string(),
+            });
+            return None;
+        }
+    };
+    let media = match LinuxMedia::start(events.clone()) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = ready_tx.send(Err(format!("GStreamer nicht verfügbar: {error}")));
+            let _ = events.send(EngineEvent::EngineError {
+                message: format!("GStreamer nicht verfügbar: {error}"),
+            });
+            return None;
+        }
+    };
+    // Every startup step succeeded; unblock the waiting caller.
+    let _ = ready_tx.send(Ok(()));
+    Some((compositor, capture, media))
+}
+
+/// Outcome of [`recover_compositor`]: sleep_backoff and loop control
+/// (`break`/`continue`) stay at the call site because they cross the loop
+/// boundary (precedent: `recreate_surface_sized_state`).
+enum RecoveryOutcome {
+    Recovered,
+    RetryAfterBackoff,
+    GiveUp,
+}
+
+/// Pure-move extraction of the compositor-recovery block from the render
+/// thread loop head. Pure accounting lives here; the backoff sleep and the
+/// give-up break stay with the caller.
+fn recover_compositor(
+    compositor: &mut Option<VulkanCompositor>,
+    surfaces: NativeSurfaces,
+    width: u32,
+    height: u32,
+    recovery_failures: &mut u32,
+    events: &std::sync::mpsc::Sender<EngineEvent>,
+) -> RecoveryOutcome {
+    match VulkanCompositor::create(surfaces, width, height) {
+        Ok(next) => {
+            *compositor = Some(next);
+            *recovery_failures = 0;
+            let _ = events.send(EngineEvent::DeviceRecovery {
+                phase: DeviceRecoveryPhase::Succeeded,
+                detail: None,
+            });
+            RecoveryOutcome::Recovered
+        }
+        Err(error) => {
+            *recovery_failures += 1;
+            let _ = events.send(EngineEvent::DeviceRecovery {
+                phase: DeviceRecoveryPhase::Failed,
+                detail: Some(error.clone()),
+            });
+            if *recovery_failures >= MAX_RECOVERY_FAILURES {
+                let _ = events.send(EngineEvent::EngineError {
+                    message: format!(
+                        "Vulkan-Renderer nach {MAX_RECOVERY_FAILURES} Wiederherstellungsversuchen aufgegeben: {error}"
+                    ),
+                });
+                RecoveryOutcome::GiveUp
+            } else {
+                RecoveryOutcome::RetryAfterBackoff
+            }
+        }
+    }
+}
+
+/// Pure-move extraction of the media reconcile and notice-drain loop body
+/// from the render thread closure.
+#[allow(clippy::too_many_arguments)]
+fn reconcile_media_state(
+    snapshot: &ProjectV1,
+    media: &LinuxMedia,
+    media_audio: &MediaAudioBus,
+    media_control: &MediaControlBus,
+    events: &std::sync::mpsc::Sender<EngineEvent>,
+    media_sources: &mut HashMap<Uuid, MediaRuntimeBinding>,
+    media_frames: &mut HashMap<Uuid, MediaVideoFrame>,
+    available: &mut HashSet<Uuid>,
+    import_failures: &HashMap<Uuid, Instant>,
+) {
+    let wanted_media: HashSet<Uuid> = snapshot
+        .sources
+        .iter()
+        .filter_map(|source| match source {
+            Source::Media { id, .. } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    for source in &snapshot.sources {
+        let Source::Media {
+            id,
+            path,
+            looped,
+            continue_when_hidden,
+            restart_on_show,
+            ..
+        } = source
+        else {
+            continue;
+        };
+        let visible = snapshot
+            .scenes
+            .iter()
+            .find(|scene| scene.id == snapshot.active_scene_id)
+            .is_some_and(|scene| {
+                scene
+                    .items
+                    .iter()
+                    .any(|item| item.source_id == *id && item.visible)
+            });
+        let path_changed = media_sources
+            .get(id)
+            .is_some_and(|runtime| runtime.path != *path);
+        if path_changed {
+            if media_sources.get(id).is_some_and(|runtime| runtime.opened) {
+                media.remove(*id, media_audio);
+            }
+            media_sources.remove(id);
+            media_frames.remove(id);
+        }
+        // Bounded self-heal: once the cooldown elapsed, drop
+        // the failed binding so the open below runs a fresh
+        // session (fresh ReopenBudget + latch) instead of the
+        // binding staying dead forever. Path changes keep
+        // their immediate-tick behavior above.
+        let retry_due = media_sources.get(id).is_some_and(|runtime| {
+            !runtime.opened
+                && runtime
+                    .retry_after
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+        });
+        if retry_due {
+            // The Unsupported arm already tore the session
+            // down (opened == false); only bookkeeping remains.
+            media_sources.remove(id);
+            media_frames.remove(id);
+        }
+        if !media_sources.contains_key(id) {
+            let opened = match media.open(*id, path, *looped, media_audio) {
+                Ok(()) => true,
+                Err(reason) => {
+                    let _ = events.send(EngineEvent::UnsupportedMedia {
+                        source_id: *id,
+                        reason,
+                    });
+                    false
+                }
+            };
+            media_sources.insert(
+                *id,
+                MediaRuntimeBinding {
+                    path: path.clone(),
+                    looped: *looped,
+                    visible,
+                    playing: true,
+                    opened,
+                    retry_after: if opened {
+                        None
+                    } else {
+                        Some(Instant::now() + MEDIA_RETRY_COOLDOWN)
+                    },
+                    control_epoch: 0,
+                },
+            );
+        }
+        let runtime = media_sources.get_mut(id).expect("media runtime inserted");
+        if !runtime.opened {
+            continue;
+        }
+        if runtime.looped != *looped {
+            media.command(*id, MediaCommand::SetLoop(*looped));
+            runtime.looped = *looped;
+        }
+        if visible && !runtime.visible && *restart_on_show {
+            media.command(*id, MediaCommand::Seek(0.0));
+        }
+        let control = media_control.read().get(id).copied().unwrap_or_default();
+        runtime.control_epoch = control.epoch;
+        let should_play = control.playing && (visible || *continue_when_hidden);
+        if runtime.playing != should_play {
+            media.command(
+                *id,
+                if should_play {
+                    MediaCommand::Play
+                } else {
+                    MediaCommand::Pause
+                },
+            );
+            runtime.playing = should_play;
+        }
+        runtime.visible = visible;
+        // Atomar entnehmen: ein zwischen Snapshot und
+        // Loeschen ankommender Seek darf nicht verloren
+        // gehen (Windows-Paritaet: take unter einem Lock).
+        let seek = media_control
+            .write()
+            .entry(*id)
+            .or_default()
+            .seek_seconds
+            .take();
+        if let Some(position) = seek {
+            media.command(*id, MediaCommand::Seek(position));
+        }
+    }
+    for id in media_sources.keys().copied().collect::<Vec<_>>() {
+        if !wanted_media.contains(&id) {
+            if media_sources.get(&id).is_some_and(|runtime| runtime.opened) {
+                media.remove(id, media_audio);
+            }
+            media_sources.remove(&id);
+            media_frames.remove(&id);
+        }
+    }
+    for notice in media.drain_notices() {
+        match notice {
+            MediaNotice::State { source_id, state } => {
+                if let Some(runtime) = media_sources.get_mut(&source_id) {
+                    runtime.playing = state.playing;
+                    // Windows-Paritaet: das vom Worker selbst
+                    // ausgeloeste Pausieren am Dateiende muss
+                    // den Bus zurueckschreiben, sonst bleibt
+                    // playing=true haengen und Play erzeugt
+                    // keine Kante mehr. Der Epoch-Vergleich
+                    // schuetzt ein gleichzeitiges Nutzer-Play.
+                    if !state.playing {
+                        let mut bus = media_control.write();
+                        let entry = bus.entry(source_id).or_default();
+                        if entry.epoch == runtime.control_epoch {
+                            entry.playing = false;
+                        }
+                    }
+                }
+                let _ = events.send(EngineEvent::MediaState { source_id, state });
+            }
+            MediaNotice::Unsupported { source_id, reason } => {
+                media.remove(source_id, media_audio);
+                if let Some(runtime) = media_sources.get_mut(&source_id) {
+                    runtime.opened = false;
+                    runtime.playing = false;
+                    runtime.retry_after = Some(Instant::now() + MEDIA_RETRY_COOLDOWN);
+                }
+                media_frames.remove(&source_id);
+                available.remove(&source_id);
+                let _ = events.send(EngineEvent::UnsupportedMedia { source_id, reason });
+            }
+            MediaNotice::SeekFailed { source_id, reason } => {
+                // Windows-Paritaet: ein fehlgeschlagener Seek
+                // meldet den Grund als UnsupportedMedia-Event,
+                // ohne die Sitzung zu verwerfen. Ein separater
+                // MediaState-Dedup existiert auf diesem Pfad
+                // nicht; die Pipeline dedupliziert workerseitig
+                // und ein erfolgreicher Seek ändert die Position
+                // ohnehin, sodass das nächste State-Event fließt.
+                let _ = events.send(EngineEvent::UnsupportedMedia { source_id, reason });
+            }
+            MediaNotice::Video(frame) => {
+                let source_id = frame.source_id;
+                media_frames.insert(source_id, frame);
+                if available.insert(source_id) && !import_failures.contains_key(&source_id) {
+                    let _ = events.send(EngineEvent::SourceAvailable { source_id });
+                }
+            }
+        }
+    }
 }
 
 fn raw_handles(
@@ -3952,28 +4163,21 @@ fn destroy_imported(device: &Device, imported: ImportedFrame) {
 
 fn parse_color(value: &str) -> [f32; 4] {
     const FALLBACK: [f32; 4] = [0.02, 0.02, 0.03, 1.0];
-    let Some(hex) = value.strip_prefix('#') else {
-        return FALLBACK;
-    };
-    let bytes = hex.as_bytes();
-    if bytes.len() != 6 {
+    // Dunkler Fallback bleibt modulspezifisch: Ein Wert ohne '#'-Präfix
+    // erreicht den geteilten text_raster-Parser gar nicht erst.
+    if value.strip_prefix('#').is_none() {
         return FALLBACK;
     }
-    let nibble = |byte: u8| -> Option<u8> {
-        match byte {
-            b'0'..=b'9' => Some(byte - b'0'),
-            b'a'..=b'f' => Some(byte - b'a' + 10),
-            b'A'..=b'F' => Some(byte - b'A' + 10),
-            _ => None,
-        }
-    };
-    let channel = |index: usize| -> Option<f32> {
-        Some((nibble(bytes[index])? * 16 + nibble(bytes[index + 1])?) as f32 / 255.0)
-    };
-    match (channel(0), channel(2), channel(4)) {
-        (Some(r), Some(g), Some(b)) => [r, g, b, 1.0],
-        _ => FALLBACK,
-    }
+    // Der geteilte Parser akzeptiert 6- und 8-stelliges Hex (8-stelliges
+    // RGBA ist für den Szenen-Hintergrund bewusst eine Obermenge) und
+    // fallbackt selbst auf Weiß bei ungültigen Ziffern.
+    let [r, g, b, a] = parse_text_color(value);
+    [
+        f32::from(r) / 255.0,
+        f32::from(g) / 255.0,
+        f32::from(b) / 255.0,
+        f32::from(a) / 255.0,
+    ]
 }
 
 fn destroy_scene(device: &Device, scene: &mut SceneTarget) {
