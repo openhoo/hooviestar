@@ -19,6 +19,7 @@ use std::collections::HashMap;
 pub struct MediaControl {
     pub playing: bool,
     pub seek_seconds: Option<f64>,
+    pub epoch: u64,
 }
 
 impl Default for MediaControl {
@@ -26,6 +27,7 @@ impl Default for MediaControl {
         Self {
             playing: true,
             seek_seconds: None,
+            epoch: 0,
         }
     }
 }
@@ -111,5 +113,77 @@ mod tests {
         }
         assert_eq!(slot.take().unwrap().sequence, 9);
         assert_eq!(slot.depth(), 0)
+    }
+
+    // MediaControl-Standard: Wiedergabe laeuft sofort, keine anstehende Suche, Epoche null.
+    #[test]
+    fn default_starts_playing_without_seek() {
+        let control = MediaControl::default();
+        assert!(control.playing);
+        assert!(control.seek_seconds.is_none());
+        assert_eq!(control.epoch, 0);
+    }
+
+    // Ohne Rotation an der Ursprung: Ecken entsprechen exakt der Rechteckgeometrie (TL, TR, BR, BL).
+    #[test]
+    fn vertices_identity_corners_exact() {
+        let t = Transform {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 50.0,
+            ..Transform::default()
+        };
+        let v = item_vertices(t);
+        assert_eq!(
+            v.positions,
+            [[0.0, 0.0], [100.0, 0.0], [100.0, 50.0], [0.0, 50.0]]
+        );
+        assert_eq!(v.opacity, t.opacity);
+    }
+
+    // 90-Grad-Drehung um den Mittelpunkt: Bounding tauscht Breite und Hoehe, Ecken drehen vorhersehbar.
+    #[test]
+    fn vertices_quarter_rotation_about_center() {
+        let t = Transform {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 50.0,
+            rotation_degrees: 90.0,
+            ..Transform::default()
+        };
+        let v = item_vertices(t);
+        let expected = [[75.0, -25.0], [75.0, 75.0], [25.0, 75.0], [25.0, -25.0]];
+        for (actual, exp) in v.positions.iter().zip(expected.iter()) {
+            assert!((actual[0] - exp[0]).abs() < 1e-4);
+            assert!((actual[1] - exp[1]).abs() < 1e-4);
+        }
+    }
+
+    // Negative und grosse Koordinaten: Nur der Mittelpunkt verschiebt sich; die Zentrier-Mathematik
+    // bleibt konsistent (Eckversatz relativ zum eigenen Mittelpunkt ist unveraendert).
+    #[test]
+    fn vertices_translation_invariant_for_negative_and_large_coords() {
+        let base = Transform {
+            x: 0.0,
+            y: 0.0,
+            width: 256.0,
+            height: 128.0,
+            rotation_degrees: 30.0,
+            ..Transform::default()
+        };
+        let shifted = Transform {
+            x: -16384.0,
+            y: 32768.0,
+            ..base
+        };
+        let vb = item_vertices(base).positions;
+        let vs = item_vertices(shifted).positions;
+        // Versatz exakt als Mittelpunktdelta erwartet; f32-Rundungsfehler bleibt weit unter 1e-2.
+        for i in 0..4 {
+            assert!((vs[i][0] - (vb[i][0] - 16384.0)).abs() < 1e-2);
+            assert!((vs[i][1] - (vb[i][1] + 32768.0)).abs() < 1e-2);
+        }
     }
 }

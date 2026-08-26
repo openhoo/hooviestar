@@ -1,4 +1,9 @@
-use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    path::PathBuf,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 use pipewire::{
     self as pw,
@@ -7,6 +12,11 @@ use pipewire::{
 };
 
 use crate::{discovery::SourceCandidate, project::AudioSessionBinding};
+
+/// Ruhefenster: Nach so viel Zeit ohne neues Enumerationsereignis wird beendet.
+const DISCOVERY_IDLE_TIMEOUT: Duration = Duration::from_millis(200);
+/// Harte Obergrenze für die gesamte Enumeration unabhängig von Ereignissen.
+const DISCOVERY_MAX_WAIT: Duration = Duration::from_millis(1_500);
 
 struct BoundNode {
     _listener: NodeListener,
@@ -27,9 +37,13 @@ pub fn enumerate_audio_nodes() -> Result<Vec<SourceCandidate>, String> {
     let registry_weak = registry.downgrade();
     let listener_candidates = candidates.clone();
     let listener_nodes = bound_nodes.clone();
+    // Zeitpunkt des letzten Enumerationsereignisses für den Ruhe-Timer.
+    let last_activity = Rc::new(Cell::new(None::<Instant>));
+    let listener_activity = last_activity.clone();
     let _listener = registry
         .add_listener_local()
         .global(move |object| {
+            listener_activity.set(Some(Instant::now()));
             if object.type_ != ObjectType::Node {
                 return;
             }
@@ -40,9 +54,11 @@ pub fn enumerate_audio_nodes() -> Result<Vec<SourceCandidate>, String> {
                 return;
             };
             let candidates = listener_candidates.clone();
+            let info_activity = listener_activity.clone();
             let listener = node
                 .add_listener_local()
                 .info(move |info| {
+                    info_activity.set(Some(Instant::now()));
                     let Some(properties) = info.props() else {
                         return;
                     };
@@ -65,13 +81,23 @@ pub fn enumerate_audio_nodes() -> Result<Vec<SourceCandidate>, String> {
         })
         .register();
     let weak = mainloop.downgrade();
+    let started = Instant::now();
+    let timer_activity = last_activity.clone();
     let timer = mainloop.loop_().add_timer(move |_| {
-        if let Some(mainloop) = weak.upgrade() {
+        let Some(mainloop) = weak.upgrade() else {
+            return;
+        };
+        // Beenden, sobald die Enumeration ruhig ist oder die Obergrenze läuft.
+        let quiescent = match timer_activity.get() {
+            Some(last) => last.elapsed() >= DISCOVERY_IDLE_TIMEOUT,
+            None => false,
+        };
+        if started.elapsed() >= DISCOVERY_MAX_WAIT || quiescent {
             mainloop.quit();
         }
     });
     timer
-        .update_timer(Some(Duration::from_millis(1_500)), None)
+        .update_timer(Some(DISCOVERY_IDLE_TIMEOUT), Some(DISCOVERY_IDLE_TIMEOUT))
         .into_result()
         .map_err(|error| error.to_string())?;
     mainloop.run();
@@ -79,7 +105,6 @@ pub fn enumerate_audio_nodes() -> Result<Vec<SourceCandidate>, String> {
     let mut candidates = candidates.borrow().clone();
     candidates.sort_by(|left, right| candidate_name(left).cmp(candidate_name(right)));
     candidates.dedup_by(|left, right| left == right);
-    filter_ambiguous_audio_candidates(&mut candidates);
     Ok(candidates)
 }
 
@@ -145,27 +170,4 @@ fn candidate_name(candidate: &SourceCandidate) -> &str {
         | SourceCandidate::Display { name, .. }
         | SourceCandidate::ApplicationAudio { name, .. } => name,
     }
-}
-
-fn filter_ambiguous_audio_candidates(candidates: &mut Vec<SourceCandidate>) {
-    let mut counts = HashMap::<(String, String), usize>::new();
-    for candidate in candidates.iter() {
-        if let SourceCandidate::ApplicationAudio { binding, .. } = candidate {
-            *counts
-                .entry((
-                    binding.process_path.clone(),
-                    binding.session_grouping_id.clone(),
-                ))
-                .or_default() += 1;
-        }
-    }
-    candidates.retain(|candidate| match candidate {
-        SourceCandidate::ApplicationAudio { binding, .. } => counts
-            .get(&(
-                binding.process_path.clone(),
-                binding.session_grouping_id.clone(),
-            ))
-            .is_some_and(|count| *count == 1),
-        _ => true,
-    });
 }

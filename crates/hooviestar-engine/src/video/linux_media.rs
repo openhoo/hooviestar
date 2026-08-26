@@ -18,11 +18,11 @@ use std::{
     path::Path,
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use uuid::Uuid;
 
@@ -106,6 +106,10 @@ pub enum MediaNotice {
         source_id: Uuid,
         reason: String,
     },
+    SeekFailed {
+        source_id: Uuid,
+        reason: String,
+    },
 }
 #[derive(Clone, Debug)]
 pub enum MediaCommand {
@@ -174,21 +178,29 @@ impl LinuxMedia {
                     audio_bus,
                     notice_tx.clone(),
                 ) {
-                    let _ = notice_tx.try_send(MediaNotice::Unsupported { source_id, reason });
+                    send_control(&notice_tx, MediaNotice::Unsupported { source_id, reason });
                 }
             })
             .map_err(|error| error.to_string())?;
-        self.commands
-            .lock()
-            .map_err(|_| "media command lock poisoned")?
-            .insert(
-                source_id,
-                MediaWorker {
-                    commands: tx,
-                    ring: worker_ring,
-                    thread: Some(worker),
-                },
-            );
+        match self.commands.lock() {
+            Ok(mut commands) => {
+                commands.insert(
+                    source_id,
+                    MediaWorker {
+                        commands: tx,
+                        ring: worker_ring,
+                        thread: Some(worker),
+                    },
+                );
+            }
+            Err(_) => {
+                // The worker thread already runs; hand it a Stop so the
+                // pipeline tears down via PipelineNullGuard instead of being
+                // orphaned by this early return.
+                let _ = tx.send(MediaCommand::Stop);
+                return Err("media command lock poisoned".to_string());
+            }
+        }
         Ok(())
     }
     pub fn command(&self, source_id: Uuid, command: MediaCommand) {
@@ -196,7 +208,11 @@ impl LinuxMedia {
             && let Some(worker) = commands.get(&source_id)
         {
             match &command {
-                MediaCommand::Play => worker.ring.lock().set_active(true),
+                // Play does NOT pre-arm the ring here: the worker arms it
+                // only after the pipeline actually reached Playing, so a
+                // reopen/backoff window never exposes a re-armed-but-stale
+                // ring. Pause/Stop mute immediately.
+                MediaCommand::Play => {}
                 MediaCommand::Pause | MediaCommand::Stop => {
                     worker.ring.lock().set_active(false);
                 }
@@ -206,15 +222,26 @@ impl LinuxMedia {
         }
     }
     pub fn remove(&self, source_id: Uuid, audio: &MediaAudioBus) {
-        if let Ok(mut commands) = self.commands.lock() {
-            commands.remove(&source_id);
-        }
+        // Join the worker AFTER releasing the map lock: MediaWorker::drop
+        // waits for the media thread, which must never stall the render
+        // thread while it holds the command map.
+        let worker = self
+            .commands
+            .lock()
+            .ok()
+            .and_then(|mut commands| commands.remove(&source_id));
+        drop(worker);
         audio.lock().remove(&source_id);
     }
     pub fn shutdown(&self, audio: &MediaAudioBus) {
-        if let Ok(mut commands) = self.commands.lock() {
-            commands.clear();
-        }
+        // Same as remove(): take every worker out, release the lock, then
+        // let the workers join.
+        let workers = self
+            .commands
+            .lock()
+            .map(|mut commands| std::mem::take(&mut *commands))
+            .unwrap_or_default();
+        drop(workers);
         audio.lock().clear();
     }
     pub fn drain_notices(&self) -> Vec<MediaNotice> {
@@ -224,6 +251,13 @@ impl LinuxMedia {
             .unwrap_or_default()
     }
 }
+
+/// Forward PTS delta above this is a seek-style discontinuity rather than a
+/// pacing target; legitimate inter-frame intervals stay far below it.
+const PACE_DISCONT_JUMP_NS: u64 = 500_000_000;
+/// Clamp for one pacing sleep so a missed transition can never park a
+/// streaming thread for the length of the jump.
+const PACE_MAX_SLEEP: Duration = Duration::from_millis(100);
 
 struct MediaPacer {
     origin: std::time::Instant,
@@ -242,9 +276,17 @@ impl MediaPacer {
         }
     }
 
-    fn delay(&mut self, pts_ns: u64) -> Option<Duration> {
+    fn delay(&mut self, pts_ns: u64, discont: bool) -> Option<Duration> {
         let now = std::time::Instant::now();
-        if !self.initialized || pts_ns < self.last_pts_ns {
+        // Backward jumps (EOS restart, rewind seeks) and forward jumps beyond
+        // any legal inter-frame interval (flush seeks) are discontinuities:
+        // re-anchor instead of sleeping until wall time catches up.
+        let forward_jump_ns = pts_ns.saturating_sub(self.last_pts_ns);
+        if discont
+            || !self.initialized
+            || pts_ns < self.last_pts_ns
+            || forward_jump_ns > PACE_DISCONT_JUMP_NS
+        {
             self.origin = now;
             self.origin_pts_ns = pts_ns;
             self.last_pts_ns = pts_ns;
@@ -253,15 +295,146 @@ impl MediaPacer {
         }
         self.last_pts_ns = pts_ns;
         let target = Duration::from_nanos(pts_ns.saturating_sub(self.origin_pts_ns));
-        target.checked_sub(now.duration_since(self.origin))
+        target
+            .checked_sub(now.duration_since(self.origin))
+            .map(|delay| delay.min(PACE_MAX_SLEEP))
     }
 }
 
-fn pace(pacer: &Mutex<MediaPacer>, pts_ns: u64) {
-    let delay = pacer.lock().delay(pts_ns);
+fn pace(pacer: &Mutex<MediaPacer>, pts_ns: u64, discont: bool) {
+    let delay = pacer.lock().delay(pts_ns, discont);
     if let Some(delay) = delay {
         thread::sleep(delay);
     }
+}
+
+/// Unsupported verdicts are latched per playback session: one root cause must
+/// produce one notice, not one per rejected sample or bus message.
+fn send_unsupported_once(
+    latch: &AtomicBool,
+    notices: &mpsc::SyncSender<MediaNotice>,
+    source_id: Uuid,
+    reason: String,
+) {
+    // Terminal verdict: retried through a bounded window so a burst of
+    // video-frame try_sends cannot deadlock teardown, yet survives a full
+    // channel long enough for the drain to catch up.
+    if !latch.swap(true, Ordering::AcqRel) {
+        send_control(notices, MediaNotice::Unsupported { source_id, reason });
+    }
+}
+
+/// Bounded delivery for control notices: video-frame try_send bursts can
+/// fill the whole channel during a render stall, and the render thread may
+/// be the very thread joining this worker on teardown — a blocking send
+/// there would deadlock MediaWorker::drop forever. Retry through transient
+/// bursts, then give up silently instead of hanging.
+fn send_control(notices: &mpsc::SyncSender<MediaNotice>, mut notice: MediaNotice) {
+    for _ in 0..200 {
+        match notices.try_send(notice) {
+            Ok(()) => return,
+            Err(mpsc::TrySendError::Full(returned)) => notice = returned,
+            Err(mpsc::TrySendError::Disconnected(_)) => return,
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+struct PipelineNullGuard<'a>(&'a gst::Pipeline);
+
+impl Drop for PipelineNullGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.set_state(gst::State::Null);
+    }
+}
+
+/// Bounded reopen policy for transient GStreamer failures: instead of
+/// latching a session-wide Unsupported verdict on the first hiccup, tear
+/// the pipeline down and retry opening with a fixed backoff. The budget is
+/// cumulative across attempts and only refills after CLEAN_STRETCH of
+/// genuinely delivered playback within one attempt, so a source that emits
+/// one sample per cycle and then fails cannot livelock the rebuild loop.
+/// MAX_REOPEN_CYCLES charges without such a clean stretch end the retries
+/// with a latched Unsupported verdict.
+const MAX_REOPEN_CYCLES: u32 = 6;
+const RETRY_BACKOFF: Duration = Duration::from_millis(250);
+const CLEAN_STRETCH: Duration = Duration::from_secs(5);
+
+/// Cumulative transient-failure budget shared by all pipeline attempts.
+struct ReopenBudget {
+    /// Transient results charged since the last clean stretch.
+    cumulative: AtomicU32,
+    /// First delivered-sample instant of the current attempt; a full
+    /// CLEAN_STRETCH of delivered playback resets the cumulative charge.
+    playback_start: Mutex<Option<Instant>>,
+    /// Most recent delivered-sample instant of the current attempt; lets
+    /// charge() distinguish sustained playback from a lone stale sample.
+    last_sample: Mutex<Option<Instant>>,
+}
+
+impl ReopenBudget {
+    fn new() -> Self {
+        Self {
+            cumulative: AtomicU32::new(0),
+            playback_start: Mutex::new(None),
+            last_sample: Mutex::new(None),
+        }
+    }
+
+    /// Record the first delivered sample push of the current attempt;
+    /// later pushes keep the original instant.
+    fn note_playback_start(&self) {
+        let mut start = self.playback_start.lock();
+        if start.is_none() {
+            *start = Some(Instant::now());
+        }
+    }
+
+    /// Record one delivered sample of the current attempt: starts the
+    /// clean-stretch clock on the first sample (set-if-none) and refreshes
+    /// the most-recent-delivery instant on every sample, audio and video.
+    fn note_sample(&self) {
+        *self.last_sample.lock() = Some(Instant::now());
+        self.note_playback_start();
+    }
+
+    /// Clear per-attempt delivery tracking; called before every pipeline
+    /// attempt so partial delivery cannot accumulate clean-stretch time
+    /// across rebuilds.
+    fn begin_attempt(&self) {
+        *self.playback_start.lock() = None;
+        *self.last_sample.lock() = None;
+    }
+
+    /// Charge one Transient result and return the cumulative count. The
+    /// counter resets only when the previous attempt both started delivery
+    /// a full CLEAN_STRETCH ago AND kept delivering until recently; one
+    /// sample followed by a long stall is not a clean stretch, so flappers
+    /// cannot reset their charge every cycle.
+    fn charge(&self) -> u32 {
+        // Scoped sequentially, never nested: the sample callbacks take
+        // these mutexes in the opposite order.
+        let started_long_ago = self
+            .playback_start
+            .lock()
+            .is_some_and(|start| start.elapsed() >= CLEAN_STRETCH);
+        let delivered_recently = self
+            .last_sample
+            .lock()
+            .is_some_and(|last| last.elapsed() < CLEAN_STRETCH);
+        if started_long_ago && delivered_recently {
+            self.cumulative.store(0, Ordering::Relaxed);
+        }
+        self.cumulative.fetch_add(1, Ordering::Relaxed) + 1
+    }
+}
+
+/// Outcome of one pipeline attempt: `Finished` ended playback gracefully,
+/// `Transient` carries the reason a reopen should be tried before the
+/// existing fatal-Err path latches the session.
+enum MediaAttempt {
+    Finished,
+    Transient(String),
 }
 
 fn run_pipeline(
@@ -273,20 +446,105 @@ fn run_pipeline(
     audio_bus: MediaAudioBus,
     notices: mpsc::SyncSender<MediaNotice>,
 ) -> Result<(), String> {
-    let audio_only = {
+    // One Unsupported verdict per playback session (fresh latch per open());
+    // the latch survives pipeline rebuilds so a genuine verdict is never
+    // retried away.
+    let unsupported_latch = Arc::new(AtomicBool::new(false));
+    // Desired playback state shared with the pipeline attempts; `true`
+    // preserves the cold-open autoplay behavior.
+    let desired_playing = Arc::new(AtomicBool::new(true));
+    let budget = Arc::new(ReopenBudget::new());
+    loop {
+        budget.begin_attempt();
+        let outcome = run_pipeline_once(
+            source_id,
+            uri,
+            &mut looped,
+            &commands,
+            &ring,
+            &audio_bus,
+            &notices,
+            &unsupported_latch,
+            &desired_playing,
+            &budget,
+        )?;
+        match outcome {
+            MediaAttempt::Finished => return Ok(()),
+            MediaAttempt::Transient(reason) => {
+                let used = budget.charge();
+                if used >= MAX_REOPEN_CYCLES {
+                    // Sustained flapping without a clean stretch: stop the
+                    // rebuild loop and surface a truthful verdict instead of
+                    // retrying forever.
+                    send_unsupported_once(
+                        &unsupported_latch,
+                        &notices,
+                        source_id,
+                        "Medium wiederholt fehlgeschlagen (wiederholtes Nachladen)".to_string(),
+                    );
+                    // Terminal verdict mirror of run_pipeline_once's tail:
+                    // consumers must observe the final paused state even
+                    // when the lone Unsupported verdict above was lost on a
+                    // saturated channel. The pipeline is already torn down,
+                    // so position/duration are unknown.
+                    send_control(
+                        &notices,
+                        MediaNotice::State {
+                            source_id,
+                            state: MediaRuntimeState {
+                                playing: false,
+                                position_seconds: 0.0,
+                                duration_seconds: None,
+                            },
+                        },
+                    );
+                    return Ok(());
+                }
+                eprintln!(
+                    "media pipeline retry {used}/{MAX_REOPEN_CYCLES} in {RETRY_BACKOFF:?}: {reason}"
+                );
+                thread::sleep(RETRY_BACKOFF);
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_pipeline_once(
+    source_id: Uuid,
+    uri: &str,
+    looped: &mut bool,
+    commands: &mpsc::Receiver<MediaCommand>,
+    ring: &Arc<Mutex<PcmRing>>,
+    audio_bus: &MediaAudioBus,
+    notices: &mpsc::SyncSender<MediaNotice>,
+    unsupported_latch: &Arc<AtomicBool>,
+    desired_playing: &Arc<AtomicBool>,
+    budget: &Arc<ReopenBudget>,
+) -> Result<MediaAttempt, String> {
+    let audio_ext: Option<&'static str> = {
         let lower = uri.to_ascii_lowercase();
-        lower.ends_with(".wav") || lower.ends_with(".mp3")
+        [".flac", ".ogg", ".opus", ".m4a", ".aac", ".wav", ".mp3"]
+            .into_iter()
+            .find(|extension| lower.ends_with(extension))
+            .map(|extension| extension.trim_start_matches('.'))
     };
+    let audio_only = audio_ext.is_some();
     let launch = if audio_only {
         "uridecodebin name=decode ! queue ! audioconvert ! audioresample ! audio/x-raw,format=F32LE,rate=48000,channels=2,layout=interleaved ! appsink name=audio_sink sync=true async=false max-buffers=16 drop=true emit-signals=true".to_string()
     } else {
-        "uridecodebin name=decode ! queue ! capsfilter caps=\"video/x-raw(memory:DMABuf),format=DMA_DRM\" ! appsink name=video_sink sync=true async=false max-buffers=2 drop=false emit-signals=true decode. ! queue ! audioconvert ! audioresample ! audio/x-raw,format=F32LE,rate=48000,channels=2,layout=interleaved ! appsink name=audio_sink sync=true async=false max-buffers=16 drop=true emit-signals=true".to_string()
+        "uridecodebin name=decode ! queue ! capsfilter caps=\"video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=NV12\" ! appsink name=video_sink sync=true async=false max-buffers=2 drop=false emit-signals=true decode. ! queue ! audioconvert ! audioresample ! audio/x-raw,format=F32LE,rate=48000,channels=2,layout=interleaved ! appsink name=audio_sink sync=true async=false max-buffers=16 drop=true emit-signals=true".to_string()
     };
     let element = gst::parse::launch_full(&launch, None, gst::ParseFlags::empty())
         .map_err(|e| format!("hardware DMA-BUF pipeline: {e}"))?;
     let pipeline = element
         .downcast::<gst::Pipeline>()
         .map_err(|_| "media pipeline is not a GstPipeline".to_string())?;
+    // Every error exit after this point must leave the pipeline in NULL;
+    // GStreamer only disposes elements and streaming threads safely from a
+    // stopped state. The Stop arm sets NULL itself; the guard's extra
+    // transition is a harmless no-op.
+    let _pipeline_guard = PipelineNullGuard(&pipeline);
     pipeline
         .by_name("decode")
         .ok_or_else(|| "uridecodebin missing".to_string())?
@@ -305,11 +563,13 @@ fn run_pipeline(
         .downcast::<AppSink>()
         .map_err(|_| "audio sink is not appsink".to_string())?;
     if let Some(video) = video {
+        let unsupported_for_video = unsupported_latch.clone();
         let notice_for_video = notices.clone();
         let video_sequence = Arc::new(AtomicU64::new(0));
         let sequence_for_video = video_sequence.clone();
         let video_pacer = Arc::new(Mutex::new(MediaPacer::new()));
         let pacer_for_video = video_pacer.clone();
+        let budget_for_video = budget.clone();
         video.set_callbacks(
             AppSinkCallbacks::builder()
                 .new_sample(move |sink| {
@@ -319,12 +579,13 @@ fn run_pipeline(
                         .features(0)
                         .is_some_and(|features| features.contains("memory:DMABuf"))
                     {
-                        let _ = notice_for_video.try_send(MediaNotice::Unsupported {
-                        source_id,
-                        reason:
+                        send_unsupported_once(
+                            &unsupported_for_video,
+                            &notice_for_video,
+                            source_id,
                             "Software-/Systemspeicher-Videodecoder abgelehnt; DMA-BUF erforderlich"
                                 .into(),
-                    });
+                        );
                         return Err(gst::FlowError::NotNegotiated);
                     }
                     let info = VideoInfoDmaDrm::from_caps(caps)
@@ -334,7 +595,13 @@ fn run_pipeline(
                         .and_then(|buffer| buffer.pts())
                         .map(|timestamp| timestamp.nseconds())
                         .unwrap_or(0);
-                    pace(&pacer_for_video, timestamp_ns);
+                    let discont = sample
+                        .buffer()
+                        .is_some_and(|buffer| buffer.flags().contains(gst::BufferFlags::DISCONT));
+                    pace(&pacer_for_video, timestamp_ns, discont);
+                    // First delivered DMA-BUF frame of this attempt: start
+                    // the clean-stretch clock even for audio-less sources.
+                    budget_for_video.note_sample();
                     let _ = notice_for_video.try_send(MediaNotice::Video(MediaVideoFrame {
                         source_id,
                         sequence: sequence_for_video.fetch_add(1, Ordering::Relaxed),
@@ -356,6 +623,7 @@ fn run_pipeline(
     let bus_for_audio = audio_bus.clone();
     let audio_pacer = Arc::new(Mutex::new(MediaPacer::new()));
     let pacer_for_audio = audio_pacer.clone();
+    let budget_for_audio = budget.clone();
     audio.set_callbacks(
         AppSinkCallbacks::builder()
             .new_sample(move |sink| {
@@ -366,12 +634,16 @@ fn run_pipeline(
                     .pts()
                     .map(|timestamp| timestamp.nseconds())
                     .unwrap_or(0);
-                pace(&pacer_for_audio, pts_ns);
+                let discont = buffer.flags().contains(gst::BufferFlags::DISCONT);
+                pace(&pacer_for_audio, pts_ns, discont);
                 let bytes = map.as_slice();
                 if !registered_for_audio.swap(true, Ordering::AcqRel) {
                     bus_for_audio
                         .lock()
                         .insert(source_id, ring_for_audio.clone());
+                    // First delivered sample of this attempt: start the
+                    // clean-stretch clock that can refill the reopen budget.
+                    budget_for_audio.note_playback_start();
                 }
                 let mut ring = ring_for_audio.lock();
                 for chunk in bytes.as_chunks::<8>().0 {
@@ -380,6 +652,9 @@ fn run_pipeline(
                         f32::from_le_bytes(chunk[4..8].try_into().unwrap()),
                     ]);
                 }
+                // Refresh per-attempt delivery progress on EVERY sample so
+                // charge() sees recent delivery, not an ancient first one.
+                budget_for_audio.note_sample();
                 Ok(gst::FlowSuccess::Ok)
             })
             .build(),
@@ -387,49 +662,107 @@ fn run_pipeline(
     pipeline
         .set_state(gst::State::Paused)
         .map_err(|e| format!("pause media pipeline: {e:?}"))?;
-    pipeline
-        .set_state(gst::State::Playing)
-        .map_err(|e| format!("start media pipeline: {e:?}"))?;
+    // Honor the desired playback state across reopens instead of
+    // force-resuming: an attempt that died while paused must come back
+    // paused, with the ring left inactive until a real transition to
+    // Playing.
+    let want_playing = desired_playing.load(Ordering::Relaxed);
+    if want_playing {
+        pipeline
+            .set_state(gst::State::Playing)
+            .map_err(|e| format!("start media pipeline: {e:?}"))?;
+        // A retry teardown set the ring inactive (and cleared it); re-arm so
+        // audio flows again without waiting for a Play command.
+        ring.lock().set_active(true);
+    }
     let bus = pipeline
         .bus()
         .ok_or_else(|| "media pipeline has no bus".to_string())?;
-    let mut playing = true;
+    let mut playing = want_playing;
+    let mut ended = false;
+    // Letzter gesendeter Stand (playing, position, duration) für das
+    // State-Dedup über exakte Gleichheit — anders als der Windows-Pfad
+    // (send_media_state), der Positionsfortschritt auf 0,25 s quantisiert.
+    let mut last_state: Option<(bool, f64, Option<f64>)> = None;
+    let mut retry_reason: Option<String> = None;
     loop {
         while let Ok(command) = commands.try_recv() {
             match command {
                 MediaCommand::Play => {
-                    if !playing {
-                        pipeline
+                    // Only a natural end-of-playback restarts from zero; a
+                    // plain Play after Pause resumes at the paused position.
+                    let mut resumed = !ended;
+                    if ended
+                        && pipeline
                             .seek_simple(
                                 gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
                                 gst::ClockTime::ZERO,
                             )
-                            .map_err(|error| format!("restart media: {error}"))?;
+                            .inspect_err(|error| eprintln!("restart media failed: {error:?}"))
+                            .is_ok()
+                    {
+                        ended = false;
+                        resumed = true;
+                        // The FLUSH seek invalidated pre-jump PCM: drop
+                        // stale audio instead of replaying it over the new
+                        // position.
+                        ring.lock().clear();
                     }
-                    pipeline
-                        .set_state(gst::State::Playing)
-                        .map_err(|e| format!("play media: {e:?}"))?;
-                    playing = true;
+                    // A failed restart seek leaves playback honestly
+                    // paused/inactive; the next Play retries the restart.
+                    // A failed state change is a transient hiccup, not a
+                    // codec verdict: log it and keep the pipeline running so
+                    // Stop stays serviceable and a later Play can retry.
+                    if resumed {
+                        match pipeline.set_state(gst::State::Playing) {
+                            Ok(_) => {
+                                playing = true;
+                                ring.lock().set_active(true);
+                                desired_playing.store(true, Ordering::Relaxed);
+                            }
+                            Err(_) => {
+                                eprintln!("play media: set_state(Playing) fehlgeschlagen");
+                            }
+                        }
+                    }
                 }
                 MediaCommand::Pause => {
-                    pipeline
-                        .set_state(gst::State::Paused)
-                        .map_err(|e| format!("pause media: {e:?}"))?;
-                    playing = false;
+                    if pipeline.set_state(gst::State::Paused).is_ok() {
+                        playing = false;
+                        desired_playing.store(false, Ordering::Relaxed);
+                    } else {
+                        eprintln!("pause media: set_state(Paused) fehlgeschlagen");
+                    }
                 }
                 MediaCommand::Seek(seconds) => {
                     let nanos = (seconds.max(0.0) * 1_000_000_000.0) as u64;
-                    pipeline
-                        .seek_simple(
-                            gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
-                            gst::ClockTime::from_nseconds(nanos),
-                        )
-                        .map_err(|error| format!("seek media: {error}"))?;
+                    match pipeline.seek_simple(
+                        gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
+                        gst::ClockTime::from_nseconds(nanos),
+                    ) {
+                        Ok(()) => {
+                            ended = false;
+                            // The FLUSH seek invalidated decoded PCM: drop
+                            // stale audio so the ring never replays samples
+                            // from before the jump.
+                            ring.lock().clear();
+                        }
+                        Err(error) => {
+                            eprintln!("seek media failed: {error:?}");
+                            send_control(
+                                notices,
+                                MediaNotice::SeekFailed {
+                                    source_id,
+                                    reason: format!("Seek fehlgeschlagen: {error:?}"),
+                                },
+                            );
+                        }
+                    }
                 }
-                MediaCommand::SetLoop(value) => looped = value,
+                MediaCommand::SetLoop(value) => *looped = value,
                 MediaCommand::Stop => {
                     let _ = pipeline.set_state(gst::State::Null);
-                    return Ok(());
+                    return Ok(MediaAttempt::Finished);
                 }
             }
         }
@@ -437,31 +770,87 @@ fn run_pipeline(
             use gst::MessageView;
             match message.view() {
                 MessageView::Eos(..) => {
-                    if looped {
-                        let _ = pipeline.seek_simple(
+                    if *looped {
+                        // A failed loop seek silently wedges playback (no
+                        // further frames, ended unreachable); log it, mark
+                        // the attempt ended and mute the ring so the next
+                        // user Play can take the ended-based restart path.
+                        if let Err(error) = pipeline.seek_simple(
                             gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
                             gst::ClockTime::ZERO,
-                        );
+                        ) {
+                            send_control(
+                                notices,
+                                MediaNotice::SeekFailed {
+                                    source_id,
+                                    reason: format!("Wiederholungs-Seek fehlgeschlagen: {error:?}"),
+                                },
+                            );
+                            eprintln!("loop media seek failed: {error:?}");
+                            ended = true;
+                            ring.lock().set_active(false);
+                        } else {
+                            // The FLUSH loop seek invalidated decoded PCM
+                            // from the previous pass: drop it instead of
+                            // replaying stale audio at the restart.
+                            ring.lock().clear();
+                        }
                     } else {
                         playing = false;
+                        ended = true;
+                        // Natural end: persist the paused/ended desire so a
+                        // later transient error reopens paused instead of
+                        // spontaneously replaying finished media.
+                        desired_playing.store(false, Ordering::Relaxed);
                         ring.lock().set_active(false);
                         let _ = pipeline.set_state(gst::State::Paused);
                     }
                 }
                 MessageView::Error(error) => {
                     let detail = error.debug().unwrap_or_default();
-                    if detail.contains("not-linked")
-                        || error
-                            .error()
-                            .message()
-                            .contains("Internal data stream error")
-                    {
-                        return Err(
-                            "Hardware-DMA-BUF-Videodecoder nicht verfügbar; Software- und Systemspeicher-Videodecoder bleiben deaktiviert"
-                                .into(),
-                        );
+                    let glib_error = error.error();
+                    // Stream-domain errors (not-linked, internal data stream
+                    // errors, mid-stream decode failures) and Resource/Core
+                    // errors (busy file, IO hiccup, device loss) also fire
+                    // for transient playback problems; reopen the pipeline
+                    // instead of blaming the hardware decoder stack and
+                    // permanently removing the source.
+                    let transient = glib_error.kind::<gst::StreamError>().is_some()
+                        || detail.contains("not-linked")
+                        || glib_error.message().contains("Internal data stream error")
+                        || glib_error.kind::<gst::ResourceError>().is_some()
+                        || glib_error.kind::<gst::CoreError>().is_some();
+                    // A negotiation failure here means no decoder could
+                    // produce the DMA-BUF NV12 the capsfilter mandates;
+                    // report why immediately instead of retrying or ending
+                    // playback silently.
+                    let indication = format!("{} {detail}", glib_error.message()).to_lowercase();
+                    if transient && indication.contains("negotiat") {
+                        // Audio-classified files have no DMA-BUF video
+                        // expectation; blame the audio format truthfully.
+                        let reason = match audio_ext {
+                            Some(extension) => {
+                                format!("Audioformat nicht unterstützt: {extension}")
+                            }
+                            None => {
+                                format!("DMA-BUF-Videounterhandlung fehlgeschlagen: {detail}")
+                            }
+                        };
+                        send_unsupported_once(unsupported_latch, notices, source_id, reason);
+                        ring.lock().set_active(false);
+                        break;
                     }
-                    return Err(format!("{}: {detail}", error.error()));
+                    if !transient {
+                        // Terminal exit without any rebuild attempt: mute
+                        // the ring like every sibling exit, otherwise the
+                        // mixer keeps popping stale audio forever.
+                        ring.lock().set_active(false);
+                        return Err(format!("{}: {detail}", glib_error));
+                    }
+                    eprintln!("media transient error, reopening pipeline: {detail}");
+                    ring.lock().set_active(false);
+                    retry_reason = Some(format!("transient media error: {detail}"));
+                    break;
                 }
                 _ => {}
             }
@@ -470,16 +859,49 @@ fn run_pipeline(
             .query_position::<gst::ClockTime>()
             .map(|t| t.seconds() as f64)
             .unwrap_or(0.0);
-        let _ = notices.try_send(MediaNotice::State {
+        let duration = pipeline
+            .query_duration::<gst::ClockTime>()
+            .map(|t| t.seconds() as f64);
+        let state = (playing, position, duration);
+        // MediaState nur bei Aenderung senden; pausierte oder beendete
+        // Pipelines erzeugen sonst 25 Events/s ohne jeden Informationsgewinn.
+        if last_state != Some(state) {
+            let notice = MediaNotice::State {
+                source_id,
+                state: MediaRuntimeState {
+                    playing,
+                    position_seconds: position,
+                    duration_seconds: duration,
+                },
+            };
+            // Dedup-Gedaechtnis erst nach erfolgreicher Zustellung committen;
+            // ein voller Kanal degradiert zu verzoegerter statt verlorener Uebertragung.
+            if notices.try_send(notice).is_ok() {
+                last_state = Some(state);
+            }
+        }
+        thread::sleep(Duration::from_millis(40));
+    }
+    if let Some(reason) = retry_reason {
+        return Ok(MediaAttempt::Transient(reason));
+    }
+    // Terminal verdict: this final paused State must reach the consumer
+    // even on a full channel; the worker exits right after.
+    send_control(
+        notices,
+        MediaNotice::State {
             source_id,
             state: MediaRuntimeState {
-                playing,
-                position_seconds: position,
+                playing: false,
+                position_seconds: pipeline
+                    .query_position::<gst::ClockTime>()
+                    .map(|t| t.seconds() as f64)
+                    .unwrap_or(0.0),
                 duration_seconds: pipeline
                     .query_duration::<gst::ClockTime>()
                     .map(|t| t.seconds() as f64),
             },
-        });
-        thread::sleep(Duration::from_millis(40));
-    }
+        },
+    );
+    Ok(MediaAttempt::Finished)
 }

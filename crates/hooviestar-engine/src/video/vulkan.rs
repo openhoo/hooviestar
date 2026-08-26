@@ -17,6 +17,7 @@ use std::{
     ffi::CString,
     io::Cursor,
     os::fd::{AsRawFd, FromRawFd, IntoRawFd},
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -34,7 +35,7 @@ use super::{
         PipeWirePortalLink,
     },
     linux_media::{LinuxMedia, MediaCommand, MediaNotice, MediaVideoFrame},
-    text_raster::{TextCache, TextKey, parse_color as parse_text_color},
+    text_raster::{TextAlignKey, TextCache, TextKey, parse_color as parse_text_color},
 };
 use crate::{
     audio::MediaAudioBus,
@@ -53,6 +54,18 @@ const ITEM_FRAG: &[u8] = include_bytes!("shaders/item.frag.spv");
 const COMPOSITE_VERT: &[u8] = include_bytes!("shaders/composite.vert.spv");
 const COMPOSITE_FRAG: &[u8] = include_bytes!("shaders/composite.frag.spv");
 const MAX_SCENE_ITEMS: usize = 128;
+/// Maximum consecutive compositor creation failures before the render thread
+/// gives up permanently (mirrors the Windows render loop).
+const MAX_RECOVERY_FAILURES: u32 = 8;
+/// Minimum interval between re-import attempts of a failing portal/media
+/// DMA-BUF source.
+const IMPORT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Bounded self-heal cadence for latched media: an Unsupported verdict or a
+/// failed open retries through a fresh open session after this cooldown
+/// instead of staying dead forever (Windows-parity), without re-attempting
+/// on every tick.
+const MEDIA_RETRY_COOLDOWN: Duration = Duration::from_secs(30);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -86,7 +99,6 @@ struct SwapchainTarget {
     rendered: Vec<vk::Semaphore>,
     extent: vk::Extent2D,
     available: vk::Semaphore,
-    fence: vk::Fence,
     descriptor_set: vk::DescriptorSet,
     pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
@@ -96,18 +108,104 @@ struct ImportedFrame {
     image: vk::Image,
     memories: Vec<vk::DeviceMemory>,
     view: vk::ImageView,
-    sampler: Option<vk::Sampler>,
-    conversion: Option<vk::SamplerYcbcrConversion>,
 }
 
 struct CachedExternalFrame {
     sequence: u64,
     texture: ImportedFrame,
+    /// NV12 media imports use DISJOINT storage: ownership barriers must
+    /// address PLANE_0/PLANE_1 instead of COLOR.
+    disjoint: bool,
+    /// Imported images start in UNDEFINED; the first acquire transitions
+    /// UNDEFINED -> SHADER_READ_ONLY_OPTIMAL, later ones assume the
+    /// steady-state GENERAL layout the release barrier restores.
+    acquired: bool,
+}
+
+/// One external image taking part in the per-frame queue-family ownership
+/// transfer, with the subresource ranges its barriers must address.
+struct ExternalImageState {
+    image: vk::Image,
+    first_acquire: bool,
+    ranges: [vk::ImageSubresourceRange; 2],
+    range_count: usize,
+}
+
+/// Cheap identity probe stored next to each uploaded static texture so the
+/// per-frame hit check compares stored fields by reference instead of
+/// rebuilding cache-key strings and copying RGBA bitmaps every frame.
+enum StaticIdentity {
+    Image {
+        path: PathBuf,
+        fingerprint: (u128, u64),
+    },
+    Text(TextKey),
 }
 
 struct CachedStaticTexture {
-    key: String,
+    identity: StaticIdentity,
     texture: ImportedFrame,
+}
+
+/// What [`VulkanCompositor::synchronize_static_textures`] prepared for one
+/// visible static source this frame. The RGBA buffer is materialized only
+/// when an upload is actually required.
+enum PreparedStatic {
+    /// The uploaded texture already matches the source; nothing to do.
+    Unchanged,
+    Image {
+        path: PathBuf,
+        fingerprint: (u128, u64),
+        width: u32,
+        height: u32,
+        rgba8: Vec<u8>,
+    },
+    Text {
+        key: TextKey,
+        width: u32,
+        height: u32,
+        rgba8: Vec<u8>,
+    },
+}
+
+/// Borrowed view of one visible text item. Lets the hit check and the
+/// `TextCache` retain pass compare keys without cloning the text/family
+/// strings per frame.
+#[derive(Clone, Copy)]
+struct DesiredTextKey<'a> {
+    text: &'a str,
+    family: &'a str,
+    size_bits: u32,
+    weight: u16,
+    color: [u8; 4],
+    background: [u8; 4],
+    align: TextAlignKey,
+    width: u32,
+    height: u32,
+}
+
+impl DesiredTextKey<'_> {
+    fn matches(&self, key: &TextKey) -> bool {
+        key.text == self.text
+            && key.family == self.family
+            && key.size_bits == self.size_bits
+            && key.weight == self.weight
+            && key.color == self.color
+            && key.background == self.background
+            && key.align == self.align
+            && key.width == self.width
+            && key.height == self.height
+    }
+}
+
+/// CPU-side static-content caches owned by the render thread rather than the
+/// compositor: decoded images, rasterized text, and failure records survive
+/// swapchain/device recreations.
+#[derive(Default)]
+struct StaticCaches {
+    image_cache: ImageCache,
+    text_cache: TextCache,
+    static_failures: HashMap<Uuid, String>,
 }
 
 struct VulkanCompositor {
@@ -122,6 +220,10 @@ struct VulkanCompositor {
     queue_family: u32,
     command_pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
+    /// Shared per-frame submission fence. Only one fence is ever
+    /// waited/reset/submitted (the render loop paces on it); it lives on the
+    /// compositor rather than per swapchain target.
+    frame_fence: vk::Fence,
     scene: SceneTarget,
     scene_sampler: vk::Sampler,
     item_sampler: vk::Sampler,
@@ -130,21 +232,103 @@ struct VulkanCompositor {
     item_descriptors: Vec<vk::DescriptorSet>,
     placeholder: ImportedFrame,
     static_textures: HashMap<Uuid, CachedStaticTexture>,
-    image_cache: ImageCache,
     media_textures: HashMap<Uuid, CachedExternalFrame>,
-    text_cache: TextCache,
-    static_failures: HashMap<Uuid, String>,
     portal_textures: HashMap<Uuid, CachedExternalFrame>,
     item_pipeline: vk::Pipeline,
     item_pipeline_layout: vk::PipelineLayout,
+    /// NV12 media sampling must be fixed at pipeline-creation time through an
+    /// immutable sampler (Vulkan spec, Sampler YCbCr Conversion): these are the
+    /// shared conversion, its sampler, and the dedicated descriptor layout,
+    /// pipeline, and sets exposing it. Binding 0 of `sampler_layout` stays
+    /// non-YCbCr so portal/static/placeholder views keep using it
+    /// (VUID-VkWriteDescriptorSet-01948: view and immutable-sampler
+    /// conversions must match).
+    media_sampler: vk::Sampler,
+    media_conversion: vk::SamplerYcbcrConversion,
+    media_sampler_layout: vk::DescriptorSetLayout,
+    media_item_descriptors: Vec<vk::DescriptorSet>,
+    media_item_pipeline: vk::Pipeline,
+    media_item_pipeline_layout: vk::PipelineLayout,
     program: SwapchainTarget,
     preview: SwapchainTarget,
     output_width: u32,
     output_height: u32,
 }
 
-impl VulkanCompositor {
-    fn create(surfaces: NativeSurfaces, width: u32, height: u32) -> Result<Self, String> {
+/// Staging state for [`VulkanCompositor::create`]. Every fallible step registers
+/// its result here immediately, so a failure anywhere in the chain can destroy
+/// exactly what was created instead of leaking a half-initialized compositor.
+struct PartialVulkan {
+    entry: Option<Entry>,
+    instance: Option<Instance>,
+    surface_loader: Option<khr::surface::Instance>,
+    external_memory_fd: Option<khr::external_memory_fd::Device>,
+    physical: vk::PhysicalDevice,
+    device: Option<Device>,
+    queue: vk::Queue,
+    queue_family: u32,
+    command_pool: Option<vk::CommandPool>,
+    command_buffer: Option<vk::CommandBuffer>,
+    frame_fence: Option<vk::Fence>,
+    scene: Option<SceneTarget>,
+    scene_sampler: Option<vk::Sampler>,
+    item_sampler: Option<vk::Sampler>,
+    descriptor_pool: Option<vk::DescriptorPool>,
+    sampler_layout: Option<vk::DescriptorSetLayout>,
+    item_descriptors: Vec<vk::DescriptorSet>,
+    placeholder: Option<ImportedFrame>,
+    item_pipeline: Option<vk::Pipeline>,
+    item_pipeline_layout: Option<vk::PipelineLayout>,
+    program: Option<SwapchainTarget>,
+    media_sampler: Option<vk::Sampler>,
+    media_conversion: Option<vk::SamplerYcbcrConversion>,
+    media_sampler_layout: Option<vk::DescriptorSetLayout>,
+    media_item_descriptors: Vec<vk::DescriptorSet>,
+    media_item_pipeline: Option<vk::Pipeline>,
+    media_item_pipeline_layout: Option<vk::PipelineLayout>,
+    preview: Option<SwapchainTarget>,
+    // Surfaces are tracked until their swapchain target adopts them.
+    program_surface: Option<vk::SurfaceKHR>,
+    preview_surface: Option<vk::SurfaceKHR>,
+}
+
+impl PartialVulkan {
+    fn new() -> Self {
+        Self {
+            entry: None,
+            instance: None,
+            surface_loader: None,
+            external_memory_fd: None,
+            physical: vk::PhysicalDevice::null(),
+            device: None,
+            queue: vk::Queue::null(),
+            queue_family: 0,
+            command_pool: None,
+            command_buffer: None,
+            frame_fence: None,
+            scene: None,
+            scene_sampler: None,
+            item_sampler: None,
+            descriptor_pool: None,
+            sampler_layout: None,
+            item_descriptors: Vec::new(),
+            placeholder: None,
+            item_pipeline: None,
+            item_pipeline_layout: None,
+            media_sampler: None,
+            media_conversion: None,
+            media_sampler_layout: None,
+            media_item_descriptors: Vec::new(),
+            media_item_pipeline: None,
+            media_item_pipeline_layout: None,
+            program: None,
+            preview: None,
+            program_surface: None,
+            preview_surface: None,
+        }
+    }
+
+    fn build(&mut self, surfaces: NativeSurfaces, width: u32, height: u32) -> Result<(), String> {
         let (display, program_window, preview_window) = raw_handles(surfaces)?;
         let entry = unsafe { Entry::load() }.map_err(|error| format!("load Vulkan: {error}"))?;
         let app_name = CString::new("Hooviestar").map_err(|error| error.to_string())?;
@@ -161,15 +345,22 @@ impl VulkanCompositor {
             .enabled_extension_names(extensions);
         let instance = unsafe { entry.create_instance(&instance_info, None) }
             .map_err(|error| format!("create Vulkan instance: {error}"))?;
+        self.entry = Some(entry.clone());
+        self.instance = Some(instance.clone());
         let surface_loader = khr::surface::Instance::new(&entry, &instance);
+        self.surface_loader = Some(surface_loader.clone());
         let program_surface =
             unsafe { ash_window::create_surface(&entry, &instance, display, program_window, None) }
-                .map_err(|error| format!("Program surface: {error}"))?;
+                .map_err(|error| format!("Programm-Oberfläche: {error}"))?;
+        self.program_surface = Some(program_surface);
         let preview_surface =
             unsafe { ash_window::create_surface(&entry, &instance, display, preview_window, None) }
-                .map_err(|error| format!("Preview surface: {error}"))?;
+                .map_err(|error| format!("Preview-Oberfläche: {error}"))?;
+        self.preview_surface = Some(preview_surface);
         let (physical, queue_family) =
             choose_device(&instance, &surface_loader, program_surface, preview_surface)?;
+        self.physical = physical;
+        self.queue_family = queue_family;
         let priority = [1.0f32];
         let queue_info = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family)
@@ -182,13 +373,23 @@ impl VulkanCompositor {
             ash::ext::image_drm_format_modifier::NAME.as_ptr(),
             ash::ext::queue_family_foreign::NAME.as_ptr(),
         ];
+        // The media path creates SamplerYcbcrConversions (core since Vulkan
+        // 1.1, and the instance requests API 1.2); without this feature flag
+        // every NV12 media import fails at conversion creation. The feature
+        // lives in its own chained struct, not in PhysicalDeviceFeatures.
+        let mut ycbcr_features = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default()
+            .sampler_ycbcr_conversion(true);
         let device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_info)
+            .push_next(&mut ycbcr_features)
             .enabled_extension_names(&extensions);
         let device = unsafe { instance.create_device(physical, &device_info, None) }
             .map_err(|error| format!("create Vulkan device: {error}"))?;
+        self.device = Some(device.clone());
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
+        self.queue = queue;
         let external_memory_fd = khr::external_memory_fd::Device::new(&instance, &device);
+        self.external_memory_fd = Some(external_memory_fd);
         let command_pool = unsafe {
             device.create_command_pool(
                 &vk::CommandPoolCreateInfo::default()
@@ -198,6 +399,7 @@ impl VulkanCompositor {
             )
         }
         .map_err(|error| format!("create command pool: {error}"))?;
+        self.command_pool = Some(command_pool);
         let command_buffer = unsafe {
             device.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
@@ -207,6 +409,17 @@ impl VulkanCompositor {
             )
         }
         .map_err(|error| format!("allocate command buffer: {error}"))?[0];
+        self.command_buffer = Some(command_buffer);
+        // One shared, initially-signaled frame fence: render() waits on it
+        // before acquiring, so the first frame must not block.
+        let frame_fence = unsafe {
+            device.create_fence(
+                &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                None,
+            )
+        }
+        .map_err(|error| format!("frame fence: {error}"))?;
+        self.frame_fence = Some(frame_fence);
         let placeholder = upload_rgba_texture(
             &instance,
             &device,
@@ -217,7 +430,7 @@ impl VulkanCompositor {
             1,
             &[0, 0, 0, 0],
         )?;
-
+        self.placeholder = Some(placeholder);
         let sampler_layout = unsafe {
             device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&[
@@ -231,17 +444,73 @@ impl VulkanCompositor {
             )
         }
         .map_err(|error| format!("descriptor layout: {error}"))?;
+        self.sampler_layout = Some(sampler_layout);
+        // Vulkan normatively requires YCbCr conversion to be fixed at
+        // pipeline-creation time through a combined image sampler with an
+        // immutable sampler in the descriptor-set layout. Create the shared
+        // NV12 conversion + sampler once and expose them through a dedicated
+        // media layout; `sampler_layout` binding 0 stays non-YCbCr for
+        // portal/static/placeholder views (VUID-VkWriteDescriptorSet-01948).
+        let media_conversion = unsafe {
+            device.create_sampler_ycbcr_conversion(
+                &vk::SamplerYcbcrConversionCreateInfo::default()
+                    .format(vk::Format::G8_B8R8_2PLANE_420_UNORM)
+                    .ycbcr_model(vk::SamplerYcbcrModelConversion::YCBCR_709)
+                    .ycbcr_range(vk::SamplerYcbcrRange::ITU_NARROW)
+                    .components(vk::ComponentMapping::default())
+                    .x_chroma_offset(vk::ChromaLocation::MIDPOINT)
+                    .y_chroma_offset(vk::ChromaLocation::MIDPOINT)
+                    .chroma_filter(vk::Filter::NEAREST),
+                None,
+            )
+        }
+        .map_err(|error| format!("create shared media YCbCr conversion: {error}"))?;
+        self.media_conversion = Some(media_conversion);
+        let mut media_conversion_info =
+            vk::SamplerYcbcrConversionInfo::default().conversion(media_conversion);
+        let media_sampler = unsafe {
+            device.create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::NEAREST)
+                    .min_filter(vk::Filter::NEAREST)
+                    .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .max_lod(1.0)
+                    .push_next(&mut media_conversion_info),
+                None,
+            )
+        }
+        .map_err(|error| format!("create shared media YCbCr sampler: {error}"))?;
+        self.media_sampler = Some(media_sampler);
+        let media_sampler_layout = unsafe {
+            device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&[
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(0)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                        .immutable_samplers(std::slice::from_ref(&media_sampler)),
+                ]),
+                None,
+            )
+        }
+        .map_err(|error| format!("media descriptor layout: {error}"))?;
+        self.media_sampler_layout = Some(media_sampler_layout);
         let descriptor_pool = unsafe {
             device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
-                    .max_sets((MAX_SCENE_ITEMS + 1) as u32)
+                    .max_sets((2 * MAX_SCENE_ITEMS + 1) as u32)
                     .pool_sizes(&[vk::DescriptorPoolSize::default()
                         .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                        .descriptor_count((MAX_SCENE_ITEMS + 1) as u32)]),
+                        .descriptor_count((2 * MAX_SCENE_ITEMS + 1) as u32)]),
                 None,
             )
         }
         .map_err(|error| format!("descriptor pool: {error}"))?;
+        self.descriptor_pool = Some(descriptor_pool);
         let descriptor_layouts = vec![sampler_layout; MAX_SCENE_ITEMS + 1];
         let sets = unsafe {
             device.allocate_descriptor_sets(
@@ -252,9 +521,21 @@ impl VulkanCompositor {
         }
         .map_err(|error| format!("descriptor sets: {error}"))?;
         let scene_descriptor = sets[0];
-        let item_descriptors = sets[1..].to_vec();
+        self.item_descriptors = sets[1..].to_vec();
+        let media_descriptor_layouts = vec![media_sampler_layout; MAX_SCENE_ITEMS];
+        let media_sets = unsafe {
+            device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(descriptor_pool)
+                    .set_layouts(&media_descriptor_layouts),
+            )
+        }
+        .map_err(|error| format!("media descriptor sets: {error}"))?;
+        self.media_item_descriptors = media_sets;
         let scene_sampler = create_sampler(&device)?;
+        self.scene_sampler = Some(scene_sampler);
         let item_sampler = create_sampler(&device)?;
+        self.item_sampler = Some(item_sampler);
         let scene_render_pass = create_render_pass(&device, vk::Format::R16G16B16A16_SFLOAT)?;
         let scene = create_scene_target(
             &instance,
@@ -271,9 +552,17 @@ impl VulkanCompositor {
             scene_sampler,
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         );
-        let item_render_pass = scene_render_pass;
+        self.scene = Some(scene);
         let item_pipeline_layout = create_item_pipeline_layout(&device, sampler_layout)?;
-        let item_pipeline = create_item_pipeline(&device, item_render_pass, item_pipeline_layout)?;
+        self.item_pipeline_layout = Some(item_pipeline_layout);
+        let item_pipeline = create_item_pipeline(&device, scene_render_pass, item_pipeline_layout)?;
+        self.item_pipeline = Some(item_pipeline);
+        let media_item_pipeline_layout =
+            create_item_pipeline_layout(&device, media_sampler_layout)?;
+        self.media_item_pipeline_layout = Some(media_item_pipeline_layout);
+        let media_item_pipeline =
+            create_item_pipeline(&device, scene_render_pass, media_item_pipeline_layout)?;
+        self.media_item_pipeline = Some(media_item_pipeline);
         let program = create_swapchain(
             &instance,
             &device,
@@ -285,6 +574,9 @@ impl VulkanCompositor {
             sampler_layout,
             scene_descriptor,
         )?;
+        self.program = Some(program);
+        // The swapchain target adopted the surface; drop our tracking entry.
+        self.program_surface = None;
         let preview = create_swapchain(
             &instance,
             &device,
@@ -296,43 +588,177 @@ impl VulkanCompositor {
             sampler_layout,
             scene_descriptor,
         )?;
-        Ok(Self {
-            instance,
-            surface_loader,
-            _entry: entry,
-            external_memory_fd,
-            physical,
-            device,
-            queue,
-            queue_family,
-            command_pool,
-            command_buffer,
-            scene,
-            scene_sampler,
-            item_sampler,
-            descriptor_pool,
-            placeholder,
-            static_textures: HashMap::new(),
-            image_cache: ImageCache::default(),
-            text_cache: TextCache::default(),
-            static_failures: HashMap::new(),
-            media_textures: HashMap::new(),
-            sampler_layout,
-            item_descriptors,
-            portal_textures: HashMap::new(),
-            item_pipeline,
-            item_pipeline_layout,
-            program,
-            preview,
-            output_width: width,
-            output_height: height,
-        })
+        self.preview = Some(preview);
+        self.preview_surface = None;
+        Ok(())
     }
 
+    /// Moves the fully built state into a compositor. Only valid after
+    /// [`PartialVulkan::build`] returned `Ok`.
+    fn into_compositor(mut self, width: u32, height: u32) -> VulkanCompositor {
+        VulkanCompositor {
+            _entry: self.entry.take().expect("Vulkan entry built"),
+            instance: self.instance.take().expect("instance built"),
+            surface_loader: self.surface_loader.take().expect("surface loader built"),
+            external_memory_fd: self
+                .external_memory_fd
+                .take()
+                .expect("external memory fd built"),
+            physical: self.physical,
+            device: self.device.take().expect("device built"),
+            queue: self.queue,
+            queue_family: self.queue_family,
+            command_pool: self.command_pool.take().expect("command pool built"),
+            command_buffer: self.command_buffer.take().expect("command buffer built"),
+            frame_fence: self.frame_fence.take().expect("frame fence built"),
+            scene: self.scene.take().expect("scene target built"),
+            scene_sampler: self.scene_sampler.take().expect("scene sampler built"),
+            item_sampler: self.item_sampler.take().expect("item sampler built"),
+            descriptor_pool: self.descriptor_pool.take().expect("descriptor pool built"),
+            sampler_layout: self.sampler_layout.take().expect("sampler layout built"),
+            item_descriptors: std::mem::take(&mut self.item_descriptors),
+            placeholder: self.placeholder.take().expect("placeholder built"),
+            static_textures: HashMap::new(),
+            media_textures: HashMap::new(),
+            portal_textures: HashMap::new(),
+            item_pipeline: self.item_pipeline.take().expect("item pipeline built"),
+            item_pipeline_layout: self
+                .item_pipeline_layout
+                .take()
+                .expect("item pipeline layout built"),
+            media_sampler: self.media_sampler.take().expect("media sampler built"),
+            media_conversion: self
+                .media_conversion
+                .take()
+                .expect("media YCbCr conversion built"),
+            media_sampler_layout: self
+                .media_sampler_layout
+                .take()
+                .expect("media sampler layout built"),
+            media_item_descriptors: std::mem::take(&mut self.media_item_descriptors),
+            media_item_pipeline: self
+                .media_item_pipeline
+                .take()
+                .expect("media item pipeline built"),
+            media_item_pipeline_layout: self
+                .media_item_pipeline_layout
+                .take()
+                .expect("media item pipeline layout built"),
+            program: self.program.take().expect("program swapchain built"),
+            preview: self.preview.take().expect("preview swapchain built"),
+            output_width: width,
+            output_height: height,
+        }
+    }
+
+    /// Destroys everything created so far, mirroring `Drop for VulkanCompositor`.
+    /// Safe on partially built state: pieces that were never created are `None`.
+    unsafe fn destroy_created(&mut self) {
+        unsafe {
+            if let Some(device) = self.device.take() {
+                let _ = device.device_wait_idle();
+                let surface_loader = self.surface_loader.clone();
+                if let Some(surface_loader) = surface_loader.as_ref() {
+                    let mut program = self.program.take();
+                    let mut preview = self.preview.take();
+                    if let Some(target) = program.as_mut() {
+                        destroy_target(&device, surface_loader, target);
+                    }
+                    if let Some(target) = preview.as_mut() {
+                        destroy_target(&device, surface_loader, target);
+                    }
+                }
+                if let Some(placeholder) = self.placeholder.take() {
+                    destroy_imported(&device, placeholder);
+                }
+                if let Some(pipeline) = self.item_pipeline.take() {
+                    device.destroy_pipeline(pipeline, None);
+                }
+                if let Some(layout) = self.item_pipeline_layout.take() {
+                    device.destroy_pipeline_layout(layout, None);
+                }
+                if let Some(pipeline) = self.media_item_pipeline.take() {
+                    device.destroy_pipeline(pipeline, None);
+                }
+                if let Some(layout) = self.media_item_pipeline_layout.take() {
+                    device.destroy_pipeline_layout(layout, None);
+                }
+                if let Some(mut scene) = self.scene.take() {
+                    destroy_scene(&device, &mut scene);
+                }
+                if let Some(sampler) = self.scene_sampler.take() {
+                    device.destroy_sampler(sampler, None);
+                }
+                if let Some(sampler) = self.item_sampler.take() {
+                    device.destroy_sampler(sampler, None);
+                }
+                if let Some(conversion) = self.media_conversion.take() {
+                    device.destroy_sampler_ycbcr_conversion(conversion, None);
+                }
+                if let Some(sampler) = self.media_sampler.take() {
+                    device.destroy_sampler(sampler, None);
+                }
+                if let Some(pool) = self.descriptor_pool.take() {
+                    device.destroy_descriptor_pool(pool, None);
+                }
+                if let Some(layout) = self.sampler_layout.take() {
+                    device.destroy_descriptor_set_layout(layout, None);
+                }
+                if let Some(layout) = self.media_sampler_layout.take() {
+                    device.destroy_descriptor_set_layout(layout, None);
+                }
+                if let Some(pool) = self.command_pool.take() {
+                    device.destroy_command_pool(pool, None);
+                }
+                if let Some(fence) = self.frame_fence.take() {
+                    device.destroy_fence(fence, None);
+                }
+                device.destroy_device(None);
+            }
+            // Swapchain targets adopt their surfaces on success; any still
+            // tracked surface was created but never adopted and needs an
+            // explicit destroy here.
+            if let Some(surface_loader) = self.surface_loader.take() {
+                for surface in [self.program_surface.take(), self.preview_surface.take()]
+                    .into_iter()
+                    .flatten()
+                {
+                    surface_loader.destroy_surface(surface, None);
+                }
+            }
+            if let Some(instance) = self.instance.take() {
+                instance.destroy_instance(None);
+            }
+        }
+    }
+}
+
+impl VulkanCompositor {
+    fn create(surfaces: NativeSurfaces, width: u32, height: u32) -> Result<Self, String> {
+        let mut partial = PartialVulkan::new();
+        match partial.build(surfaces, width, height) {
+            Ok(()) => Ok(partial.into_compositor(width, height)),
+            Err(error) => {
+                // Roll back every resource created before the failing step
+                // instead of leaking the partially initialized compositor.
+                unsafe { partial.destroy_created() };
+                Err(error)
+            }
+        }
+    }
+
+    /// Emits per-source portal import transitions onto the engine event
+    /// channel: `SourceUnavailable` when a source first enters
+    /// `import_failures`, `SourceAvailable` when a successful re-import
+    /// removes the entry. Stale eviction removes entries silently. The
+    /// failure map lives on the render thread so backoff streaks survive
+    /// compositor recreations.
     fn synchronize_portal_textures(
         &mut self,
         frames: &HashMap<Uuid, CapturedFrame>,
-    ) -> Result<(), RenderError> {
+        import_failures: &mut HashMap<Uuid, Instant>,
+        events: &std::sync::mpsc::Sender<EngineEvent>,
+    ) {
         let stale = self
             .portal_textures
             .keys()
@@ -343,6 +769,7 @@ impl VulkanCompositor {
             if let Some(cached) = self.portal_textures.remove(&source_id) {
                 destroy_imported(&self.device, cached.texture);
             }
+            import_failures.remove(&source_id);
         }
         for (source_id, frame) in frames {
             if self
@@ -352,31 +779,61 @@ impl VulkanCompositor {
             {
                 continue;
             }
-            let texture = import_frame(
+            // A source whose last import failed is retried at a bounded
+            // interval instead of every frame; until then it keeps rendering
+            // through the placeholder path.
+            if import_failures
+                .get(source_id)
+                .is_some_and(|last| last.elapsed() < IMPORT_RETRY_INTERVAL)
+            {
+                continue;
+            }
+            match import_frame(
                 &self.instance,
                 &self.device,
                 &self.external_memory_fd,
                 self.physical,
                 frame,
-            )
-            .map_err(|reason| RenderError::Import {
-                source_id: Some(*source_id),
-                reason,
-            })?;
-            if let Some(previous) = self.portal_textures.insert(
-                *source_id,
-                CachedExternalFrame {
-                    sequence: frame.sequence,
-                    texture,
-                },
             ) {
-                destroy_imported(&self.device, previous.texture);
+                Ok(texture) => {
+                    if import_failures.remove(source_id).is_some() {
+                        let _ = events.send(EngineEvent::SourceAvailable {
+                            source_id: *source_id,
+                        });
+                    }
+                    if let Some(previous) = self.portal_textures.insert(
+                        *source_id,
+                        CachedExternalFrame {
+                            sequence: frame.sequence,
+                            texture,
+                            // Packed RGB portal DMA-BUF: single plane, COLOR aspect.
+                            disjoint: false,
+                            acquired: false,
+                        },
+                    ) {
+                        destroy_imported(&self.device, previous.texture);
+                    }
+                }
+                Err(_) => {
+                    // A single failing import must never abort the frame
+                    // before acquire/submit/present — that would freeze both
+                    // swapchains while the capture keeps delivering. Evict
+                    // the source so its items render through the placeholder
+                    // descriptor and back off re-import attempts.
+                    if import_failures.insert(*source_id, Instant::now()).is_none() {
+                        let _ = events.send(EngineEvent::SourceUnavailable {
+                            source_id: *source_id,
+                            reason: "Vulkan-DMA-BUF-Import fehlgeschlagen".into(),
+                        });
+                    }
+                    self.remove_external_texture(*source_id);
+                }
             }
         }
-        Ok(())
     }
     fn synchronize_static_textures(
         &mut self,
+        caches: &mut StaticCaches,
         project: &ProjectV1,
         events: &std::sync::mpsc::Sender<EngineEvent>,
     ) {
@@ -388,7 +845,7 @@ impl VulkanCompositor {
             return;
         };
         let mut desired = HashSet::new();
-        let mut desired_text = HashSet::new();
+        let mut desired_text = Vec::new();
         let mut desired_images = HashSet::new();
 
         for item in scene.items.iter().filter(|item| item.visible) {
@@ -402,25 +859,42 @@ impl VulkanCompositor {
             let prepared = match source {
                 Source::Image { id, path, .. } => {
                     desired.insert(*id);
-                    self.image_cache
+                    caches
+                        .image_cache
                         .get_or_decode(path)
                         .inspect(|decoded| {
                             desired_images.insert(decoded.path.clone());
                         })
                         .map(|decoded| {
-                            let decoded = decoded.clone();
-                            (
-                                *id,
-                                format!(
-                                    "image:{}:{}:{}",
-                                    decoded.path.display(),
-                                    decoded.fingerprint.0,
-                                    decoded.fingerprint.1
-                                ),
-                                decoded.width,
-                                decoded.height,
-                                decoded.rgba8,
-                            )
+                            // Cache-hit fast path: compare the stored
+                            // identity (canonical path + file fingerprint)
+                            // before building any key string or copying the
+                            // decoded bitmap.
+                            let unchanged = self.static_textures.get(id).is_some_and(|cached| {
+                                matches!(
+                                    &cached.identity,
+                                    StaticIdentity::Image {
+                                        path: identity_path,
+                                        fingerprint: identity_fingerprint,
+                                    } if identity_path == &decoded.path
+                                        && *identity_fingerprint
+                                            == decoded.fingerprint
+                                )
+                            });
+                            if unchanged {
+                                (*id, PreparedStatic::Unchanged)
+                            } else {
+                                (
+                                    *id,
+                                    PreparedStatic::Image {
+                                        path: decoded.path.clone(),
+                                        fingerprint: decoded.fingerprint,
+                                        width: decoded.width,
+                                        height: decoded.height,
+                                        rgba8: decoded.rgba8.clone(),
+                                    },
+                                )
+                            }
                         })
                 }
                 Source::Text {
@@ -435,9 +909,9 @@ impl VulkanCompositor {
                     ..
                 } => {
                     desired.insert(*id);
-                    let key = TextKey {
-                        text: text.clone(),
-                        family: font_family.clone(),
+                    let wanted = DesiredTextKey {
+                        text: text.as_str(),
+                        family: font_family.as_str(),
                         size_bits: font_size_px.to_bits(),
                         weight: *font_weight,
                         color: parse_text_color(color),
@@ -446,57 +920,101 @@ impl VulkanCompositor {
                         width: item.transform.width.round().max(1.0) as u32,
                         height: item.transform.height.round().max(1.0) as u32,
                     };
-                    desired_text.insert(key.clone());
-
-                    let cache_key = format!("text:{key:?}");
-                    self.text_cache.rasterize(key).map(|raster| {
-                        let raster = raster.clone();
-                        (*id, cache_key, raster.width, raster.height, raster.rgba8)
-                    })
+                    desired_text.push(wanted);
+                    // Cache-hit fast path: scalar fields first, string
+                    // contents by borrow. No TextKey construction, no
+                    // rasterization lookup, no bitmap copy.
+                    let unchanged = self.static_textures.get(id).is_some_and(|cached| {
+                        matches!(
+                            &cached.identity,
+                            StaticIdentity::Text(key) if wanted.matches(key)
+                        )
+                    });
+                    if unchanged {
+                        Ok((*id, PreparedStatic::Unchanged))
+                    } else {
+                        let key = TextKey {
+                            text: text.clone(),
+                            family: font_family.clone(),
+                            size_bits: wanted.size_bits,
+                            weight: wanted.weight,
+                            color: wanted.color,
+                            background: wanted.background,
+                            align: wanted.align,
+                            width: wanted.width,
+                            height: wanted.height,
+                        };
+                        caches.text_cache.rasterize(key.clone()).map(|raster| {
+                            (
+                                *id,
+                                PreparedStatic::Text {
+                                    key,
+                                    width: raster.width,
+                                    height: raster.height,
+                                    rgba8: raster.rgba8.clone(),
+                                },
+                            )
+                        })
+                    }
                 }
                 _ => continue,
             };
-            let result = prepared.map_err(|error| error.to_string()).and_then(
-                |(source_id, key, width, height, rgba8)| {
-                    if self
-                        .static_textures
-                        .get(&source_id)
-                        .is_some_and(|cached| cached.key == key)
-                    {
-                        return Ok((source_id, false));
-                    }
-                    upload_rgba_texture(
-                        &self.instance,
-                        &self.device,
-                        self.physical,
-                        self.queue,
-                        self.command_pool,
-                        width,
-                        height,
-                        &rgba8,
-                    )
-                    .map(|texture| {
-                        if let Some(previous) = self
-                            .static_textures
-                            .insert(source_id, CachedStaticTexture { key, texture })
-                        {
-                            destroy_imported(&self.device, previous.texture);
-                        }
-                        (source_id, true)
-                    })
-                },
-            );
+            let result =
+                prepared
+                    .map_err(|error| error.to_string())
+                    .and_then(|(source_id, prepared)| {
+                        let (identity, width, height, rgba8) = match prepared {
+                            PreparedStatic::Unchanged => return Ok((source_id, false)),
+                            PreparedStatic::Image {
+                                path,
+                                fingerprint,
+                                width,
+                                height,
+                                rgba8,
+                            } => (
+                                StaticIdentity::Image { path, fingerprint },
+                                width,
+                                height,
+                                rgba8,
+                            ),
+                            PreparedStatic::Text {
+                                key,
+                                width,
+                                height,
+                                rgba8,
+                            } => (StaticIdentity::Text(key), width, height, rgba8),
+                        };
+                        upload_rgba_texture(
+                            &self.instance,
+                            &self.device,
+                            self.physical,
+                            self.queue,
+                            self.command_pool,
+                            width,
+                            height,
+                            &rgba8,
+                        )
+                        .map(|texture| {
+                            if let Some(previous) = self
+                                .static_textures
+                                .insert(source_id, CachedStaticTexture { identity, texture })
+                            {
+                                destroy_imported(&self.device, previous.texture);
+                            }
+                            (source_id, true)
+                        })
+                    });
             match result {
                 Ok((source_id, changed)) => {
-                    let recovered = self.static_failures.remove(&source_id).is_some();
+                    let recovered = caches.static_failures.remove(&source_id).is_some();
                     if changed || recovered {
                         let _ = events.send(EngineEvent::SourceAvailable { source_id });
                     }
                 }
                 Err(reason) => {
                     let source_id = item.source_id;
-                    if self.static_failures.get(&source_id) != Some(&reason) {
-                        self.static_failures.insert(source_id, reason.clone());
+                    if caches.static_failures.get(&source_id) != Some(&reason) {
+                        caches.static_failures.insert(source_id, reason.clone());
                         let _ = events.send(EngineEvent::SourceUnavailable { source_id, reason });
                     }
                     if let Some(previous) = self.static_textures.remove(&source_id) {
@@ -505,8 +1023,11 @@ impl VulkanCompositor {
                 }
             }
         }
-        self.text_cache.retain(|key| desired_text.contains(key));
-        self.image_cache
+        caches
+            .text_cache
+            .retain(|key| desired_text.iter().any(|wanted| wanted.matches(key)));
+        caches
+            .image_cache
             .retain(|path| desired_images.contains(path));
 
         let stale = self
@@ -519,13 +1040,17 @@ impl VulkanCompositor {
             if let Some(cached) = self.static_textures.remove(&source_id) {
                 destroy_imported(&self.device, cached.texture);
             }
-            self.static_failures.remove(&source_id);
+            caches.static_failures.remove(&source_id);
         }
     }
+    /// See [`VulkanCompositor::synchronize_portal_textures`] for the
+    /// transition-emission contract and the render-thread-owned failure map.
     fn synchronize_media_textures(
         &mut self,
         frames: &HashMap<Uuid, MediaVideoFrame>,
-    ) -> Result<(), RenderError> {
+        import_failures: &mut HashMap<Uuid, Instant>,
+        events: &std::sync::mpsc::Sender<EngineEvent>,
+    ) {
         let stale = self
             .media_textures
             .keys()
@@ -536,6 +1061,7 @@ impl VulkanCompositor {
             if let Some(cached) = self.media_textures.remove(&source_id) {
                 destroy_imported(&self.device, cached.texture);
             }
+            import_failures.remove(&source_id);
         }
         for (source_id, frame) in frames {
             if self
@@ -545,28 +1071,55 @@ impl VulkanCompositor {
             {
                 continue;
             }
-            let texture = import_media_frame(
+            // Bounded retry after a failed import (see
+            // synchronize_portal_textures).
+            if import_failures
+                .get(source_id)
+                .is_some_and(|last| last.elapsed() < IMPORT_RETRY_INTERVAL)
+            {
+                continue;
+            }
+            match import_media_frame(
                 &self.instance,
                 &self.device,
                 &self.external_memory_fd,
                 self.physical,
+                self.media_conversion,
                 frame,
-            )
-            .map_err(|reason| RenderError::Import {
-                source_id: Some(*source_id),
-                reason,
-            })?;
-            if let Some(previous) = self.media_textures.insert(
-                *source_id,
-                CachedExternalFrame {
-                    sequence: frame.sequence,
-                    texture,
-                },
             ) {
-                destroy_imported(&self.device, previous.texture);
+                Ok(texture) => {
+                    if import_failures.remove(source_id).is_some() {
+                        let _ = events.send(EngineEvent::SourceAvailable {
+                            source_id: *source_id,
+                        });
+                    }
+                    if let Some(previous) = self.media_textures.insert(
+                        *source_id,
+                        CachedExternalFrame {
+                            sequence: frame.sequence,
+                            texture,
+                            // import_media_frame only accepts NV12, created DISJOINT.
+                            disjoint: true,
+                            acquired: false,
+                        },
+                    ) {
+                        destroy_imported(&self.device, previous.texture);
+                    }
+                }
+                Err(_) => {
+                    // Never abort the frame on a per-source import failure;
+                    // evict and render the placeholder instead (see
+                    // synchronize_portal_textures).
+                    if import_failures.insert(*source_id, Instant::now()).is_none() {
+                        let _ = events.send(EngineEvent::SourceUnavailable {
+                            source_id: *source_id,
+                            reason: "Vulkan-DMA-BUF-Import fehlgeschlagen".into(),
+                        });
+                    }
+                    self.remove_external_texture(*source_id);
+                }
             }
         }
-        Ok(())
     }
 
     fn remove_external_texture(&mut self, source_id: Uuid) {
@@ -578,71 +1131,222 @@ impl VulkanCompositor {
         }
     }
 
+    /// Rebuilds the scene render target when the project output size changed.
+    /// Device, pipelines, immutable-sampler architecture, descriptor pool, and
+    /// every texture cache stay untouched; only the color attachment rotates
+    /// and the shared scene descriptor is repointed at its new view. The
+    /// replacement is created before the old attachments are freed, so a
+    /// failure leaves the current target fully functional.
+    fn recreate_scene_target(&mut self, width: u32, height: u32) -> Result<(), String> {
+        if self.output_width == width && self.output_height == height {
+            return Ok(());
+        }
+        let next = create_scene_target(
+            &self.instance,
+            &self.device,
+            self.physical,
+            self.scene.render_pass,
+            width,
+            height,
+        )?;
+        update_descriptor(
+            &self.device,
+            self.program.descriptor_set,
+            next.view,
+            self.scene_sampler,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        );
+        destroy_scene_attachments(&self.device, &mut self.scene);
+        self.scene = next;
+        self.output_width = width;
+        self.output_height = height;
+        Ok(())
+    }
+
+    /// Rebuilds the program/preview swapchain targets in place. Pass
+    /// `force = true` for swapchain-scoped errors (OUT_OF_DATE/SUBOPTIMAL)
+    /// where the extent may be unchanged but the swapchain is stale;
+    /// otherwise only mismatched extents are recreated. Device, pipelines,
+    /// descriptor pool, and every texture cache survive.
+    fn recreate_swapchains(
+        &mut self,
+        program: (u32, u32),
+        preview: (u32, u32),
+        force: bool,
+    ) -> Result<(), String> {
+        let program_changed = force
+            || self.program.extent.width != program.0
+            || self.program.extent.height != program.1;
+        let preview_changed = force
+            || self.preview.extent.width != preview.0
+            || self.preview.extent.height != preview.1;
+        if !program_changed && !preview_changed {
+            return Ok(());
+        }
+        // Mirror Drop: drain the presentation queue before retiring
+        // swapchain resources.
+        unsafe {
+            let _ = self.device.device_wait_idle();
+        }
+        if program_changed {
+            recreate_swapchain(
+                &self.instance,
+                &self.device,
+                self.physical,
+                &self.surface_loader,
+                self.sampler_layout,
+                &mut self.program,
+                program.0,
+                program.1,
+            )?;
+        }
+        if preview_changed {
+            recreate_swapchain(
+                &self.instance,
+                &self.device,
+                self.physical,
+                &self.surface_loader,
+                self.sampler_layout,
+                &mut self.preview,
+                preview.0,
+                preview.1,
+            )?;
+        }
+        Ok(())
+    }
+
     fn render(
         &mut self,
+        caches: &mut StaticCaches,
         project: &ProjectV1,
         frames: &mut HashMap<Uuid, CapturedFrame>,
         media_frames: &HashMap<Uuid, MediaVideoFrame>,
+        import_failures: &mut HashMap<Uuid, Instant>,
         events: &std::sync::mpsc::Sender<EngineEvent>,
-    ) -> Result<HashSet<Uuid>, RenderError> {
+    ) -> Result<(), RenderError> {
         let scene = project
             .scenes
             .iter()
             .find(|scene| scene.id == project.active_scene_id)
             .ok_or_else(|| RenderError::Import {
-                source_id: None,
                 reason: "active scene is missing".into(),
             })?;
         let (program_index, preview_index);
-        let mut used = HashSet::new();
         unsafe {
             self.device
-                .wait_for_fences(&[self.program.fence], true, u64::MAX)
+                .wait_for_fences(&[self.frame_fence], true, u64::MAX)
                 .map_err(RenderError::Vk)?;
         }
-        self.synchronize_portal_textures(frames)?;
-        self.synchronize_media_textures(media_frames)?;
-        self.synchronize_static_textures(project, events);
-        let mut external_images = [vk::Image::null(); MAX_SCENE_ITEMS];
+        self.synchronize_portal_textures(frames, import_failures, events);
+        self.synchronize_media_textures(media_frames, import_failures, events);
+        self.synchronize_static_textures(caches, project, events);
+        let mut external_images: [ExternalImageState; MAX_SCENE_ITEMS] =
+            std::array::from_fn(|_| ExternalImageState {
+                image: vk::Image::null(),
+                first_acquire: false,
+                ranges: [vk::ImageSubresourceRange::default(); 2],
+                range_count: 0,
+            });
         let mut external_count = 0usize;
         for item in scene.items.iter().filter(|item| item.visible) {
-            let cached = self
-                .portal_textures
-                .get(&item.source_id)
-                .or_else(|| self.media_textures.get(&item.source_id));
+            let cached = if let Some(cached) = self.portal_textures.get_mut(&item.source_id) {
+                Some(cached)
+            } else {
+                self.media_textures.get_mut(&item.source_id)
+            };
             let Some(cached) = cached else {
                 continue;
             };
             let image = cached.texture.image;
             if external_count < MAX_SCENE_ITEMS
-                && !external_images[..external_count].contains(&image)
+                && !external_images[..external_count]
+                    .iter()
+                    .any(|external| external.image == image)
             {
-                external_images[external_count] = image;
+                // DISJOINT multi-planar images reject COLOR-aspect barriers;
+                // each plane needs its own ownership transfer.
+                let (ranges, range_count) = if cached.disjoint {
+                    (
+                        [
+                            plane_range(vk::ImageAspectFlags::PLANE_0),
+                            plane_range(vk::ImageAspectFlags::PLANE_1),
+                        ],
+                        2,
+                    )
+                } else {
+                    ([color_range(), vk::ImageSubresourceRange::default()], 1)
+                };
+                external_images[external_count] = ExternalImageState {
+                    image,
+                    first_acquire: !cached.acquired,
+                    ranges,
+                    range_count,
+                };
                 external_count += 1;
             }
         }
         unsafe {
+            // Acquire both swapchain images before resetting the fence: a
+            // timeout skip then leaves the fence signaled and no semaphores
+            // pending, so the next frame stays in sync.
+            program_index = acquire(&self.program)?;
+            preview_index = match acquire(&self.preview) {
+                Ok(index) => index,
+                Err(RenderError::AcquireTimeout) => {
+                    // The program image was acquired but will not be rendered
+                    // this frame; consume its acquire semaphore with an empty
+                    // submit and present the untouched image so the next
+                    // acquire stays synchronized.
+                    self.device
+                        .reset_fences(&[self.frame_fence])
+                        .map_err(RenderError::Vk)?;
+                    self.device
+                        .queue_submit(
+                            self.queue,
+                            &[vk::SubmitInfo::default()
+                                .wait_semaphores(std::slice::from_ref(&self.program.available))
+                                .wait_dst_stage_mask(&[vk::PipelineStageFlags::TOP_OF_PIPE])
+                                .signal_semaphores(&[
+                                    self.program.rendered[program_index as usize]
+                                ])],
+                            self.frame_fence,
+                        )
+                        .map_err(RenderError::Vk)?;
+                    present(&self.program, self.queue, program_index)?;
+                    return Ok(());
+                }
+                Err(other) => return Err(other),
+            };
             self.device
-                .reset_fences(&[self.program.fence])
+                .reset_fences(&[self.frame_fence])
                 .map_err(RenderError::Vk)?;
-            program_index = acquire(&self.device, &self.program)?;
-            preview_index = acquire(&self.device, &self.preview)?;
             self.device
                 .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())
                 .map_err(RenderError::Vk)?;
             self.device
                 .begin_command_buffer(self.command_buffer, &vk::CommandBufferBeginInfo::default())
                 .map_err(RenderError::Vk)?;
-            let acquire_barriers = std::array::from_fn::<_, MAX_SCENE_ITEMS, _>(|index| {
-                vk::ImageMemoryBarrier::default()
-                    .old_layout(vk::ImageLayout::GENERAL)
-                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
-                    .dst_queue_family_index(self.queue_family)
-                    .image(external_images[index])
-                    .subresource_range(color_range())
-            });
-            if external_count > 0 {
+            let mut acquire_barriers = [vk::ImageMemoryBarrier::default(); MAX_SCENE_ITEMS * 2];
+            let mut acquire_count = 0usize;
+            for external in &external_images[..external_count] {
+                let old_layout = if external.first_acquire {
+                    vk::ImageLayout::UNDEFINED
+                } else {
+                    vk::ImageLayout::GENERAL
+                };
+                for range in &external.ranges[..external.range_count] {
+                    acquire_barriers[acquire_count] = vk::ImageMemoryBarrier::default()
+                        .old_layout(old_layout)
+                        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+                        .dst_queue_family_index(self.queue_family)
+                        .image(external.image)
+                        .subresource_range(*range);
+                    acquire_count += 1;
+                }
+            }
+            if acquire_count > 0 {
                 self.device.cmd_pipeline_barrier(
                     self.command_buffer,
                     vk::PipelineStageFlags::TOP_OF_PIPE,
@@ -650,7 +1354,7 @@ impl VulkanCompositor {
                     vk::DependencyFlags::BY_REGION,
                     &[],
                     &[],
-                    &acquire_barriers[..external_count],
+                    &acquire_barriers[..acquire_count],
                 );
             }
             let scene_clear = [parse_color(&project.output.background)];
@@ -690,6 +1394,7 @@ impl VulkanCompositor {
                     extent: self.scene.extent,
                 }],
             );
+            let mut media_bound = false;
             self.device.cmd_bind_pipeline(
                 self.command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -702,49 +1407,71 @@ impl VulkanCompositor {
                 .take(MAX_SCENE_ITEMS)
                 .enumerate()
             {
-                let item_descriptor = self.item_descriptors[draw_index];
-                let mode = if let Some(cached) = self.portal_textures.get(&item.source_id) {
+                let mut mode = 0u32;
+                let mut media_draw = false;
+                if let Some(cached) = self.portal_textures.get(&item.source_id) {
                     update_descriptor(
                         &self.device,
-                        item_descriptor,
+                        self.item_descriptors[draw_index],
                         cached.texture.view,
                         self.item_sampler,
                         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                     );
-                    used.insert(item.source_id);
-                    0
                 } else if let Some(cached) = self.media_textures.get(&item.source_id) {
+                    // The view carries the shared SamplerYcbcrConversionInfo;
+                    // the write's sampler field is ignored because the
+                    // binding's immutable sampler fixes the conversion at
+                    // pipeline-creation time.
                     update_descriptor(
                         &self.device,
-                        item_descriptor,
+                        self.media_item_descriptors[draw_index],
                         cached.texture.view,
-                        cached.texture.sampler.unwrap_or(self.item_sampler),
+                        vk::Sampler::null(),
                         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                     );
-                    0
+                    media_draw = true;
                 } else if let Some(cached) = self.static_textures.get(&item.source_id) {
                     update_descriptor(
                         &self.device,
-                        item_descriptor,
+                        self.item_descriptors[draw_index],
                         cached.texture.view,
                         self.item_sampler,
                         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                     );
-                    0
                 } else {
                     update_descriptor(
                         &self.device,
-                        item_descriptor,
+                        self.item_descriptors[draw_index],
                         self.placeholder.view,
                         self.item_sampler,
                         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                     );
-                    1
+                    mode = 1;
+                }
+                if media_draw != media_bound {
+                    self.device.cmd_bind_pipeline(
+                        self.command_buffer,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        if media_draw {
+                            self.media_item_pipeline
+                        } else {
+                            self.item_pipeline
+                        },
+                    );
+                    media_bound = media_draw;
+                }
+                let (item_descriptor, draw_pipeline_layout) = if media_draw {
+                    (
+                        self.media_item_descriptors[draw_index],
+                        self.media_item_pipeline_layout,
+                    )
+                } else {
+                    (self.item_descriptors[draw_index], self.item_pipeline_layout)
                 };
                 self.device.cmd_bind_descriptor_sets(
                     self.command_buffer,
                     vk::PipelineBindPoint::GRAPHICS,
-                    self.item_pipeline_layout,
+                    draw_pipeline_layout,
                     0,
                     &[item_descriptor],
                     &[],
@@ -756,7 +1483,7 @@ impl VulkanCompositor {
                 );
                 self.device.cmd_push_constants(
                     self.command_buffer,
-                    self.item_pipeline_layout,
+                    draw_pipeline_layout,
                     vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                     0,
                     bytes,
@@ -764,27 +1491,30 @@ impl VulkanCompositor {
                 self.device.cmd_draw(self.command_buffer, 4, 1, 0, 0);
             }
             self.device.cmd_end_render_pass(self.command_buffer);
-            let release_barriers = std::array::from_fn::<_, MAX_SCENE_ITEMS, _>(|index| {
-                vk::ImageMemoryBarrier::default()
-                    .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .new_layout(vk::ImageLayout::GENERAL)
-                    .src_access_mask(vk::AccessFlags::SHADER_READ)
-                    .src_queue_family_index(self.queue_family)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
-                    .image(external_images[index])
-                    .subresource_range(color_range())
-            });
-            if external_count > 0 {
-                self.device.cmd_pipeline_barrier(
-                    self.command_buffer,
-                    vk::PipelineStageFlags::FRAGMENT_SHADER,
-                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                    vk::DependencyFlags::BY_REGION,
-                    &[],
-                    &[],
-                    &release_barriers[..external_count],
-                );
+            let mut release_barriers = [vk::ImageMemoryBarrier::default(); MAX_SCENE_ITEMS * 2];
+            let mut release_count = 0usize;
+            for external in &external_images[..external_count] {
+                for range in &external.ranges[..external.range_count] {
+                    release_barriers[release_count] = vk::ImageMemoryBarrier::default()
+                        .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                        .new_layout(vk::ImageLayout::GENERAL)
+                        .src_access_mask(vk::AccessFlags::SHADER_READ)
+                        .src_queue_family_index(self.queue_family)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+                        .image(external.image)
+                        .subresource_range(*range);
+                    release_count += 1;
+                }
             }
+            self.device.cmd_pipeline_barrier(
+                self.command_buffer,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::BY_REGION,
+                &[],
+                &[],
+                &release_barriers[..release_count],
+            );
             composite_target(
                 &self.device,
                 self.command_buffer,
@@ -819,19 +1549,36 @@ impl VulkanCompositor {
                         .wait_dst_stage_mask(&stages)
                         .command_buffers(&[self.command_buffer])
                         .signal_semaphores(&signals)],
-                    self.program.fence,
+                    self.frame_fence,
                 )
                 .map_err(RenderError::Vk)?;
+            // The first-acquire barriers live only in this command
+            // buffer; commit the flags only after the submit succeeded so
+            // an acquire timeout or earlier failure makes the next frame
+            // re-issue the UNDEFINED -> SHADER_READ_ONLY transition.
+            for external in &external_images[..external_count] {
+                if !external.first_acquire {
+                    continue;
+                }
+                for cached in self
+                    .portal_textures
+                    .values_mut()
+                    .chain(self.media_textures.values_mut())
+                {
+                    if cached.texture.image == external.image {
+                        cached.acquired = true;
+                    }
+                }
+            }
         }
         present(&self.program, self.queue, program_index)?;
         present(&self.preview, self.queue, preview_index)?;
         unsafe {
             self.device
-                .wait_for_fences(&[self.program.fence], true, u64::MAX)
+                .wait_for_fences(&[self.frame_fence], true, u64::MAX)
                 .map_err(RenderError::Vk)?;
         }
-        let _ = events;
-        Ok(used)
+        Ok(())
     }
 }
 
@@ -842,11 +1589,17 @@ impl Drop for VulkanCompositor {
             for (_, cached) in self.portal_textures.drain() {
                 destroy_imported(&self.device, cached.texture);
             }
+            self.device.destroy_pipeline(self.media_item_pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.media_item_pipeline_layout, None);
             for (_, cached) in self.media_textures.drain() {
                 destroy_imported(&self.device, cached.texture);
             }
             destroy_target(&self.device, &self.surface_loader, &mut self.program);
             destroy_target(&self.device, &self.surface_loader, &mut self.preview);
+            self.device.destroy_sampler(self.media_sampler, None);
+            self.device
+                .destroy_sampler_ycbcr_conversion(self.media_conversion, None);
             for (_, cached) in self.static_textures.drain() {
                 destroy_imported(&self.device, cached.texture);
             }
@@ -866,6 +1619,9 @@ impl Drop for VulkanCompositor {
             self.device
                 .destroy_descriptor_set_layout(self.sampler_layout, None);
             self.device.destroy_command_pool(self.command_pool, None);
+            self.device.destroy_fence(self.frame_fence, None);
+            self.device
+                .destroy_descriptor_set_layout(self.media_sampler_layout, None);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
@@ -877,15 +1633,18 @@ struct MediaRuntimeBinding {
     visible: bool,
     playing: bool,
     opened: bool,
+    retry_after: Option<Instant>,
 }
 
 #[derive(Debug)]
 enum RenderError {
     Vk(vk::Result),
     Import {
-        source_id: Option<Uuid>,
         reason: String,
     },
+    /// Swapchain acquire timed out; the frame is skipped and the render loop
+    /// re-checks its stop flag before retrying.
+    AcquireTimeout,
 }
 
 pub struct RenderRuntime {
@@ -915,10 +1674,7 @@ impl RenderRuntime {
                     initial.width,
                     initial.height,
                 ) {
-                    Ok(value) => {
-                        let _ = ready_tx.send(Ok(()));
-                        value
-                    }
+                    Ok(value) => value,
                     Err(error) => {
                         let _ = ready_tx.send(Err(error.clone()));
                         let _ = events.send(EngineEvent::DeviceRecovery {
@@ -931,6 +1687,10 @@ impl RenderRuntime {
                 let mut capture = match CaptureHandle::spawn() {
                     Ok(value) => value,
                     Err(error) => {
+                        // The ready channel must resolve even when startup
+                        // fails, or `start` blocks until its timeout while
+                        // the thread dies silently.
+                        let _ = ready_tx.send(Err(error.to_string()));
                         let _ = events.send(EngineEvent::EngineError {
                             message: error.to_string(),
                         });
@@ -940,21 +1700,70 @@ impl RenderRuntime {
                 let media = match LinuxMedia::start(events.clone()) {
                     Ok(value) => value,
                     Err(error) => {
-                        let _ = events.send(EngineEvent::EngineError { message: format!("GStreamer unavailable: {error}") });
+                        let _ = ready_tx.send(Err(format!("GStreamer nicht verfügbar: {error}")));
+                        let _ = events.send(EngineEvent::EngineError { message: format!("GStreamer nicht verfügbar: {error}") });
                         return;
                     }
                 };
+                // Every startup step succeeded; unblock the waiting caller.
+                let _ = ready_tx.send(Ok(()));
                 let mut media_sources: HashMap<Uuid, MediaRuntimeBinding> = HashMap::new();
                 let mut media_frames: HashMap<Uuid, MediaVideoFrame> = HashMap::new();
                 let mut frames: HashMap<Uuid, CapturedFrame> = HashMap::new();
                 let mut nodes: HashMap<Uuid, u32> = HashMap::new();
                 let mut available = HashSet::new();
-                let mut last_frame: HashMap<Uuid, Instant> = HashMap::new();
+                // Import-failure streaks live on the render thread (not on
+                // the compositor) so backoff state survives device/surface
+                // recreations.
+                let mut import_failures: HashMap<Uuid, Instant> = HashMap::new();
+                let mut capture_started: HashMap<Uuid, Instant> = HashMap::new();
+                // Eviction/failure-report dedup: identical consecutive
+                // reasons are reported once until frames recover
+                // (mirrors windows.rs should_report_failure philosophy).
+                let mut evict_notified: HashMap<Uuid, String> = HashMap::new();
+                let mut recovery_failures: u32 = 0;
                 let mut generation = 0;
                 let mut output = initial;
+                let mut static_caches = StaticCaches::default();
                 let mut deadline = Instant::now();
                 while !thread_stop.load(Ordering::Acquire) {
                     let snapshot = project.read().clone();
+                    if compositor.is_none() {
+                        // Bounded recovery: retry the failed creation instead
+                        // of exiting the thread (mirrors the Windows loop).
+                        match VulkanCompositor::create(
+                            *surface_state.read(),
+                            snapshot.output.width,
+                            snapshot.output.height,
+                        ) {
+                            Ok(next) => {
+                                compositor = Some(next);
+                                recovery_failures = 0;
+                                output = snapshot.output.clone();
+                                let _ = events.send(EngineEvent::DeviceRecovery {
+                                    phase: DeviceRecoveryPhase::Succeeded,
+                                    detail: None,
+                                });
+                            }
+                            Err(error) => {
+                                recovery_failures += 1;
+                                let _ = events.send(EngineEvent::DeviceRecovery {
+                                    phase: DeviceRecoveryPhase::Failed,
+                                    detail: Some(error.clone()),
+                                });
+                                if recovery_failures >= MAX_RECOVERY_FAILURES {
+                                    let _ = events.send(EngineEvent::EngineError {
+                                        message: format!(
+                                            "Vulkan-Renderer nach {MAX_RECOVERY_FAILURES} Wiederherstellungsversuchen aufgegeben: {error}"
+                                        ),
+                                    });
+                                    break;
+                                }
+                                sleep_backoff(&thread_stop, recovery_failures);
+                            }
+                        }
+                        continue;
+                    }
                     let wanted_media: HashSet<Uuid> = snapshot
                         .sources
                         .iter()
@@ -995,6 +1804,23 @@ impl RenderRuntime {
                             media_sources.remove(id);
                             media_frames.remove(id);
                         }
+                        // Bounded self-heal: once the cooldown elapsed, drop
+                        // the failed binding so the open below runs a fresh
+                        // session (fresh ReopenBudget + latch) instead of the
+                        // binding staying dead forever. Path changes keep
+                        // their immediate-tick behavior above.
+                        let retry_due = media_sources.get(id).is_some_and(|runtime| {
+                            !runtime.opened
+                                && runtime
+                                    .retry_after
+                                    .is_some_and(|deadline| Instant::now() >= deadline)
+                        });
+                        if retry_due {
+                            // The Unsupported arm already tore the session
+                            // down (opened == false); only bookkeeping remains.
+                            media_sources.remove(id);
+                            media_frames.remove(id);
+                        }
                         if !media_sources.contains_key(id) {
                             let opened = match media.open(*id, path, *looped, &media_audio) {
                                 Ok(()) => true,
@@ -1014,6 +1840,11 @@ impl RenderRuntime {
                                     visible,
                                     playing: true,
                                     opened,
+                                    retry_after: if opened {
+                                        None
+                                    } else {
+                                        Some(Instant::now() + MEDIA_RETRY_COOLDOWN)
+                                    },
                                 },
                             );
                         }
@@ -1071,6 +1902,8 @@ impl RenderRuntime {
                                 if let Some(runtime) = media_sources.get_mut(&source_id) {
                                     runtime.opened = false;
                                     runtime.playing = false;
+                                    runtime.retry_after =
+                                        Some(Instant::now() + MEDIA_RETRY_COOLDOWN);
                                 }
                                 media_frames.remove(&source_id);
                                 available.remove(&source_id);
@@ -1079,10 +1912,25 @@ impl RenderRuntime {
                                     reason,
                                 });
                             }
+                            MediaNotice::SeekFailed { source_id, reason } => {
+                                // Windows-Paritaet: ein fehlgeschlagener Seek
+                                // meldet den Grund als UnsupportedMedia-Event,
+                                // ohne die Sitzung zu verwerfen. Ein separater
+                                // MediaState-Dedup existiert auf diesem Pfad
+                                // nicht; die Pipeline dedupliziert workerseitig
+                                // und ein erfolgreicher Seek ändert die Position
+                                // ohnehin, sodass das nächste State-Event fließt.
+                                let _ = events.send(EngineEvent::UnsupportedMedia {
+                                    source_id,
+                                    reason,
+                                });
+                            }
                             MediaNotice::Video(frame) => {
                                 let source_id = frame.source_id;
                                 media_frames.insert(source_id, frame);
-                                if available.insert(source_id) {
+                                if available.insert(source_id)
+                                    && !import_failures.contains_key(&source_id)
+                                {
                                     let _ = events.send(EngineEvent::SourceAvailable { source_id });
                                 }
                             }
@@ -1106,26 +1954,50 @@ impl RenderRuntime {
                             phase: DeviceRecoveryPhase::Started,
                             detail: None,
                         });
-                        drop(compositor.take());
-                        compositor = Some(match VulkanCompositor::create(
-                            current_surfaces,
-                            snapshot.output.width,
-                            snapshot.output.height,
-                        ) {
-                            Ok(next) => next,
+                        // Selective recreation: only surface-sized state
+                        // rotates. Device, pipelines, and the static caches
+                        // survive, so images are not re-decoded and text is
+                        // not re-rasterized while a window edge is dragged.
+                        let recreated = recreate_surface_sized_state(
+                            compositor
+                                .as_mut()
+                                .expect("Vulkan compositor initialized"),
+                            &current_surfaces,
+                            (snapshot.output.width, snapshot.output.height),
+                        );
+                        match recreated {
+                            Ok(()) => {
+                                recovery_failures = 0;
+                                output = snapshot.output.clone();
+                                let _ = events.send(EngineEvent::DeviceRecovery {
+                                    phase: DeviceRecoveryPhase::Succeeded,
+                                    detail: None,
+                                });
+                            }
                             Err(error) => {
+                                // Selective recreation failed; fall back to
+                                // the full device rebuild with the same
+                                // bounded-retry accounting as a failed create.
+                                drop(compositor.take());
+                                recovery_failures += 1;
                                 let _ = events.send(EngineEvent::DeviceRecovery {
                                     phase: DeviceRecoveryPhase::Failed,
-                                    detail: Some(error),
+                                    detail: Some(error.clone()),
                                 });
-                                break;
+                                if recovery_failures >= MAX_RECOVERY_FAILURES {
+                                    let _ = events.send(EngineEvent::EngineError {
+                                        message: format!(
+                                        "Vulkan-Renderer nach {MAX_RECOVERY_FAILURES} Wiederherstellungsversuchen aufgegeben: {error}"
+                                        ),
+                                    });
+                                    break;
+                                }
+                                // The compositor stays None; the loop head
+                                // retries the creation after the backoff.
+                                sleep_backoff(&thread_stop, recovery_failures);
+                                continue;
                             }
-                        });
-                        output = snapshot.output.clone();
-                        let _ = events.send(EngineEvent::DeviceRecovery {
-                            phase: DeviceRecoveryPhase::Succeeded,
-                            detail: None,
-                        });
+                        }
                     }
                     let current_generation = portal.generation();
                     if current_generation != generation {
@@ -1139,14 +2011,40 @@ impl RenderRuntime {
                         capture.shutdown();
                         capture = match CaptureHandle::spawn() {
                             Ok(value) => value,
-                            Err(error) => {
-                                let _ = events.send(EngineEvent::EngineError {
-                                    message: error.to_string(),
-                                });
-                                break;
+                            Err(mut error) => {
+                                // Bounded respawn retry: a transient spawn
+                                // failure must not kill the render thread;
+                                // give up only past MAX_RECOVERY_FAILURES
+                                // (mirrors the compositor accounting).
+                                let respawned = loop {
+                                    recovery_failures += 1;
+                                    let _ = events.send(EngineEvent::DeviceRecovery {
+                                        phase: DeviceRecoveryPhase::Failed,
+                                        detail: Some(error.to_string()),
+                                    });
+                                    if recovery_failures >= MAX_RECOVERY_FAILURES {
+                                        let _ = events.send(EngineEvent::EngineError {
+                                            message: format!(
+                                                "Vulkan-Renderer nach {MAX_RECOVERY_FAILURES} Wiederherstellungsversuchen aufgegeben: {error}"
+                                            ),
+                                        });
+                                        break None;
+                                    }
+                                    sleep_backoff(&thread_stop, recovery_failures);
+                                    match CaptureHandle::spawn() {
+                                        Ok(value) => break Some(value),
+                                        Err(retry_error) => error = retry_error,
+                                    }
+                                };
+                                match respawned {
+                                    Some(value) => value,
+                                    None => break,
+                                }
                             }
                         };
                         available.clear();
+                        capture_started.clear();
+                        evict_notified.clear();
                         generation = current_generation;
                     }
                     let selected = portal.streams();
@@ -1181,40 +2079,57 @@ impl RenderRuntime {
                             let remote = portal.take_remote();
                             capture.start(*source_id, *node, remote);
                             nodes.insert(*source_id, *node);
+                            capture_started.insert(*source_id, Instant::now());
                         }
                     }
                     for source_id in nodes.keys().copied().collect::<Vec<_>>() {
                         if !wanted.contains_key(&source_id) {
                             capture.stop(source_id);
                             nodes.remove(&source_id);
+                            capture_started.remove(&source_id);
+                            evict_notified.remove(&source_id);
                             if let Some(frame) = frames.remove(&source_id) {
                                 capture.return_buffer(source_id, frame.buffer_token);
                             }
                         }
                     }
-                    while let Ok(message) = capture.try_recv() {
-                        match message {
-                            FrameMessage::Frame(frame) => {
-                                let source_id = frame.source_id;
-                                if let Some(old) = frames.insert(source_id, frame) {
-                                    capture.return_buffer(source_id, old.buffer_token);
-                                }
-                                last_frame.insert(source_id, Instant::now());
-                                if available.insert(source_id) {
-                                    let _ = events.send(EngineEvent::SourceAvailable { source_id });
-                                }
-                            }
-                            FrameMessage::SourceError { source_id, reason } => {
-                                available.remove(&source_id);
-                                let _ = events.send(EngineEvent::SourceUnavailable { source_id, reason });
-                            }
+                    drain_capture_messages(
+                        &mut capture,
+                        &mut frames,
+                        &mut capture_started,
+                        &mut available,
+                        &mut nodes,
+                        &import_failures,
+                        &mut evict_notified,
+                        &events,
+                    );
+                    // Portal delivery is damage-driven: after a capture delivered its
+                    // first frame, silence just means idle content and the last frame
+                    // keeps being rendered. Only captures that never delivered
+                    // anything fall offline after the grace window; genuine stream
+                    // failures arrive as SourceError events.
+                    let expired: Vec<Uuid> = capture_started
+                        .iter()
+                        .filter(|(_, started)| started.elapsed() > Duration::from_millis(750))
+                        .map(|(source_id, _)| *source_id)
+                        .collect();
+                    for source_id in expired {
+                        capture_started.remove(&source_id);
+                        available.remove(&source_id);
+                        // Windows-parity restart: evict the silent capture so
+                        // the wanted-loop re-issues capture.start next tick
+                        // instead of leaving a frozen frame forever.
+                        nodes.remove(&source_id);
+                        if let Some(frame) = frames.remove(&source_id) {
+                            capture.return_buffer(source_id, frame.buffer_token);
                         }
-                    }
-                    for (source_id, seen) in last_frame.clone() {
-                        if seen.elapsed() > Duration::from_millis(750) && available.remove(&source_id) {
+                        capture.stop(source_id);
+                        let reason = "PipeWire-Quelle liefert keine Live-Frames";
+                        if evict_notified.get(&source_id).map(String::as_str) != Some(reason) {
+                            evict_notified.insert(source_id, reason.to_string());
                             let _ = events.send(EngineEvent::SourceUnavailable {
                                 source_id,
-                                reason: "PipeWire-Quelle liefert keine Live-Frames".into(),
+                                reason: reason.into(),
                             });
                         }
                     }
@@ -1222,13 +2137,16 @@ impl RenderRuntime {
                         .as_mut()
                         .expect("Vulkan compositor initialized")
                         .render(
+                            &mut static_caches,
                             &snapshot,
                             &mut frames,
                             &media_frames,
+                            &mut import_failures,
                             &events,
                         )
                     {
-                        Ok(_) => {}
+                        Ok(()) => {}
+                        Err(RenderError::AcquireTimeout) => {}
                         Err(RenderError::Vk(error)) => {
                             let detail = if matches!(
                                 error,
@@ -1243,57 +2161,81 @@ impl RenderRuntime {
                                 phase: DeviceRecoveryPhase::Started,
                                 detail: Some(detail),
                             });
-                            drop(compositor.take());
-                            compositor = Some(match VulkanCompositor::create(
-                                *surface_state.read(),
-                                output.width,
-                                output.height,
-                            ) {
-                                Ok(next) => next,
-                                Err(recovery_error) => {
-                                    let _ = events.send(EngineEvent::DeviceRecovery {
-                                        phase: DeviceRecoveryPhase::Failed,
-                                        detail: Some(recovery_error),
-                                    });
-                                    break;
+                            let swapchain_scoped = matches!(
+                                error,
+                                vk::Result::ERROR_OUT_OF_DATE_KHR
+                                    | vk::Result::SUBOPTIMAL_KHR
+                            );
+                            let mut recovered = false;
+                            if swapchain_scoped {
+                                // Swapchain-scoped error: recreate only the
+                                // presentation targets. Device, pipelines, and
+                                // texture caches stay alive.
+                                let current_surfaces = *surface_state.read();
+                                let active = compositor
+                                    .as_mut()
+                                    .expect("Vulkan compositor initialized");
+                                recovered = match active.recreate_swapchains(
+                                    (
+                                        current_surfaces.program_width.max(1),
+                                        current_surfaces.program_height.max(1),
+                                    ),
+                                    (
+                                        current_surfaces.preview_width.max(1),
+                                        current_surfaces.preview_height.max(1),
+                                    ),
+                                    true,
+                                ) {
+                                    Ok(()) => {
+                                        recovery_failures = 0;
+                                        let _ = events.send(EngineEvent::DeviceRecovery {
+                                            phase: DeviceRecoveryPhase::Succeeded,
+                                            detail: None,
+                                        });
+                                        true
+                                    }
+                                    Err(_) => false,
+                                };
+                            }
+                            if !recovered {
+                                drop(compositor.take());
+                                match VulkanCompositor::create(
+                                    *surface_state.read(),
+                                    output.width,
+                                    output.height,
+                                ) {
+                                    Ok(next) => {
+                                        compositor = Some(next);
+                                        recovery_failures = 0;
+                                        let _ = events.send(EngineEvent::DeviceRecovery {
+                                            phase: DeviceRecoveryPhase::Succeeded,
+                                            detail: None,
+                                        });
+                                    }
+                                    Err(recovery_error) => {
+                                        recovery_failures += 1;
+                                        let _ = events.send(EngineEvent::DeviceRecovery {
+                                            phase: DeviceRecoveryPhase::Failed,
+                                            detail: Some(recovery_error.clone()),
+                                        });
+                                        if recovery_failures >= MAX_RECOVERY_FAILURES {
+                                            let _ = events.send(EngineEvent::EngineError {
+                                                message: format!(
+                                                    "Vulkan-Renderer nach {MAX_RECOVERY_FAILURES} Wiederherstellungsversuchen aufgegeben: {recovery_error}"
+                                                ),
+                                            });
+                                            break;
+                                        }
+                                        // The compositor stays None; the loop head
+                                        // retries the creation after the backoff.
+                                        sleep_backoff(&thread_stop, recovery_failures);
+                                    }
                                 }
-                            });
-                            let _ = events.send(EngineEvent::DeviceRecovery {
-                                phase: DeviceRecoveryPhase::Succeeded,
-                                detail: None,
-                            });
+                            }
                         }
-                        Err(RenderError::Import { source_id, reason }) => {
-                            let Some(source_id) = source_id else {
-                                let _ = events.send(EngineEvent::EngineError { message: reason });
-                                continue;
-                            };
-                            if let Some(compositor) = compositor.as_mut() {
-                                compositor.remove_external_texture(source_id);
-                            }
-                            available.remove(&source_id);
-                            if snapshot.sources.iter().any(
-                                |source| matches!(source, Source::Media { id, .. } if *id == source_id),
-                            ) {
-                                media.remove(source_id, &media_audio);
-                                if let Some(runtime) = media_sources.get_mut(&source_id) {
-                                    runtime.opened = false;
-                                    runtime.playing = false;
-                                }
-                                media_frames.remove(&source_id);
-                                let _ = events.send(EngineEvent::UnsupportedMedia {
-                                    source_id,
-                                    reason,
-                                });
-                            } else {
-                                if let Some(frame) = frames.remove(&source_id) {
-                                    capture.return_buffer(source_id, frame.buffer_token);
-                                }
-                                let _ = events.send(EngineEvent::SourceUnavailable {
-                                    source_id,
-                                    reason,
-                                });
-                            }
+                        Err(RenderError::Import { reason }) => {
+                            let _ = events.send(EngineEvent::EngineError { message: reason });
+                            continue;
                         }
                     }
                     let frame_time = Duration::from_secs_f64(1.0 / output.fps.max(1) as f64);
@@ -1335,7 +2277,9 @@ impl RenderRuntime {
             Err(error) => {
                 stop.store(true, Ordering::Release);
                 let _ = thread.join();
-                Err(format!("Vulkan renderer startup timeout: {error}"))
+                Err(format!(
+                    "Zeitüberschreitung beim Vulkan-Renderer-Start: {error}"
+                ))
             }
         }
     }
@@ -1352,6 +2296,79 @@ impl Drop for RenderRuntime {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// Pure-move extraction of the capture `FrameMessage` drain loop body from
+/// the render thread closure.
+#[allow(clippy::too_many_arguments)]
+fn drain_capture_messages(
+    capture: &mut CaptureHandle,
+    frames: &mut HashMap<Uuid, CapturedFrame>,
+    capture_started: &mut HashMap<Uuid, Instant>,
+    available: &mut HashSet<Uuid>,
+    nodes: &mut HashMap<Uuid, u32>,
+    import_failures: &HashMap<Uuid, Instant>,
+    evict_notified: &mut HashMap<Uuid, String>,
+    events: &std::sync::mpsc::Sender<EngineEvent>,
+) {
+    while let Ok(message) = capture.try_recv() {
+        match message {
+            FrameMessage::Frame(frame) => {
+                let source_id = frame.source_id;
+                if let Some(old) = frames.insert(source_id, frame) {
+                    capture.return_buffer(source_id, old.buffer_token);
+                }
+                capture_started.remove(&source_id);
+                // Frames arrived again: re-arm eviction reporting.
+                evict_notified.remove(&source_id);
+                if available.insert(source_id) && !import_failures.contains_key(&source_id) {
+                    let _ = events.send(EngineEvent::SourceAvailable { source_id });
+                }
+            }
+            FrameMessage::SourceError { source_id, reason } => {
+                available.remove(&source_id);
+                capture_started.remove(&source_id);
+                // Windows-parity restart: tear the errored stream down so the
+                // wanted-loop re-issues capture.start next tick instead of
+                // keeping a frozen last frame forever.
+                nodes.remove(&source_id);
+                if let Some(frame) = frames.remove(&source_id) {
+                    capture.return_buffer(source_id, frame.buffer_token);
+                }
+                capture.stop(source_id);
+                if evict_notified.get(&source_id).map(String::as_str) != Some(reason.as_str()) {
+                    evict_notified.insert(source_id, reason.clone());
+                    let _ = events.send(EngineEvent::SourceUnavailable { source_id, reason });
+                }
+            }
+        }
+    }
+}
+
+/// Pure-move extraction of the selective-recreation sequence from the render
+/// thread closure's output-resize block: scene target first, then both
+/// swapchain targets. Recovery accounting (including the give-up `break`)
+/// stays at the call site because it crosses the loop boundary.
+fn recreate_surface_sized_state(
+    compositor: &mut VulkanCompositor,
+    surfaces: &NativeSurfaces,
+    output: (u32, u32),
+) -> Result<(), String> {
+    compositor
+        .recreate_scene_target(output.0, output.1)
+        .and_then(|()| {
+            compositor.recreate_swapchains(
+                (
+                    surfaces.program_width.max(1),
+                    surfaces.program_height.max(1),
+                ),
+                (
+                    surfaces.preview_width.max(1),
+                    surfaces.preview_height.max(1),
+                ),
+                false,
+            )
+        })
 }
 
 fn raw_handles(
@@ -1388,9 +2405,42 @@ fn choose_device(
     program: vk::SurfaceKHR,
     preview: vk::SurfaceKHR,
 ) -> Result<(vk::PhysicalDevice, u32), String> {
+    // Extensions unconditionally enabled on the logical device below. Requesting
+    // an unsupported name makes vkCreateDevice fail with
+    // VK_ERROR_EXTENSION_NOT_PRESENT, so devices lacking any of them are
+    // disqualified before queue selection instead. The same applies to the
+    // samplerYcbcrConversion feature the media path requires.
+    const REQUIRED_EXTENSIONS: [&std::ffi::CStr; 6] = [
+        khr::swapchain::NAME,
+        khr::external_memory::NAME,
+        khr::external_memory_fd::NAME,
+        ash::ext::external_memory_dma_buf::NAME,
+        ash::ext::image_drm_format_modifier::NAME,
+        ash::ext::queue_family_foreign::NAME,
+    ];
     let devices = unsafe { instance.enumerate_physical_devices() }
         .map_err(|error| format!("enumerate Vulkan devices: {error}"))?;
     for physical in devices {
+        let supported = unsafe { instance.enumerate_device_extension_properties(physical) }
+            .map_err(|error| format!("query device extensions: {error}"))?;
+        if !REQUIRED_EXTENSIONS.iter().all(|name| {
+            supported
+                .iter()
+                .any(|property| property.extension_name_as_c_str() == Ok(*name))
+        }) {
+            continue;
+        }
+        // Enabling an unsupported feature fails vkCreateDevice, so disqualify
+        // such devices here as well. sampler_ycbcr_conversion is promoted
+        // from an extension and lives in its own chained query struct.
+        let mut ycbcr_features = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default();
+        let mut features2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut ycbcr_features);
+        unsafe {
+            instance.get_physical_device_features2(physical, &mut features2);
+        }
+        if ycbcr_features.sampler_ycbcr_conversion != vk::TRUE {
+            continue;
+        }
         let properties = unsafe { instance.get_physical_device_queue_family_properties(physical) };
         for (index, family) in properties.iter().enumerate() {
             if !family.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
@@ -1409,7 +2459,10 @@ fn choose_device(
             }
         }
     }
-    Err("no Vulkan graphics queue can present both surfaces".into())
+    Err(
+        "no Vulkan device supports the required extensions and features and can present both surfaces"
+            .into(),
+    )
 }
 
 fn create_sampler(device: &Device) -> Result<vk::Sampler, String> {
@@ -1495,42 +2548,76 @@ fn create_scene_target(
         )
     }
     .map_err(|error| format!("create scene image: {error}"))?;
-    let requirements = unsafe { device.get_image_memory_requirements(image) };
-    let memory_type = find_memory_type(
-        instance,
-        physical,
-        requirements.memory_type_bits,
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    )?;
-    let memory = unsafe {
-        device.allocate_memory(
-            &vk::MemoryAllocateInfo::default()
-                .allocation_size(requirements.size)
-                .memory_type_index(memory_type),
-            None,
-        )
+    // Staging rollback: every dependent resource registers itself the moment
+    // it exists, so a failure below releases exactly what was created instead
+    // of leaking a partial attachment on the hot resize path (PartialVulkan
+    // discipline).
+    let mut memory = None;
+    let mut view = None;
+    let mut framebuffer = None;
+    let staged = (|| -> Result<(), String> {
+        let requirements = unsafe { device.get_image_memory_requirements(image) };
+        let memory_type = find_memory_type(
+            instance,
+            physical,
+            requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )?;
+        let allocated = unsafe {
+            device.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(requirements.size)
+                    .memory_type_index(memory_type),
+                None,
+            )
+        }
+        .map_err(|error| format!("allocate scene image: {error}"))?;
+        memory = Some(allocated);
+        unsafe { device.bind_image_memory(image, allocated, 0) }
+            .map_err(|error| format!("bind scene image: {error}"))?;
+        let attached = create_view(
+            device,
+            image,
+            vk::Format::R16G16B16A16_SFLOAT,
+            vk::ComponentMapping::default(),
+        )?;
+        view = Some(attached);
+        let target = unsafe {
+            device.create_framebuffer(
+                &vk::FramebufferCreateInfo::default()
+                    .render_pass(render_pass)
+                    .attachments(std::slice::from_ref(&attached))
+                    .width(width)
+                    .height(height)
+                    .layers(1),
+                None,
+            )
+        }
+        .map_err(|error| format!("scene framebuffer: {error}"))?;
+        framebuffer = Some(target);
+        Ok(())
+    })();
+    if let Err(error) = staged {
+        // Reverse creation order; `render_pass` belongs to the caller.
+        unsafe {
+            if let Some(framebuffer) = framebuffer {
+                device.destroy_framebuffer(framebuffer, None);
+            }
+            if let Some(view) = view {
+                device.destroy_image_view(view, None);
+            }
+            device.destroy_image(image, None);
+            if let Some(memory) = memory {
+                device.free_memory(memory, None);
+            }
+        }
+        return Err(error);
     }
-    .map_err(|error| format!("allocate scene image: {error}"))?;
-    unsafe { device.bind_image_memory(image, memory, 0) }
-        .map_err(|error| format!("bind scene image: {error}"))?;
-    let view = create_view(device, image, vk::Format::R16G16B16A16_SFLOAT)?;
-    let framebuffer = unsafe {
-        device.create_framebuffer(
-            &vk::FramebufferCreateInfo::default()
-                .render_pass(render_pass)
-                .attachments(std::slice::from_ref(&view))
-                .width(width)
-                .height(height)
-                .layers(1),
-            None,
-        )
-    }
-    .map_err(|error| format!("scene framebuffer: {error}"))?;
     Ok(SceneTarget {
         image,
-        memory,
-        view,
-        framebuffer,
+        memory: memory.expect("staged scene memory"),
+        view: view.expect("staged scene view"),
+        framebuffer: framebuffer.expect("staged scene framebuffer"),
         render_pass,
         extent,
     })
@@ -1582,83 +2669,179 @@ fn create_swapchain(
     );
     let render_pass = create_render_pass(device, format.format)?;
     let swapchain_loader = khr::swapchain::Device::new(instance, device);
-    let swapchain = unsafe {
-        swapchain_loader.create_swapchain(
-            &vk::SwapchainCreateInfoKHR::default()
-                .surface(surface)
-                .min_image_count(count)
-                .image_format(format.format)
-                .image_color_space(format.color_space)
-                .image_extent(extent)
-                .image_array_layers(1)
-                .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
-                .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
-                .pre_transform(capabilities.current_transform)
-                .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-                .present_mode(vk::PresentModeKHR::FIFO)
-                .clipped(true),
-            None,
-        )
-    }
-    .map_err(|error| format!("create swapchain: {error}"))?;
-    let images = unsafe { swapchain_loader.get_swapchain_images(swapchain) }
-        .map_err(|error| format!("swapchain images: {error}"))?;
-    let mut views = Vec::with_capacity(images.len());
-    let mut framebuffers = Vec::with_capacity(images.len());
-    for image in &images {
-        let view = create_view(device, *image, format.format)?;
-        let framebuffer = unsafe {
-            device.create_framebuffer(
-                &vk::FramebufferCreateInfo::default()
-                    .render_pass(render_pass)
-                    .attachments(std::slice::from_ref(&view))
-                    .width(extent.width)
-                    .height(extent.height)
-                    .layers(1),
-                None,
-            )
+    // Staging rollback: every dependent resource registers itself the moment
+    // it exists, so a failure anywhere in the chain destroys exactly what was
+    // created before propagating (PartialVulkan discipline). Surface and
+    // descriptor_set stay with the caller.
+    let mut swapchain = None;
+    let mut views: Vec<vk::ImageView> = Vec::new();
+    let mut framebuffers: Vec<vk::Framebuffer> = Vec::new();
+    let mut available = None;
+    let mut rendered: Vec<vk::Semaphore> = Vec::new();
+    let mut pipeline_layout = None;
+    let mut pipeline = None;
+    let staged = (|| -> Result<(), String> {
+        swapchain = Some(
+            unsafe {
+                swapchain_loader.create_swapchain(
+                    &vk::SwapchainCreateInfoKHR::default()
+                        .surface(surface)
+                        .min_image_count(count)
+                        .image_format(format.format)
+                        .image_color_space(format.color_space)
+                        .image_extent(extent)
+                        .image_array_layers(1)
+                        .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+                        .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+                        .pre_transform(capabilities.current_transform)
+                        .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+                        .present_mode(vk::PresentModeKHR::FIFO)
+                        .clipped(true),
+                    None,
+                )
+            }
+            .map_err(|error| format!("create swapchain: {error}"))?,
+        );
+        let images =
+            unsafe { swapchain_loader.get_swapchain_images(swapchain.expect("staged swapchain")) }
+                .map_err(|error| format!("swapchain images: {error}"))?;
+        for image in &images {
+            let view = create_view(
+                device,
+                *image,
+                format.format,
+                vk::ComponentMapping::default(),
+            )?;
+            views.push(view);
+            let framebuffer = unsafe {
+                device.create_framebuffer(
+                    &vk::FramebufferCreateInfo::default()
+                        .render_pass(render_pass)
+                        .attachments(std::slice::from_ref(&view))
+                        .width(extent.width)
+                        .height(extent.height)
+                        .layers(1),
+                    None,
+                )
+            }
+            .map_err(|error| format!("swapchain framebuffer: {error}"))?;
+            framebuffers.push(framebuffer);
         }
-        .map_err(|error| format!("swapchain framebuffer: {error}"))?;
-        views.push(view);
-        framebuffers.push(framebuffer);
+        let sem_info = vk::SemaphoreCreateInfo::default();
+        available = Some(
+            unsafe { device.create_semaphore(&sem_info, None) }
+                .map_err(|error| format!("available semaphore: {error}"))?,
+        );
+        for _ in 0..images.len() {
+            let semaphore = unsafe { device.create_semaphore(&sem_info, None) }
+                .map_err(|error| format!("rendered semaphore: {error}"))?;
+            rendered.push(semaphore);
+        }
+        pipeline_layout = Some(create_composite_pipeline_layout(device, layout)?);
+        pipeline = Some(create_composite_pipeline(
+            device,
+            render_pass,
+            pipeline_layout.expect("staged pipeline layout"),
+        )?);
+        Ok(())
+    })();
+    if let Err(error) = staged {
+        // Reverse creation order; the surface is NOT destroyed — a
+        // replacement target adopts it (see recreate_swapchain).
+        unsafe {
+            if let Some(pipeline) = pipeline {
+                device.destroy_pipeline(pipeline, None);
+            }
+            if let Some(pipeline_layout) = pipeline_layout {
+                device.destroy_pipeline_layout(pipeline_layout, None);
+            }
+            for semaphore in rendered.drain(..) {
+                device.destroy_semaphore(semaphore, None);
+            }
+            if let Some(available) = available {
+                device.destroy_semaphore(available, None);
+            }
+            for framebuffer in framebuffers.drain(..) {
+                device.destroy_framebuffer(framebuffer, None);
+            }
+            for view in views.drain(..) {
+                device.destroy_image_view(view, None);
+            }
+            if let Some(swapchain) = swapchain {
+                swapchain_loader.destroy_swapchain(swapchain, None);
+            }
+            device.destroy_render_pass(render_pass, None);
+        }
+        return Err(error);
     }
-    let sem_info = vk::SemaphoreCreateInfo::default();
-    let available = unsafe { device.create_semaphore(&sem_info, None) }
-        .map_err(|error| format!("available semaphore: {error}"))?;
-    let rendered = (0..images.len())
-        .map(|_| unsafe { device.create_semaphore(&sem_info, None) })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("rendered semaphore: {error}"))?;
-    let fence = unsafe {
-        device.create_fence(
-            &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-            None,
-        )
-    }
-    .map_err(|error| format!("swapchain fence: {error}"))?;
-    let pipeline_layout = create_composite_pipeline_layout(device, layout)?;
-    let pipeline = create_composite_pipeline(device, render_pass, pipeline_layout)?;
     Ok(SwapchainTarget {
         surface,
         loader: swapchain_loader,
-        swapchain,
+        swapchain: swapchain.expect("staged swapchain"),
         views,
         framebuffers,
         render_pass,
         extent,
-        available,
+        available: available.expect("staged available semaphore"),
         rendered,
-        fence,
         descriptor_set,
-        pipeline,
-        pipeline_layout,
+        pipeline: pipeline.expect("staged composite pipeline"),
+        pipeline_layout: pipeline_layout.expect("staged pipeline layout"),
     })
+}
+
+/// Rebuilds one swapchain target in place for a resize or a swapchain-scoped
+/// error. The replacement is created on the same surface BEFORE the old state
+/// is retired, so a failure leaves the previous target fully functional
+/// (staging rollback). The surface handle, the shared scene descriptor set,
+/// and the device/pipeline lifetime all survive.
+#[allow(clippy::too_many_arguments)]
+fn recreate_swapchain(
+    instance: &Instance,
+    device: &Device,
+    physical: vk::PhysicalDevice,
+    surface_loader: &khr::surface::Instance,
+    layout: vk::DescriptorSetLayout,
+    target: &mut SwapchainTarget,
+    width: u32,
+    height: u32,
+) -> Result<(), String> {
+    let next = create_swapchain(
+        instance,
+        device,
+        physical,
+        surface_loader,
+        target.surface,
+        width,
+        height,
+        layout,
+        target.descriptor_set,
+    )?;
+    // Success only: retire the old swapchain state. The surface is NOT
+    // destroyed — the replacement target adopted the same handle.
+    destroy_swapchain_state(device, target);
+    *target = next;
+    Ok(())
+}
+
+/// Identity mapping except alpha, which reads as a constant 1.0. X-format
+/// DRM buffers leave the alpha byte undefined; without this swizzle the item
+/// shader premultiplies by that garbage and X-captured windows render with
+/// random per-pixel transparency.
+fn opaque_alpha_components() -> vk::ComponentMapping {
+    vk::ComponentMapping {
+        r: vk::ComponentSwizzle::R,
+        g: vk::ComponentSwizzle::G,
+        b: vk::ComponentSwizzle::B,
+        a: vk::ComponentSwizzle::ONE,
+    }
 }
 
 fn create_view(
     device: &Device,
     image: vk::Image,
     format: vk::Format,
+    components: vk::ComponentMapping,
 ) -> Result<vk::ImageView, String> {
     unsafe {
         device.create_image_view(
@@ -1666,6 +2849,7 @@ fn create_view(
                 .image(image)
                 .view_type(vk::ImageViewType::TYPE_2D)
                 .format(format)
+                .components(components)
                 .subresource_range(
                     vk::ImageSubresourceRange::default()
                         .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -1714,13 +2898,19 @@ fn create_composite_pipeline_layout(
     .map_err(|error| format!("composite pipeline layout: {error}"))
 }
 
-fn create_item_pipeline(
+#[allow(clippy::too_many_arguments)]
+fn create_graphics_pipeline(
     device: &Device,
     render_pass: vk::RenderPass,
     layout: vk::PipelineLayout,
+    vert_bytes: &[u8],
+    frag_bytes: &[u8],
+    topology: vk::PrimitiveTopology,
+    blend_enable: bool,
+    label: &str,
 ) -> Result<vk::Pipeline, String> {
-    let vert = create_shader(device, ITEM_VERT)?;
-    let frag = create_shader(device, ITEM_FRAG)?;
+    let vert = create_shader(device, vert_bytes)?;
+    let frag = create_shader(device, frag_bytes)?;
     let entry = CString::new("main").unwrap();
     let stages = [
         vk::PipelineShaderStageCreateInfo::default()
@@ -1732,15 +2922,22 @@ fn create_item_pipeline(
             .module(frag)
             .name(&entry),
     ];
-    let blend = vk::PipelineColorBlendAttachmentState::default()
-        .blend_enable(true)
-        .src_color_blend_factor(vk::BlendFactor::ONE)
-        .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-        .color_blend_op(vk::BlendOp::ADD)
-        .src_alpha_blend_factor(vk::BlendFactor::ONE)
-        .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-        .alpha_blend_op(vk::BlendOp::ADD)
-        .color_write_mask(vk::ColorComponentFlags::RGBA);
+    // With blending disabled the factor/op fields are ignored by Vulkan, so
+    // the disabled arm keeps the previous default state byte-for-byte.
+    let blend = if blend_enable {
+        vk::PipelineColorBlendAttachmentState::default()
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::ONE)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .alpha_blend_op(vk::BlendOp::ADD)
+            .color_write_mask(vk::ColorComponentFlags::RGBA)
+    } else {
+        vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA)
+    };
     let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
     let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
     let pipeline = unsafe {
@@ -1751,8 +2948,7 @@ fn create_item_pipeline(
                     .stages(&stages)
                     .vertex_input_state(&vk::PipelineVertexInputStateCreateInfo::default())
                     .input_assembly_state(
-                        &vk::PipelineInputAssemblyStateCreateInfo::default()
-                            .topology(vk::PrimitiveTopology::TRIANGLE_STRIP),
+                        &vk::PipelineInputAssemblyStateCreateInfo::default().topology(topology),
                     )
                     .viewport_state(
                         &vk::PipelineViewportStateCreateInfo::default()
@@ -1783,7 +2979,7 @@ fn create_item_pipeline(
             .map_err(|(_, error)| error)
     }
     .map(|pipelines| pipelines[0])
-    .map_err(|error| format!("item pipeline: {error}"));
+    .map_err(|error| format!("{label}: {error}"));
     unsafe {
         device.destroy_shader_module(vert, None);
         device.destroy_shader_module(frag, None);
@@ -1791,74 +2987,38 @@ fn create_item_pipeline(
     pipeline
 }
 
+fn create_item_pipeline(
+    device: &Device,
+    render_pass: vk::RenderPass,
+    layout: vk::PipelineLayout,
+) -> Result<vk::Pipeline, String> {
+    create_graphics_pipeline(
+        device,
+        render_pass,
+        layout,
+        ITEM_VERT,
+        ITEM_FRAG,
+        vk::PrimitiveTopology::TRIANGLE_STRIP,
+        true,
+        "item pipeline",
+    )
+}
+
 fn create_composite_pipeline(
     device: &Device,
     render_pass: vk::RenderPass,
     layout: vk::PipelineLayout,
 ) -> Result<vk::Pipeline, String> {
-    let vert = create_shader(device, COMPOSITE_VERT)?;
-    let frag = create_shader(device, COMPOSITE_FRAG)?;
-    let entry = CString::new("main").unwrap();
-    let stages = [
-        vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::VERTEX)
-            .module(vert)
-            .name(&entry),
-        vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::FRAGMENT)
-            .module(frag)
-            .name(&entry),
-    ];
-    let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-    let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
-    let color_write = vk::PipelineColorBlendAttachmentState::default()
-        .color_write_mask(vk::ColorComponentFlags::RGBA);
-    let pipeline = unsafe {
-        device
-            .create_graphics_pipelines(
-                vk::PipelineCache::null(),
-                &[vk::GraphicsPipelineCreateInfo::default()
-                    .stages(&stages)
-                    .vertex_input_state(&vk::PipelineVertexInputStateCreateInfo::default())
-                    .input_assembly_state(
-                        &vk::PipelineInputAssemblyStateCreateInfo::default()
-                            .topology(vk::PrimitiveTopology::TRIANGLE_LIST),
-                    )
-                    .viewport_state(
-                        &vk::PipelineViewportStateCreateInfo::default()
-                            .viewport_count(1)
-                            .scissor_count(1),
-                    )
-                    .rasterization_state(
-                        &vk::PipelineRasterizationStateCreateInfo::default()
-                            .polygon_mode(vk::PolygonMode::FILL)
-                            .cull_mode(vk::CullModeFlags::NONE)
-                            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
-                            .line_width(1.0),
-                    )
-                    .multisample_state(
-                        &vk::PipelineMultisampleStateCreateInfo::default()
-                            .rasterization_samples(vk::SampleCountFlags::TYPE_1),
-                    )
-                    .color_blend_state(
-                        &vk::PipelineColorBlendStateCreateInfo::default()
-                            .attachments(std::slice::from_ref(&color_write)),
-                    )
-                    .dynamic_state(&dynamic)
-                    .layout(layout)
-                    .render_pass(render_pass)
-                    .subpass(0)],
-                None,
-            )
-            .map_err(|(_, error)| error)
-    }
-    .map(|pipelines| pipelines[0])
-    .map_err(|error| format!("composite pipeline: {error}"));
-    unsafe {
-        device.destroy_shader_module(vert, None);
-        device.destroy_shader_module(frag, None);
-    }
-    pipeline
+    create_graphics_pipeline(
+        device,
+        render_pass,
+        layout,
+        COMPOSITE_VERT,
+        COMPOSITE_FRAG,
+        vk::PrimitiveTopology::TRIANGLE_LIST,
+        false,
+        "composite pipeline",
+    )
 }
 
 fn create_shader(device: &Device, bytes: &[u8]) -> Result<vk::ShaderModule, String> {
@@ -1871,6 +3031,17 @@ fn create_shader(device: &Device, bytes: &[u8]) -> Result<vk::ShaderModule, Stri
 fn color_range() -> vk::ImageSubresourceRange {
     vk::ImageSubresourceRange::default()
         .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .base_mip_level(0)
+        .level_count(1)
+        .base_array_layer(0)
+        .layer_count(1)
+}
+
+/// Barrier range for one plane of a DISJOINT multi-planar (NV12) image;
+/// COLOR is invalid for such images.
+fn plane_range(aspect: vk::ImageAspectFlags) -> vk::ImageSubresourceRange {
+    vk::ImageSubresourceRange::default()
+        .aspect_mask(aspect)
         .base_mip_level(0)
         .level_count(1)
         .base_array_layer(0)
@@ -2187,7 +3358,12 @@ fn upload_rgba_texture(
         }
         return Err(error);
     }
-    let view = match create_view(device, image, vk::Format::R8G8B8A8_UNORM) {
+    let view = match create_view(
+        device,
+        image,
+        vk::Format::R8G8B8A8_UNORM,
+        vk::ComponentMapping::default(),
+    ) {
         Ok(view) => view,
         Err(error) => {
             unsafe {
@@ -2201,8 +3377,6 @@ fn upload_rgba_texture(
         image,
         memories: vec![memory],
         view,
-        sampler: None,
-        conversion: None,
     })
 }
 
@@ -2211,6 +3385,7 @@ fn import_media_frame(
     device: &Device,
     external_fd: &khr::external_memory_fd::Device,
     physical: vk::PhysicalDevice,
+    conversion: vk::SamplerYcbcrConversion,
     frame: &MediaVideoFrame,
 ) -> Result<ImportedFrame, String> {
     if frame.drm_format != DRM_FORMAT_NV12 {
@@ -2276,9 +3451,7 @@ fn import_media_frame(
     }
     .map_err(|error| format!("create NV12 DMA-BUF image: {error}"))?;
     let mut memories = Vec::with_capacity(2);
-    let mut conversion = vk::SamplerYcbcrConversion::null();
     let mut view = vk::ImageView::null();
-    let mut sampler = vk::Sampler::null();
     let operation = (|| -> Result<(), String> {
         for (index, plane) in planes.into_iter().enumerate() {
             let aspect = if index == 0 {
@@ -2305,7 +3478,7 @@ fn import_media_frame(
                     )
                     .map_err(|error| format!("media DMA-BUF memory properties: {error}"))?;
             }
-            let memory_type = find_memory_type(
+            let memory_type = find_memory_type_any(
                 instance,
                 physical,
                 requirements.memory_requirements.memory_type_bits & fd_properties.memory_type_bits,
@@ -2343,20 +3516,6 @@ fn import_media_frame(
             unsafe { device.bind_image_memory2(std::slice::from_ref(&bind)) }
                 .map_err(|error| format!("bind media DMA-BUF plane: {error}"))?;
         }
-        conversion = unsafe {
-            device.create_sampler_ycbcr_conversion(
-                &vk::SamplerYcbcrConversionCreateInfo::default()
-                    .format(format)
-                    .ycbcr_model(vk::SamplerYcbcrModelConversion::YCBCR_709)
-                    .ycbcr_range(vk::SamplerYcbcrRange::ITU_NARROW)
-                    .components(vk::ComponentMapping::default())
-                    .x_chroma_offset(vk::ChromaLocation::MIDPOINT)
-                    .y_chroma_offset(vk::ChromaLocation::MIDPOINT)
-                    .chroma_filter(vk::Filter::NEAREST),
-                None,
-            )
-        }
-        .map_err(|error| format!("create media YCbCr conversion: {error}"))?;
         let mut conversion_info = vk::SamplerYcbcrConversionInfo::default().conversion(conversion);
         view = unsafe {
             device.create_image_view(
@@ -2370,35 +3529,12 @@ fn import_media_frame(
             )
         }
         .map_err(|error| format!("create media YCbCr image view: {error}"))?;
-        let mut sampler_conversion =
-            vk::SamplerYcbcrConversionInfo::default().conversion(conversion);
-        sampler = unsafe {
-            device.create_sampler(
-                &vk::SamplerCreateInfo::default()
-                    .mag_filter(vk::Filter::NEAREST)
-                    .min_filter(vk::Filter::NEAREST)
-                    .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
-                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                    .max_lod(1.0)
-                    .push_next(&mut sampler_conversion),
-                None,
-            )
-        }
-        .map_err(|error| format!("create media YCbCr sampler: {error}"))?;
         Ok(())
     })();
     if let Err(error) = operation {
         unsafe {
-            if sampler != vk::Sampler::null() {
-                device.destroy_sampler(sampler, None);
-            }
             if view != vk::ImageView::null() {
                 device.destroy_image_view(view, None);
-            }
-            if conversion != vk::SamplerYcbcrConversion::null() {
-                device.destroy_sampler_ycbcr_conversion(conversion, None);
             }
             for memory in memories {
                 device.free_memory(memory, None);
@@ -2411,8 +3547,6 @@ fn import_media_frame(
         image,
         memories,
         view,
-        sampler: Some(sampler),
-        conversion: Some(conversion),
     })
 }
 fn import_frame(
@@ -2425,6 +3559,14 @@ fn import_frame(
     let FrameMemory::DmaBuf { planes } = &frame.memory;
     let format =
         drm_to_vk(frame.drm_format).ok_or_else(|| "unsupported DMA-BUF DRM format".to_string())?;
+    // X-format DRM buffers leave the alpha byte undefined; swizzling the
+    // view's alpha to a constant 1 keeps sampled opacity well-defined.
+    let components =
+        if frame.drm_format == DRM_FORMAT_XRGB8888 || frame.drm_format == DRM_FORMAT_XBGR8888 {
+            opaque_alpha_components()
+        } else {
+            vk::ComponentMapping::default()
+        };
     if frame.modifier == DRM_FORMAT_MOD_INVALID {
         return Err("DMA-BUF modifier was not fixated by PipeWire".into());
     }
@@ -2476,7 +3618,7 @@ fn import_frame(
                 )
                 .map_err(|error| format!("DMA-BUF memory properties: {error}"))?;
         }
-        let memory_type = find_memory_type(
+        let memory_type = find_memory_type_any(
             instance,
             physical,
             requirements.memory_type_bits & fd_properties.memory_type_bits,
@@ -2513,15 +3655,13 @@ fn import_frame(
         };
         unsafe { device.bind_image_memory(image, memory, 0) }
             .map_err(|error| format!("bind imported DMA-BUF: {error}"))?;
-        create_view(device, image, format)
+        create_view(device, image, format, components)
     })();
     match result {
         Ok(view) => Ok(ImportedFrame {
             image,
             memories: vec![memory],
             view,
-            sampler: None,
-            conversion: None,
         }),
         Err(error) => {
             unsafe {
@@ -2559,6 +3699,32 @@ fn find_memory_type(
                     .property_flags
                     .contains(required)
         })
+        .ok_or_else(|| {
+            format!(
+                "no Vulkan memory type with bits {bits:#b} satisfying {:#x}",
+                required.as_raw()
+            )
+        })
+}
+
+/// Lenient variant for IMPORTED memory (dma-buf fds): the export-constraint
+/// intersection with the fd properties can leave types whose property flags
+/// miss the requested mask even though the kernel buffer works as-is, so any
+/// type within `bits` is acceptable as a fallback.
+fn find_memory_type_any(
+    instance: &Instance,
+    physical: vk::PhysicalDevice,
+    bits: u32,
+    required: vk::MemoryPropertyFlags,
+) -> Result<u32, String> {
+    let properties = unsafe { instance.get_physical_device_memory_properties(physical) };
+    (0..properties.memory_type_count)
+        .find(|index| {
+            (bits & (1 << index)) != 0
+                && properties.memory_types[*index as usize]
+                    .property_flags
+                    .contains(required)
+        })
         .or_else(|| (0..properties.memory_type_count).find(|index| (bits & (1 << index)) != 0))
         .ok_or_else(|| "no compatible Vulkan memory type".into())
 }
@@ -2566,16 +3732,12 @@ fn find_memory_type(
 fn item_push(transform: Transform, width: u32, height: u32, mode: u32) -> ItemPush {
     let radians = transform.rotation_degrees.to_radians();
     let (sin, cos) = radians.sin_cos();
-    let crop_left = transform.crop_left.max(0.0).min(transform.width);
-    let crop_right = transform
-        .crop_right
-        .max(0.0)
-        .min(transform.width - crop_left);
-    let crop_top = transform.crop_top.max(0.0).min(transform.height);
+    let crop_left = transform.crop_left.clamp(0.0, transform.width);
+    let crop_right = transform.crop_right.clamp(0.0, transform.width - crop_left);
+    let crop_top = transform.crop_top.clamp(0.0, transform.height);
     let crop_bottom = transform
         .crop_bottom
-        .max(0.0)
-        .min(transform.height - crop_top);
+        .clamp(0.0, transform.height - crop_top);
     let inner_width = (transform.width - crop_left - crop_right).max(1.0);
     let inner_height = (transform.height - crop_top - crop_bottom).max(1.0);
     ItemPush {
@@ -2670,18 +3832,37 @@ fn composite_target(
     }
 }
 
-fn acquire(_device: &Device, target: &SwapchainTarget) -> Result<u32, RenderError> {
+/// Interruptible backoff between consecutive compositor creation failures
+/// (mirrors the Windows render loop): 200 ms per failure, capped at 2 s.
+fn sleep_backoff(stop: &AtomicBool, failures: u32) {
+    let backoff = Duration::from_millis(200)
+        .saturating_mul(failures)
+        .min(Duration::from_secs(2));
+    let deadline = Instant::now() + backoff;
+    while Instant::now() < deadline && !stop.load(Ordering::Acquire) {
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn acquire(target: &SwapchainTarget) -> Result<u32, RenderError> {
     unsafe {
         target
             .loader
             .acquire_next_image(
                 target.swapchain,
-                u64::MAX,
+                // Bounded wait: a hidden or unmapped window can stall the
+                // presentation engine indefinitely. Timing out lets the render
+                // loop skip the frame and re-check its stop flag so shutdown's
+                // join always terminates.
+                100_000_000,
                 target.available,
                 vk::Fence::null(),
             )
             .map(|(index, _)| index)
-            .map_err(RenderError::Vk)
+            .map_err(|error| match error {
+                vk::Result::TIMEOUT => RenderError::AcquireTimeout,
+                other => RenderError::Vk(other),
+            })
     }
 }
 
@@ -2703,12 +3884,6 @@ fn present(target: &SwapchainTarget, queue: vk::Queue, index: u32) -> Result<(),
 
 fn destroy_imported(device: &Device, imported: ImportedFrame) {
     unsafe {
-        if let Some(sampler) = imported.sampler {
-            device.destroy_sampler(sampler, None);
-        }
-        if let Some(conversion) = imported.conversion {
-            device.destroy_sampler_ycbcr_conversion(conversion, None);
-        }
         device.destroy_image_view(imported.view, None);
         device.destroy_image(imported.image, None);
         for memory in imported.memories {
@@ -2745,11 +3920,19 @@ fn parse_color(value: &str) -> [f32; 4] {
 
 fn destroy_scene(device: &Device, scene: &mut SceneTarget) {
     unsafe {
+        destroy_scene_attachments(device, scene);
+        device.destroy_render_pass(scene.render_pass, None);
+    }
+}
+/// Frees a scene target's image attachments but keeps `render_pass` alive:
+/// the replacement target reuses the same pass, so pipelines stay untouched
+/// across a selective scene recreation.
+fn destroy_scene_attachments(device: &Device, scene: &mut SceneTarget) {
+    unsafe {
         device.destroy_framebuffer(scene.framebuffer, None);
         device.destroy_image_view(scene.view, None);
         device.destroy_image(scene.image, None);
         device.free_memory(scene.memory, None);
-        device.destroy_render_pass(scene.render_pass, None);
     }
 }
 fn destroy_target(
@@ -2757,6 +3940,12 @@ fn destroy_target(
     surface_loader: &khr::surface::Instance,
     target: &mut SwapchainTarget,
 ) {
+    destroy_swapchain_state(device, target);
+    unsafe { surface_loader.destroy_surface(target.surface, None) };
+}
+/// Frees every swapchain-owned resource except the surface, which a
+/// replacement target adopts (see `recreate_swapchain`).
+fn destroy_swapchain_state(device: &Device, target: &mut SwapchainTarget) {
     unsafe {
         for framebuffer in target.framebuffers.drain(..) {
             device.destroy_framebuffer(framebuffer, None);
@@ -2767,12 +3956,10 @@ fn destroy_target(
         device.destroy_pipeline(target.pipeline, None);
         device.destroy_pipeline_layout(target.pipeline_layout, None);
         device.destroy_render_pass(target.render_pass, None);
-        device.destroy_fence(target.fence, None);
         device.destroy_semaphore(target.available, None);
         for semaphore in target.rendered.drain(..) {
             device.destroy_semaphore(semaphore, None);
         }
         target.loader.destroy_swapchain(target.swapchain, None);
-        surface_loader.destroy_surface(target.surface, None);
     }
 }

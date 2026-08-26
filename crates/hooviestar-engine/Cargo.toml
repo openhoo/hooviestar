@@ -16,13 +16,12 @@ uuid.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 ash = { version = "0.38", default-features = false, features = ["loaded"] }
 ash-window = "0.13"
-ashpd = { version = "0.13.13", default-features = false, features = ["tokio", "screencast", "raw_handle", "wayland"] }
+ashpd = { version = "0.13.13", default-features = false, features = ["tokio", "screencast"] }
 pipewire = { version = "0.9.2", features = ["v0_3_77"] }
 raw-window-handle = "0.6"
 gstreamer = "=0.25.3"
 gstreamer-app = "=0.25.2"
 gstreamer-video = { version = "=0.25.3", features = ["v1_24"] }
-gstreamer-audio = "=0.25.3"
 gstreamer-allocators = "=0.25.3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
 fontdue = "0.9"
@@ -38,10 +37,12 @@ windows = { version = "0.61", features = [
     "Win32_Graphics_Direct2D_Common",
     "Win32_Graphics_DirectWrite",
     "Win32_Graphics_Imaging",
+    "Win32_Graphics_Dwm",
     "Win32_Media_MediaFoundation",
     "Win32_Media_Audio",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_Graphics_Direct3D_Fxc",
     "Win32_System_Variant",
     "Win32_System_Threading",

@@ -121,6 +121,16 @@ impl Source {
             | Self::ApplicationAudio { id, .. } => *id,
         }
     }
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Window { name, .. }
+            | Self::Display { name, .. }
+            | Self::Image { name, .. }
+            | Self::Text { name, .. }
+            | Self::Media { name, .. }
+            | Self::ApplicationAudio { name, .. } => name,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -225,6 +235,25 @@ impl ProjectV1 {
             if !source_ids.insert(source.id()) || !all_ids.insert(source.id()) {
                 return Err("duplicate source id".into());
             }
+            if source.name().trim().is_empty() {
+                return Err("source name is empty".into());
+            }
+            if let Source::Text {
+                color,
+                background_color,
+                ..
+            } = source
+                && (!is_color(color) || !is_color(background_color))
+            {
+                return Err("invalid text color".into());
+            }
+            let font_size_px = match source {
+                Source::Text { font_size_px, .. } => Some(*font_size_px),
+                _ => None,
+            };
+            if font_size_px.is_some_and(|size| !size.is_finite() || size <= 0.0 || size > 4096.0) {
+                return Err("invalid text font size".into());
+            }
             let volume = match source {
                 Source::Media { volume, .. } | Source::ApplicationAudio { volume, .. } => {
                     Some(*volume)
@@ -245,10 +274,13 @@ impl ProjectV1 {
             if !scene_ids.insert(scene.id) || !all_ids.insert(scene.id) {
                 return Err("duplicate scene id".into());
             }
-            if let Some(hotkey) = &scene.hotkey
-                && !hotkeys.insert(hotkey.to_ascii_lowercase())
-            {
-                return Err("duplicate scene hotkey".into());
+            if let Some(hotkey) = &scene.hotkey {
+                if hotkey.trim().is_empty() {
+                    return Err("invalid scene hotkey".into());
+                }
+                if !hotkeys.insert(hotkey.to_ascii_lowercase()) {
+                    return Err("duplicate scene hotkey".into());
+                }
             }
             if scene.items.len() > 128 {
                 return Err("scene has too many items".into());
@@ -344,5 +376,35 @@ mod tests {
             muted: false,
         });
         assert_eq!(project.validate(), Err("invalid source volume".into()));
+    }
+
+    #[test]
+    fn blank_source_name_is_rejected() {
+        let mut project = ProjectV1::empty();
+        project.sources.push(Source::ApplicationAudio {
+            id: Uuid::new_v4(),
+            name: "   ".into(),
+            binding: AudioSessionBinding {
+                process_path: "/usr/bin/game".into(),
+                session_grouping_id: "game".into(),
+            },
+            volume: 1.0,
+            muted: false,
+        });
+        assert_eq!(project.validate(), Err("source name is empty".into()));
+        match project.sources.first_mut() {
+            Some(Source::ApplicationAudio { name, .. }) => *name = "Game-Audio".into(),
+            _ => unreachable!("test pushed an ApplicationAudio source"),
+        }
+        project.validate().unwrap();
+    }
+
+    #[test]
+    fn blank_hotkey_is_rejected() {
+        let mut project = ProjectV1::empty();
+        project.scenes[0].hotkey = Some("   ".into());
+        assert_eq!(project.validate(), Err("invalid scene hotkey".into()));
+        project.scenes[0].hotkey = Some("Ctrl+Alt+9".into());
+        project.validate().unwrap();
     }
 }

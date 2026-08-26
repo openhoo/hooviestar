@@ -15,7 +15,7 @@ use std::{
 use parking_lot::Mutex;
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, WAIT_OBJECT_0},
+        Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0},
         Media::Audio::{
             AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
             AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
@@ -44,17 +44,32 @@ use windows::{
     core::{HRESULT, IUnknown, Interface, Ref, implement},
 };
 
-use super::{GainRamp, LIMITER_CEILING, MediaAudioBus, PcmRing, SAMPLE_RATE};
+use super::{GainRamp, LIMITER_CEILING, MediaAudioBus, PcmRing, SAMPLE_RATE, emit_availability};
 use crate::{
     audio::journal::{RestoreJournal, SessionRestoreEntry, default_journal_path},
     discovery::windows::{
         mute_audio_session, repair_audio_journal, resolve_audio_process, restore_audio_session,
     },
-    engine::{EngineEvent, LevelEntry},
-    project::{ProjectV1, Source},
+    engine::{AudioWarningKind, EngineEvent, LevelEntry},
+    project::{AudioSessionBinding, ProjectV1, Source},
 };
 use uuid::Uuid;
 
+/// Ticks (je 500 ms) mit aktivem Retry-Ausfall nach fehlgeschlagener Aktivierung.
+const RETRY_TICKS_AFTER_FAILURES: u32 = 20;
+/// Neustartversuche des Mischers bei unmittelbar wiederholten Fehlern.
+const MIXER_MAX_CONSECUTIVE_RESTARTS: u32 = 5;
+const MIXER_RESTART_BACKOFF_INITIAL: Duration = Duration::from_millis(500);
+const MIXER_RESTART_BACKOFF_MAX: Duration = Duration::from_secs(8);
+
+/// Intervall des Verwaltungs-Threads, der Quellen synchronisiert.
+const MANAGEMENT_SYNC_INTERVAL: Duration = Duration::from_millis(500);
+/// Läuft ein Versuch länger als gesund, gilt die Fehlerkette als unterbrochen.
+const MIXER_HEALTHY_RUNTIME: Duration = Duration::from_secs(30);
+
+/// Ticks (je 500 ms) mit durchgehend leerem Ring, bevor ein gebundener,
+/// lebender Capture einmalig Stagnation meldet.
+const STALE_RING_TICKS: u32 = 30;
 #[implement(IActivateAudioInterfaceCompletionHandler)]
 struct ActivationHandler {
     sender: StdMutex<Option<mpsc::Sender<Result<IAudioClient, String>>>>,
@@ -91,10 +106,26 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for ActivationHandler_Impl {
     }
 }
 
+/// Räumt WASAPI-Client und Ereignishandle auf jedem Exit-Pfad auf.
+struct StreamGuard {
+    client: IAudioClient,
+    event: HANDLE,
+}
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.client.Stop();
+            let _ = CloseHandle(self.event);
+        }
+    }
+}
+
 pub struct ProcessAudioCapture {
     ring: Arc<Mutex<PcmRing>>,
     stop: Arc<AtomicBool>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    failure: Arc<Mutex<Option<String>>>,
 }
 
 impl ProcessAudioCapture {
@@ -102,10 +133,12 @@ impl ProcessAudioCapture {
         if process_id == 0 {
             return Err("process id must be non-zero".into());
         }
-        let ring = Arc::new(Mutex::new(PcmRing::new(SAMPLE_RATE as usize * 2)));
+        let ring = Arc::new(Mutex::new(PcmRing::new(SAMPLE_RATE as usize / 10)));
         let thread_ring = ring.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
+        let failure = Arc::new(Mutex::new(None));
+        let thread_failure = failure.clone();
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name(format!("process-loopback-{process_id}"))
@@ -113,6 +146,7 @@ impl ProcessAudioCapture {
                 let result = capture_thread(process_id, thread_ring, thread_stop, ready_sender);
                 if let Err(error) = result {
                     eprintln!("process loopback stopped: {error}");
+                    *thread_failure.lock() = Some(error);
                 }
             })
             .map_err(|error| error.to_string())?;
@@ -121,6 +155,7 @@ impl ProcessAudioCapture {
                 ring,
                 stop,
                 thread: Mutex::new(Some(thread)),
+                failure,
             }),
             Ok(Err(error)) => {
                 let _ = thread.join();
@@ -136,6 +171,11 @@ impl ProcessAudioCapture {
 
     pub fn pop(&self) -> [f32; 2] {
         self.ring.lock().pop()
+    }
+
+    /// Grund des Fehlers, falls der Capture-Thread unerwartet geendet hat.
+    pub fn failure_reason(&self) -> Option<String> {
+        self.failure.lock().clone()
     }
 
     pub fn shutdown(&self) {
@@ -155,56 +195,6 @@ impl Drop for ProcessAudioCapture {
     }
 }
 
-enum AudioInput {
-    Process(ProcessAudioCapture),
-    Media(Arc<Mutex<PcmRing>>),
-}
-
-impl AudioInput {
-    fn pop(&self) -> [f32; 2] {
-        match self {
-            Self::Process(capture) => capture.pop(),
-            Self::Media(ring) => ring.lock().pop(),
-        }
-    }
-
-    fn shutdown(&self) {
-        if let Self::Process(capture) = self {
-            capture.shutdown();
-        }
-    }
-}
-
-struct SourceCapture {
-    input: AudioInput,
-    gain: GainRamp,
-    target_volume: f32,
-    muted: bool,
-    restore: Option<SessionRestoreEntry>,
-    journal_path: PathBuf,
-}
-
-impl SourceCapture {
-    fn restore(&mut self) {
-        let Some(entry) = self.restore.take() else {
-            return;
-        };
-        if restore_audio_session(&entry).is_ok()
-            && let Ok(mut journal) = RestoreJournal::load(&self.journal_path)
-        {
-            journal.remove(&entry.session_instance_id);
-            let _ = journal.save_atomic(&self.journal_path);
-        }
-    }
-}
-
-impl Drop for SourceCapture {
-    fn drop(&mut self) {
-        self.input.shutdown();
-        self.restore();
-    }
-}
-
 pub struct AudioRuntime {
     stop: Arc<AtomicBool>,
     thread: Mutex<Option<JoinHandle<()>>>,
@@ -217,23 +207,74 @@ impl AudioRuntime {
         media_audio: MediaAudioBus,
     ) -> Result<Self, String> {
         let journal_path = default_journal_path().map_err(|error| error.to_string())?;
-        repair_audio_journal(&journal_path)?;
+        // Journalproblem sichtbar machen: Unlesbares Journal (Quarantäne)
+        // oder gescheiterte Ersatzschreibung — die Baselines sind verloren,
+        // betroffene Sitzungen bleiben ggf. stumm. Der Pfad ist der
+        // Quarantäne-Ort, das Originaljournal bzw. das nicht ersetzbare Journal.
+        if let Some((error, quarantined)) = repair_audio_journal(&journal_path)? {
+            let _ = events.send(EngineEvent::EngineError {
+                message: format!(
+                    "Problem im Audio-Wiederherstellungsjournal ({error}); \
+                     betroffene Datei: {} – Sitzungen wurden nicht automatisch entstummt.",
+                    quarantined.display()
+                ),
+            });
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
+        let last_failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let thread_last_failure = last_failure.clone();
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("wasapi-mixer".into())
             .spawn(move || {
-                let result = mixer_thread(
-                    project,
-                    events,
-                    media_audio,
-                    journal_path,
-                    thread_stop,
-                    ready_sender,
-                );
-                if let Err(error) = result {
-                    eprintln!("WASAPI mixer stopped: {error}");
+                let mut consecutive_failures: u32 = 0;
+                let mut backoff = MIXER_RESTART_BACKOFF_INITIAL;
+                // Meldung über ausgeschöpfte Neustarts nur einmal pro Fehlerkette.
+                let mut exhausted_reported = false;
+                while !thread_stop.load(Ordering::Acquire) {
+                    let started = Instant::now();
+                    let result = mixer_thread(
+                        project.clone(),
+                        events.clone(),
+                        media_audio.clone(),
+                        journal_path.clone(),
+                        thread_stop.clone(),
+                        ready_sender.clone(),
+                    );
+                    match result {
+                        Ok(()) => return, // Sauberer Stopp ueber das Stop-Flag.
+                        Err(error) => {
+                            *thread_last_failure.lock() = Some(error.clone());
+                            eprintln!("WASAPI mixer stopped: {error}");
+                            let _ = events.send(EngineEvent::EngineError {
+                                message: format!("Audio-Mischer wurde unerwartet beendet: {error}"),
+                            });
+                            if started.elapsed() >= MIXER_HEALTHY_RUNTIME {
+                                consecutive_failures = 0;
+                                backoff = MIXER_RESTART_BACKOFF_INITIAL;
+                                exhausted_reported = false;
+                            } else {
+                                consecutive_failures += 1;
+                            }
+                            if consecutive_failures >= MIXER_MAX_CONSECUTIVE_RESTARTS
+                                && !exhausted_reported
+                            {
+                                exhausted_reported = true;
+                                let _ = events.send(EngineEvent::EngineError {
+                                    message: "Audio-Mischer konnte nach wiederholten Fehlern \
+                                        vorübergehend nicht neu gestartet werden; weitere \
+                                        Versuche laufen im Hintergrund."
+                                        .into(),
+                                });
+                            }
+                            // Nie dauerhaft enden, solange nicht gestoppt
+                            // wurde: Ein späteres Wiedereinstecken des
+                            // Endgeräts belebt den Mischer erneut.
+                            sleep_stoppable(&thread_stop, backoff);
+                            backoff = (backoff * 2).min(MIXER_RESTART_BACKOFF_MAX);
+                        }
+                    }
                 }
             })
             .map_err(|error| error.to_string())?;
@@ -243,13 +284,23 @@ impl AudioRuntime {
                 thread: Mutex::new(Some(thread)),
             }),
             Ok(Err(error)) => {
+                // Der Thread wiederholt Fehler intern mit Backoff; hier
+                // endgueltig anhalten, sonst blockiert das Join Minuten.
+                stop.store(true, Ordering::Release);
                 let _ = thread.join();
                 Err(error)
             }
             Err(error) => {
                 stop.store(true, Ordering::Release);
                 let _ = thread.join();
-                Err(error.to_string())
+                // Echtgrund melden statt generischem Timeout, wenn der
+                // Mischer vorher wiederholt scheiterte (z. B. fehlendes
+                // Standardendgerät).
+                let detail = last_failure.lock().take();
+                Err(match detail {
+                    Some(failure) => format!("audio mixer did not become ready: {failure}"),
+                    None => error.to_string(),
+                })
             }
         }
     }
@@ -268,6 +319,30 @@ impl Drop for AudioRuntime {
         if let Some(thread) = self.thread.get_mut().take() {
             let _ = thread.join();
         }
+    }
+}
+/// Schläft die Dauer ab, bricht aber früh bei gesetztem Stopp-Flag aus.
+fn sleep_stoppable(stop: &AtomicBool, duration: Duration) {
+    let deadline = Instant::now() + duration;
+    while !stop.load(Ordering::Acquire) {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100).min(deadline - now));
+    }
+}
+
+/// Wie `sleep_stoppable`, bricht aber bereits aus, sobald EINES der beiden
+/// Flags gesetzt ist (Supervisor-Stopp oder Verwaltungs-Notstopp).
+fn sleep_stoppable_either(first: &AtomicBool, second: &AtomicBool, duration: Duration) {
+    let deadline = Instant::now() + duration;
+    while !first.load(Ordering::Acquire) && !second.load(Ordering::Acquire) {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100).min(deadline - now));
     }
 }
 
@@ -318,52 +393,97 @@ fn mixer_thread_initialized(
         .map_err(|error| error.to_string())?;
     let event =
         unsafe { CreateEventW(None, false, false, None) }.map_err(|error| error.to_string())?;
-    unsafe { client.SetEventHandle(event) }.map_err(|error| error.to_string())?;
-    let buffer_size = unsafe { client.GetBufferSize() }.map_err(|error| error.to_string())?;
+    // Guard sofort nach CreateEventW: Auch ein fehlgeschlagenes
+    // SetEventHandle darf das Handle nicht für die Prozesslaufzeit leaken.
+    let stream = StreamGuard { client, event };
+    unsafe { stream.client.SetEventHandle(stream.event) }.map_err(|error| error.to_string())?;
+    let buffer_size =
+        unsafe { stream.client.GetBufferSize() }.map_err(|error| error.to_string())?;
     let render: IAudioRenderClient =
-        unsafe { client.GetService() }.map_err(|error| error.to_string())?;
-    unsafe { client.Start() }.map_err(|error| error.to_string())?;
+        unsafe { stream.client.GetService() }.map_err(|error| error.to_string())?;
+    unsafe { stream.client.Start() }.map_err(|error| error.to_string())?;
+
+    // Die Quellenverwaltung läuft neben dem Render-Thread: Erzeugung,
+    // Stummschaltung und Journal-I/O blockieren dort und dürfen den Mischer
+    // nicht ausbremsen. Der Render-Thread sieht nur fertige Mischringe.
+    let live: Arc<Mutex<HashMap<Uuid, Arc<LiveSource>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let management_events = events.clone();
+    // Eigenes Notstopp-Flag für den Verwaltungs-Thread: Der Guard-Drop nach
+    // einem Render-Fehler setzt NUR dieses Flag — fasst er den Stop-Arc des
+    // Supervisors an, endet dessen Neustart-Schleife dauerhaft.
+    let mgmt_stop = Arc::new(AtomicBool::new(false));
+    let thread_mgmt_stop = mgmt_stop.clone();
+    let management = ManagementGuard {
+        mgmt_stop,
+        handle: Some(
+            thread::Builder::new()
+                .name("audio-source-management".into())
+                .spawn({
+                    let live = live.clone();
+                    let stop = stop.clone();
+                    move || {
+                        management_loop(
+                            project,
+                            management_events,
+                            media_audio,
+                            journal_path,
+                            live,
+                            stop,
+                            thread_mgmt_stop,
+                        )
+                    }
+                })
+                .map_err(|error| error.to_string())?,
+        ),
+    };
     let _ = ready.send(Ok(()));
 
-    let mut sources: HashMap<Uuid, SourceCapture> = HashMap::new();
-    let mut last_sync = Instant::now() - Duration::from_secs(2);
     let mut last_levels = Instant::now();
     while !stop.load(Ordering::Acquire) {
-        if last_sync.elapsed() >= Duration::from_secs(1) {
-            synchronize_sources(
-                &project.read(),
-                &events,
-                &media_audio,
-                &journal_path,
-                &mut sources,
-            );
-            last_sync = Instant::now();
-        }
-        if unsafe { WaitForSingleObject(event, 100) } != WAIT_OBJECT_0 {
+        if unsafe { WaitForSingleObject(stream.event, 100) } != WAIT_OBJECT_0 {
             continue;
         }
-        let padding = unsafe { client.GetCurrentPadding() }.map_err(|error| error.to_string())?;
+        let padding =
+            unsafe { stream.client.GetCurrentPadding() }.map_err(|error| error.to_string())?;
         let frames = buffer_size.saturating_sub(padding);
         if frames == 0 {
             continue;
         }
+        // Momentaufnahme der Mischseiten: kurze Sperre zum Klonen, danach
+        // nur noch referenzgezählte Ringe anfassen.
+        let snapshot: Vec<(Uuid, Arc<LiveSource>)> = live
+            .lock()
+            .iter()
+            .map(|(source_id, source)| (*source_id, Arc::clone(source)))
+            .collect();
         let data = unsafe { render.GetBuffer(frames) }.map_err(|error| error.to_string())?;
         let output = unsafe { slice::from_raw_parts_mut(data.cast::<f32>(), frames as usize * 2) };
-        let mut peaks: HashMap<Uuid, (f32, f64, usize)> = HashMap::new();
+        // Wie der Linux-Callback: Ring- und Rampen-Sperren einmal je Puffer
+        // und Quelle nehmen, nie pro Frame. Pegel sammeln sich in
+        // slot-indizierten Arrays statt einer je Frame gehashten Map.
+        let mut rings: Vec<Option<parking_lot::MutexGuard<'_, PcmRing>>> =
+            Vec::with_capacity(snapshot.len());
+        let mut ramps: Vec<Option<parking_lot::MutexGuard<'_, GainRamp>>> =
+            Vec::with_capacity(snapshot.len());
+        for (_, shared) in &snapshot {
+            rings.push(Some(shared.ring.lock()));
+            ramps.push(Some(shared.gain.lock()));
+        }
+        let mut levels: Vec<(f32, f64, usize)> = vec![(0.0, 0.0, 0); snapshot.len()];
         for frame in output.chunks_exact_mut(2) {
             let mut mixed = [0.0f32; 2];
-            for (source_id, source) in &mut sources {
-                let input = source.input.pop();
-                let gain = if source.muted {
+            for (slot, (_, shared)) in snapshot.iter().enumerate() {
+                let input = rings[slot].as_mut().map_or([0.0, 0.0], |ring| ring.pop());
+                let gain = if shared.muted.load(Ordering::Relaxed) {
                     0.0
                 } else {
-                    source.gain.next_gain()
+                    ramps[slot].as_mut().map_or(0.0, |ramp| ramp.next_gain())
                 };
                 let left = input[0] * gain;
                 let right = input[1] * gain;
                 mixed[0] += left;
                 mixed[1] += right;
-                let level = peaks.entry(*source_id).or_default();
+                let level = &mut levels[slot];
                 level.0 = level.0.max(left.abs().max(right.abs()));
                 level.1 += f64::from(left * left + right * right) * 0.5;
                 level.2 += 1;
@@ -377,17 +497,21 @@ fn mixer_thread_initialized(
             frame[0] = mixed[0] * limiter;
             frame[1] = mixed[1] * limiter;
         }
+        // Guards vor jeglichem blockierenden Aufruf ablegen.
+        drop(rings);
+        drop(ramps);
         unsafe { render.ReleaseBuffer(frames, 0) }.map_err(|error| error.to_string())?;
         if last_levels.elapsed() >= Duration::from_millis(100) {
-            let entries = peaks
-                .into_iter()
-                .map(|(source_id, (peak, squares, count))| LevelEntry {
-                    source_id,
-                    peak,
-                    rms: if count == 0 {
+            let entries = snapshot
+                .iter()
+                .zip(levels.iter())
+                .map(|((source_id, _), (peak, squares, count))| LevelEntry {
+                    source_id: *source_id,
+                    peak: *peak,
+                    rms: if *count == 0 {
                         0.0
                     } else {
-                        (squares / count as f64).sqrt() as f32
+                        (*squares / *count as f64).sqrt() as f32
                     },
                 })
                 .collect();
@@ -395,86 +519,413 @@ fn mixer_thread_initialized(
             last_levels = Instant::now();
         }
     }
-    for source in sources.values() {
-        source.input.shutdown();
-    }
-    let _ = unsafe { client.Stop() };
-    let _ = unsafe { CloseHandle(event) };
+    drop(management); // Verwaltungs-Thread stoppen und joinen, bevor COM endet.
     Ok(())
 }
 
-enum DesiredInput<'a> {
-    Application(&'a crate::project::AudioSessionBinding),
+enum DesiredInput {
+    Application(AudioSessionBinding),
     Media,
 }
 
+/// Verwaltungsseitiger Zustand einer Quelle: Besitzer des Capture-Threads
+/// und der Wiederherstellungsdaten. Das Drop stoppt den Thread und hebt
+/// die Stummschaltung der gebundenen Sitzung wieder auf.
+struct SourceHandle {
+    capture: Option<ProcessAudioCapture>,
+    binding: Option<AudioSessionBinding>,
+    /// Aufgelöste PID der Anwendungssitzung — Dedup-Schlüssel gegen doppelte Erfassung.
+    pid: Option<u32>,
+    target_volume: f32,
+    restore: Option<SessionRestoreEntry>,
+    journal_path: PathBuf,
+}
+
+impl SourceHandle {
+    fn restore(&mut self) {
+        let Some(entry) = self.restore.take() else {
+            return;
+        };
+        if let Err(error) = restore_audio_session(&entry) {
+            eprintln!(
+                "Audio-Sitzung {} konnte nicht wiederhergestellt werden: {error}",
+                entry.session_instance_id
+            );
+        } else if let Ok(mut journal) = RestoreJournal::load(&self.journal_path) {
+            journal.remove(&entry.session_instance_id);
+            let _ = journal.save_atomic(&self.journal_path);
+        }
+    }
+}
+
+impl Drop for SourceHandle {
+    fn drop(&mut self) {
+        // Feld leeren: Der Drop des Captures stoppt und joint den Thread.
+        self.capture = None;
+        self.restore();
+    }
+}
+
+/// Mischseitige Sicht einer Quelle ohne blockierende Besitztümer.
+struct LiveSource {
+    ring: Arc<Mutex<PcmRing>>,
+    gain: Mutex<GainRamp>,
+    muted: AtomicBool,
+}
+
+/// Stoppt und joint den Verwaltungs-Thread auf jedem Exit-Pfad des
+/// Render-Threads — auch bei Fehlerausgängen über `?`. Das Flag gehört
+/// ausschließlich dem Verwaltungs-Thread (`mgmt_stop`): Würde der Drop den
+/// Supervisor-Stop anfassen, beendete jeder Render-Fehler die Neustart-
+/// Schleife des Supervisors dauerhaft.
+struct ManagementGuard {
+    mgmt_stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Drop for ManagementGuard {
+    fn drop(&mut self) {
+        self.mgmt_stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Retry-Sperre gilt nur für die Bindung, deren Aktivierung scheiterte;
+/// nach einem Retarget auf eine andere Bindung verliert sie ihre Wirkung.
+struct CooldownEntry {
+    remaining: u32,
+    binding: Option<AudioSessionBinding>,
+}
+
 fn synchronize_sources(
-    project: &ProjectV1,
+    desired: &HashMap<Uuid, (DesiredInput, f32, bool)>,
     events: &mpsc::Sender<EngineEvent>,
     media_audio: &MediaAudioBus,
     journal_path: &PathBuf,
-    sources: &mut HashMap<Uuid, SourceCapture>,
+    handles: &mut HashMap<Uuid, SourceHandle>,
+    live: &Mutex<HashMap<Uuid, Arc<LiveSource>>>,
+    availability: &mut HashMap<Uuid, bool>,
+    retry_cooldown: &mut HashMap<Uuid, CooldownEntry>,
+    last_overruns: &mut HashMap<Uuid, u64>,
+    stale_rings: &mut HashMap<Uuid, (u32, bool)>,
 ) {
-    let desired: HashMap<Uuid, (DesiredInput<'_>, f32, bool)> = project
-        .sources
-        .iter()
-        .filter_map(|source| match source {
-            Source::ApplicationAudio {
-                id,
-                binding,
-                volume,
-                muted,
-                ..
-            } => Some((*id, (DesiredInput::Application(binding), *volume, *muted))),
-            Source::Media {
-                id, volume, muted, ..
-            } => Some((*id, (DesiredInput::Media, *volume, *muted))),
-            _ => None,
-        })
-        .collect();
-    sources.retain(|source_id, _| desired.contains_key(source_id));
+    handles.retain(|source_id, _| desired.contains_key(source_id));
+    availability.retain(|source_id, _| desired.contains_key(source_id));
+    retry_cooldown.retain(|source_id, _| desired.contains_key(source_id));
+    live.lock()
+        .retain(|source_id, _| desired.contains_key(source_id));
+    // Gestorbene Capture-Threads räumen Verwaltungs- UND Mischseite auf.
+    handles.retain(|source_id, handle| {
+        let Some(capture) = &handle.capture else {
+            return true;
+        };
+        let Some(reason) = capture.failure_reason() else {
+            return true;
+        };
+        emit_availability(
+            events,
+            availability,
+            *source_id,
+            false,
+            &format!("Prozess-Loopback wurde beendet: {reason}"),
+        );
+        retry_cooldown.insert(
+            *source_id,
+            CooldownEntry {
+                remaining: RETRY_TICKS_AFTER_FAILURES,
+                binding: handle.binding.clone(),
+            },
+        );
+        live.lock().remove(source_id);
+        false
+    });
     for (source_id, (desired_input, volume, muted)) in desired {
-        if let Some(source) = sources.get_mut(&source_id) {
-            if (source.target_volume - volume).abs() > f32::EPSILON {
-                source.gain.set(volume, 480);
-                source.target_volume = volume;
+        let desired_binding = match desired_input {
+            DesiredInput::Application(binding) => Some(binding),
+            DesiredInput::Media => None,
+        };
+        if let Some(handle) = handles.get_mut(source_id)
+            && handle.binding.as_ref() == desired_binding
+        {
+            if let Some(shared) = live.lock().get(source_id) {
+                if (handle.target_volume - *volume).abs() > f32::EPSILON {
+                    shared.gain.lock().set(*volume, 480);
+                    handle.target_volume = *volume;
+                }
+                shared.muted.store(*muted, Ordering::Relaxed);
             }
-            source.muted = muted;
             continue;
+        }
+        // Neue Quelle oder geänderte Bindung: Der alte Capture bleibt bis
+        // zur Fertigstellung des neuen bestehen — kein selbst verursachter
+        // Ausfall, wenn die Aktivierung scheitert oder eine Sperre läuft.
+        if matches!(desired_input, DesiredInput::Application(_)) {
+            let blocking = match retry_cooldown.get(source_id) {
+                None => false,
+                Some(entry) => entry.binding.as_ref() == desired_binding && entry.remaining > 0,
+            };
+            if blocking {
+                if let Some(entry) = retry_cooldown.get_mut(source_id) {
+                    entry.remaining -= 1;
+                }
+                // Auch während der Sperre folgt der weitermischende
+                // Fallback Lautstärke und Stummschaltung (Parität
+                // zum Bindungstreffer oben).
+                if let Some(handle) = handles.get_mut(source_id) {
+                    if let Some(shared) = live.lock().get(source_id) {
+                        if (handle.target_volume - *volume).abs() > f32::EPSILON {
+                            shared.gain.lock().set(*volume, 480);
+                            handle.target_volume = *volume;
+                        }
+                        shared.muted.store(*muted, Ordering::Relaxed);
+                    }
+                }
+                continue;
+            }
+            // Abgelaufene oder nicht mehr zutreffende Sperre entfernen.
+            retry_cooldown.remove(source_id);
         }
         let prepared = match desired_input {
             DesiredInput::Application(binding) => (|| {
-                let capture = ProcessAudioCapture::start(resolve_audio_process(binding)?)?;
+                let pid = resolve_audio_process(binding)?;
+                // Dedup: Dieselbe Sitzung nicht doppelt erfassen — der
+                // Mischer würde beide Ringe summieren (+6 dB Echo).
+                if handles
+                    .iter()
+                    .any(|(other_id, handle)| *other_id != *source_id && handle.pid == Some(pid))
+                {
+                    return Err(format!(
+                        "Audio-Sitzung (PID {pid}) wird bereits von einer anderen Quelle erfasst"
+                    ));
+                }
+                let capture = ProcessAudioCapture::start(pid)?;
+                let ring = capture.ring.clone();
                 let restore = mute_audio_session(binding, journal_path)?;
-                Ok((AudioInput::Process(capture), Some(restore)))
+                Ok((Some(capture), ring, Some(restore), Some(pid)))
             })(),
             DesiredInput::Media => media_audio
                 .lock()
-                .get(&source_id)
+                .get(source_id)
                 .cloned()
-                .map(|ring| (AudioInput::Media(ring), None))
+                .map(|ring| (None, ring, None, None))
                 .ok_or_else(|| "media audio stream is not ready".to_string()),
         };
         match prepared {
-            Ok((input, restore)) => {
-                sources.insert(
-                    source_id,
-                    SourceCapture {
-                        input,
-                        gain: GainRamp::new(volume),
-                        target_volume: volume,
-                        muted,
+            Ok((capture, ring, restore, pid)) => {
+                retry_cooldown.remove(source_id);
+                let shared = Arc::new(LiveSource {
+                    ring,
+                    gain: Mutex::new(GainRamp::new(*volume)),
+                    muted: AtomicBool::new(*muted),
+                });
+                let replaced = handles.insert(
+                    *source_id,
+                    SourceHandle {
+                        capture,
+                        binding: desired_binding.cloned(),
+                        pid,
+                        target_volume: *volume,
                         restore,
                         journal_path: journal_path.clone(),
                     },
                 );
-                let _ = events.send(EngineEvent::SourceAvailable { source_id });
+                // Bind-Rückstand verwerfen, bevor die Quelle gemischt wird:
+                // Alter Backlog würde sonst als A-V-Versatz abgespielt.
+                shared.ring.lock().clear();
+                live.lock().insert(*source_id, shared);
+                // Alter Capture erst jetzt verwerfen: Sein Drop stoppt
+                // seinen Thread und stellt die alte Sitzung wieder her.
+                drop(replaced);
+                // Frische Bindung: Telemetrie-Baselines zurücksetzen,
+                // damit Stagnation nicht vom Vorgänger-Capture geerbt wird.
+                last_overruns.remove(source_id);
+                stale_rings.remove(source_id);
+                emit_availability(events, availability, *source_id, true, "");
             }
             Err(reason) => {
-                let _ = events.send(EngineEvent::SourceUnavailable { source_id, reason });
+                if matches!(desired_input, DesiredInput::Application(_)) {
+                    retry_cooldown.insert(
+                        *source_id,
+                        CooldownEntry {
+                            remaining: RETRY_TICKS_AFTER_FAILURES,
+                            binding: desired_binding.cloned(),
+                        },
+                    );
+                }
+                // Fehlgeschlagene Bindungsänderung: Der vorherige Capture
+                // bleibt in handles/live bestehen und mischt unverändert
+                // weiter — gestorbene Captures wurden oben bereits
+                // ausgetragen, ein verbleibender Eintrag ist also live.
+                // Die Quelle bleibt hörbar und wird zu Recht als
+                // verfügbar geführt; nur ohne jeden Ersatz-Capture gilt
+                // sie tatsächlich als ausgefallen.
+                if handles.contains_key(source_id) {
+                    eprintln!(
+                        "Audio-Bindung konnte nicht gewechselt werden ({reason}); \
+                         vorherige Quelle läuft weiter"
+                    );
+                } else {
+                    emit_availability(events, availability, *source_id, false, &reason);
+                }
             }
         }
     }
+}
+
+/// Telemetrie-Parität zu Linux: Überläufe werden sofort gemeldet — auch für
+/// Medienquellen ohne eigenen Capture, deren Bus-Ring unabhängig vom Mix
+/// weiterdekodiert; beim ersten Sichtbarwerden zählt nur der Zuwachs ab dem
+/// aktuellen Ringstand, nicht die Vorgeschichte. Leere Ringe gelten bei
+/// Prozess-Loopback als normal (jede Periode wird gepoppt) und erzeugen
+/// keine Unterlauf-Warnung; ein gebundener, lebender Capture mit dauerhaft
+/// leerem Ring meldet dagegen einmalig Stagnation, bis er wieder Frames
+/// liefert. Für Medienquellen existiert kein Producer-Liveness-Signal,
+/// daher entfallen Stagnation und Unterlauf dort bewusst.
+fn report_ring_health(
+    events: &mpsc::Sender<EngineEvent>,
+    handles: &HashMap<Uuid, SourceHandle>,
+    live: &Mutex<HashMap<Uuid, Arc<LiveSource>>>,
+    last_overruns: &mut HashMap<Uuid, u64>,
+    stale: &mut HashMap<Uuid, (u32, bool)>,
+) {
+    for (source_id, handle) in handles {
+        // Medienquellen ohne eigenen Capture besitzen keinen Producer-
+        // Liveness-Indikator; für sie wird ausschließlich der Überlauf-
+        // Delta aus dem Bus-Ring gemeldet.
+        let (overruns, filled_frames) = match &handle.capture {
+            Some(capture) => {
+                let ring = capture.ring.lock();
+                (ring.overruns(), ring.filled_frames())
+            }
+            None => {
+                let Some(source) = live.lock().get(source_id).cloned() else {
+                    continue;
+                };
+                let ring = source.ring.lock();
+                (ring.overruns(), 0)
+            }
+        };
+        // Baseline auf den Ist-Stand setzen: Frische Captures starten bei
+        // null; Medienringe dekodieren dagegen auch unvermischt weiter,
+        // ihr Vorschub vor der Mischung ist keine neue Warnung.
+        let last = last_overruns.entry(*source_id).or_insert(overruns);
+        let new_overruns = overruns.saturating_sub(*last);
+        *last = overruns;
+        if new_overruns > 0 {
+            let quelle = match &handle.capture {
+                Some(_) => match &handle.binding {
+                    Some(binding) => {
+                        format!("Prozess-Loopback-Quelle „{}“", binding.process_path)
+                    }
+                    None => "Prozess-Loopback-Quelle".to_string(),
+                },
+                None => "Medienquelle".to_string(),
+            };
+            let _ = events.send(EngineEvent::AudioWarning {
+                kind: AudioWarningKind::Overrun,
+                message: format!(
+                    "Tonpuffer-Überlauf für {quelle} ({new_overruns} Frames verworfen)"
+                ),
+            });
+        }
+        let Some(capture) = &handle.capture else {
+            continue;
+        };
+        if capture.failure_reason().is_some() || filled_frames > 0 {
+            stale.remove(source_id);
+            continue;
+        }
+        let state = stale.entry(*source_id).or_insert((0, false));
+        state.0 = state.0.saturating_add(1);
+        if state.0 > STALE_RING_TICKS && !state.1 {
+            state.1 = true;
+            let _ = events.send(EngineEvent::AudioWarning {
+                kind: AudioWarningKind::Underrun,
+                message: match &handle.binding {
+                    Some(binding) => format!(
+                        "Quelle „{}“ liefert seit längerer Zeit keine Frames; Capture läuft weiter",
+                        binding.process_path
+                    ),
+                    None => "Quelle liefert seit längerer Zeit keine Frames; Capture läuft weiter"
+                        .into(),
+                },
+            });
+        }
+    }
+    last_overruns.retain(|source_id, _| handles.contains_key(source_id));
+    stale.retain(|source_id, _| handles.contains_key(source_id));
+}
+
+/// Eigenständiger Verwaltungs-Thread: spiegelt den Projekt-Wunschzustand in
+/// fertige Mischringe, ohne den Render-Thread zu blockieren.
+fn management_loop(
+    project: Arc<parking_lot::RwLock<ProjectV1>>,
+    events: mpsc::Sender<EngineEvent>,
+    media_audio: MediaAudioBus,
+    journal_path: PathBuf,
+    live: Arc<Mutex<HashMap<Uuid, Arc<LiveSource>>>>,
+    stop: Arc<AtomicBool>,
+    mgmt_stop: Arc<AtomicBool>,
+) {
+    let mut handles: HashMap<Uuid, SourceHandle> = HashMap::new();
+    let mut availability: HashMap<Uuid, bool> = HashMap::new();
+    let mut retry_cooldown: HashMap<Uuid, CooldownEntry> = HashMap::new();
+    let mut last_overruns: HashMap<Uuid, u64> = HashMap::new();
+    let mut stale_rings: HashMap<Uuid, (u32, bool)> = HashMap::new();
+    // Endet beim Supervisor-Stopp ODER beim eigenen Notstopp des Guards
+    // (nach Render-Fehler); nur ersterer bedeutet echtes Herunterfahren.
+    while !stop.load(Ordering::Acquire) && !mgmt_stop.load(Ordering::Acquire) {
+        // Wunschzustand kurz unter dem Read-Lock kopieren; das eigentliche
+        // Synchronisieren blockiert und darf den Lock nicht halten.
+        let desired: HashMap<Uuid, (DesiredInput, f32, bool)> = {
+            let project = project.read();
+            project
+                .sources
+                .iter()
+                .filter_map(|source| match source {
+                    Source::ApplicationAudio {
+                        id,
+                        binding,
+                        volume,
+                        muted,
+                        ..
+                    } => Some((
+                        *id,
+                        (DesiredInput::Application(binding.clone()), *volume, *muted),
+                    )),
+                    Source::Media {
+                        id, volume, muted, ..
+                    } => Some((*id, (DesiredInput::Media, *volume, *muted))),
+                    _ => None,
+                })
+                .collect()
+        };
+        synchronize_sources(
+            &desired,
+            &events,
+            &media_audio,
+            &journal_path,
+            &mut handles,
+            &live,
+            &mut availability,
+            &mut retry_cooldown,
+            &mut last_overruns,
+            &mut stale_rings,
+        );
+        report_ring_health(
+            &events,
+            &handles,
+            &live,
+            &mut last_overruns,
+            &mut stale_rings,
+        );
+        sleep_stoppable_either(&stop, &mgmt_stop, MANAGEMENT_SYNC_INTERVAL);
+    }
+    // Herunterfahren: Drops stoppen die Capture-Threads und stellen die
+    // Sitzungen wieder her.
+    handles.clear();
 }
 
 fn capture_thread(
@@ -483,9 +934,16 @@ fn capture_thread(
     stop: Arc<AtomicBool>,
     ready: mpsc::SyncSender<Result<(), String>>,
 ) -> Result<(), String> {
-    unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
+    let co_init = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
         .ok()
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string());
+    // Auch das Scheitern von CoInitializeEx muss den wartenden Aufrufer
+    // erreichen, sonst blockt ProcessAudioCapture::start bis zum vollen
+    // Ready-Timeout.
+    if let Err(error) = co_init {
+        let _ = ready.send(Err(error.clone()));
+        return Err(error);
+    }
     let result = capture_thread_initialized(process_id, ring, stop, ready);
     unsafe { CoUninitialize() };
     result
@@ -504,30 +962,46 @@ fn capture_thread_initialized(
             return Err(error);
         }
     };
-    let format = WAVEFORMATEX {
-        wFormatTag: 1,
-        nChannels: 2,
-        nSamplesPerSec: SAMPLE_RATE,
-        nAvgBytesPerSec: SAMPLE_RATE * 2 * 2,
-        nBlockAlign: 4,
-        wBitsPerSample: 16,
-        cbSize: 0,
+    // Der gesamte Setup nach der Aktivierung meldet Bereitschaft: Fehler
+    // hier erreichten den Aufrufer zuvor nie und ließen
+    // ProcessAudioCapture::start bis zum vollen Ready-Timeout (15 s) warten.
+    let setup = (|| -> Result<(StreamGuard, IAudioCaptureClient), String> {
+        let format = WAVEFORMATEX {
+            wFormatTag: 1,
+            nChannels: 2,
+            nSamplesPerSec: SAMPLE_RATE,
+            nAvgBytesPerSec: SAMPLE_RATE * 2 * 2,
+            nBlockAlign: 4,
+            wBitsPerSample: 16,
+            cbSize: 0,
+        };
+        let flags = AUDCLNT_STREAMFLAGS_LOOPBACK
+            | AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+            | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+            | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+        unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 1_000_000, 0, &format, None) }
+            .map_err(|error| error.to_string())?;
+        let event =
+            unsafe { CreateEventW(None, false, false, None) }.map_err(|error| error.to_string())?;
+        // Guard sofort nach CreateEventW: Auch ein fehlgeschlagenes
+        // SetEventHandle darf das Handle nicht für die Prozesslaufzeit leaken.
+        let stream = StreamGuard { client, event };
+        unsafe { stream.client.SetEventHandle(stream.event) }.map_err(|error| error.to_string())?;
+        let capture: IAudioCaptureClient =
+            unsafe { stream.client.GetService() }.map_err(|error| error.to_string())?;
+        unsafe { stream.client.Start() }.map_err(|error| error.to_string())?;
+        Ok((stream, capture))
+    })();
+    let (stream, capture) = match setup {
+        Ok(parts) => parts,
+        Err(error) => {
+            let _ = ready.send(Err(error.clone()));
+            return Err(error);
+        }
     };
-    let flags = AUDCLNT_STREAMFLAGS_LOOPBACK
-        | AUDCLNT_STREAMFLAGS_EVENTCALLBACK
-        | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
-        | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
-    unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 1_000_000, 0, &format, None) }
-        .map_err(|error| error.to_string())?;
-    let event =
-        unsafe { CreateEventW(None, false, false, None) }.map_err(|error| error.to_string())?;
-    unsafe { client.SetEventHandle(event) }.map_err(|error| error.to_string())?;
-    let capture: IAudioCaptureClient =
-        unsafe { client.GetService() }.map_err(|error| error.to_string())?;
-    unsafe { client.Start() }.map_err(|error| error.to_string())?;
     let _ = ready.send(Ok(()));
     while !stop.load(Ordering::Acquire) {
-        if unsafe { WaitForSingleObject(event, 100) } != WAIT_OBJECT_0 {
+        if unsafe { WaitForSingleObject(stream.event, 100) } != WAIT_OBJECT_0 {
             continue;
         }
         loop {
@@ -562,8 +1036,6 @@ fn capture_thread_initialized(
             unsafe { capture.ReleaseBuffer(frame_count) }.map_err(|error| error.to_string())?;
         }
     }
-    let _ = unsafe { client.Stop() };
-    let _ = unsafe { CloseHandle(event) };
     Ok(())
 }
 

@@ -8,7 +8,9 @@
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
-    os::fd::{BorrowedFd, OwnedFd},
+    io::{Read as _, Write as _},
+    os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd},
+    os::unix::net::UnixStream,
     rc::Rc,
     sync::{Arc, Mutex, mpsc},
     thread,
@@ -27,6 +29,7 @@ use ashpd::{
 };
 use pipewire as pw;
 use pw::properties::properties;
+use pw::spa::support::system::IoFlags;
 use uuid::Uuid;
 
 /// DRM_FORMAT_MOD_INVALID as defined by drm_fourcc.h.  A range containing this
@@ -251,6 +254,9 @@ enum CaptureCommand {
 
 pub struct CaptureHandle {
     commands: mpsc::Sender<CaptureCommand>,
+    /// Schreibende der Selbst-Pipe; je Befehl ein Byte weckt die
+    /// Mainloop-Quelle des Capture-Threads.
+    wake: UnixStream,
     frames: mpsc::Receiver<FrameMessage>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -259,12 +265,18 @@ impl CaptureHandle {
     pub fn spawn() -> Result<Self, LinuxVideoError> {
         let (command_tx, command_rx) = mpsc::channel();
         let (frame_tx, frame_rx) = mpsc::channel();
+        let (wake_read, wake_write) =
+            UnixStream::pair().map_err(|error| LinuxVideoError::PipeWire(error.to_string()))?;
+        // Volle Pipe darf den Sender nicht blockieren; ein verlorener
+        // Weck-Schreibversuch ist harmlos, es liegen dann bereits Bytes an.
+        let _ = wake_write.set_nonblocking(true);
         let thread = thread::Builder::new()
             .name("pipewire-video".into())
-            .spawn(move || capture_thread(command_rx, frame_tx))
+            .spawn(move || capture_thread(command_rx, frame_tx, wake_read))
             .map_err(|error| LinuxVideoError::PipeWire(error.to_string()))?;
         Ok(Self {
             commands: command_tx,
+            wake: wake_write,
             frames: frame_rx,
             thread: Some(thread),
         })
@@ -276,16 +288,22 @@ impl CaptureHandle {
             node_id,
             remote,
         });
+        // Je Befehl ein Weck-Byte; die Mainloop erwacht nur bei Bedarf.
+        let _ = (&self.wake).write(&[1]);
     }
 
     pub fn stop(&self, source_id: Uuid) {
         let _ = self.commands.send(CaptureCommand::Stop { source_id });
+        // Je Befehl ein Weck-Byte; die Mainloop erwacht nur bei Bedarf.
+        let _ = (&self.wake).write(&[1]);
     }
 
     pub fn return_buffer(&self, source_id: Uuid, token: SendBufferToken) {
         let _ = self
             .commands
             .send(CaptureCommand::Return { source_id, token });
+        // Je Befehl ein Weck-Byte; die Mainloop erwacht nur bei Bedarf.
+        let _ = (&self.wake).write(&[1]);
     }
 
     pub fn try_recv(&self) -> Result<FrameMessage, mpsc::TryRecvError> {
@@ -294,6 +312,9 @@ impl CaptureHandle {
 
     pub fn shutdown(&mut self) {
         let _ = self.commands.send(CaptureCommand::Shutdown);
+        // Vor dem Join wecken: ohne Byte würde die idle Mainloop den
+        // Shutdown nie sehen und thread::join blockiert für immer.
+        let _ = (&self.wake).write(&[1]);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -329,7 +350,11 @@ struct PipeWireState {
     frames: mpsc::Sender<FrameMessage>,
 }
 
-fn capture_thread(commands: mpsc::Receiver<CaptureCommand>, frames: mpsc::Sender<FrameMessage>) {
+fn capture_thread(
+    commands: mpsc::Receiver<CaptureCommand>,
+    frames: mpsc::Sender<FrameMessage>,
+    wake: UnixStream,
+) {
     pw::init();
     let mainloop = match pw::main_loop::MainLoopRc::new(None) {
         Ok(value) => value,
@@ -344,10 +369,24 @@ fn capture_thread(commands: mpsc::Receiver<CaptureCommand>, frames: mpsc::Sender
         streams: HashMap::new(),
         frames: frames.clone(),
     }));
-    let timer_state = state.clone();
-    let timer_loop = mainloop.downgrade();
-    let timer = mainloop.loop_().add_timer(move |_| {
-        let mut state = timer_state.borrow_mut();
+    // Selbst-Pipe als Mainloop-Quelle statt eines 5-ms-Timers: die Loop
+    // erwacht nur, wenn CaptureHandle je gesendetem Befehl ein Byte schreibt
+    // — kein Leerlauf-Polling mehr, Befehle bleiben sofort bedienbar.
+    let _ = wake.set_nonblocking(true);
+    let loop_weak = mainloop.downgrade();
+    // Bindung hält die IO-Quelle am Leben; Drop entfernt sie aus der Loop.
+    let _command_pump = mainloop.loop_().add_io(wake, IoFlags::IN, move |pipe| {
+        // Verwerfbare Bytes lesen, sonst bleibt die Quelle lesbar und die
+        // Loop dreht im Dauerkreis.
+        let mut discard = [0u8; 256];
+        loop {
+            match pipe.read(&mut discard) {
+                Ok(n) if n == discard.len() => continue,
+                Ok(_) => break,
+                Err(_) => break,
+            }
+        }
+        let mut state = state.borrow_mut();
         while let Ok(command) = commands.try_recv() {
             match command {
                 CaptureCommand::Start {
@@ -358,10 +397,29 @@ fn capture_thread(commands: mpsc::Receiver<CaptureCommand>, frames: mpsc::Sender
                     if let Some(remote) = remote
                         && state.core.is_none()
                     {
-                        state.core =
-                            pw::context::ContextRc::connect_fd_rc(&context, remote, None).ok();
+                        // connect_fd_rc consumes the fd but does not close it
+                        // when pw_context_connect_fd fails; reclaim and drop
+                        // the OwnedFd on the error path.
+                        let fd = remote.into_raw_fd();
+                        match pw::context::ContextRc::connect_fd_rc(
+                            &context,
+                            unsafe { OwnedFd::from_raw_fd(fd) },
+                            None,
+                        ) {
+                            Ok(core) => state.core = Some(core),
+                            Err(error) => {
+                                drop(unsafe { OwnedFd::from_raw_fd(fd) });
+                                let _ = state.frames.send(FrameMessage::SourceError {
+                                    source_id,
+                                    reason: format!(
+                                        "PipeWire-Portalverbindung fehlgeschlagen: {error}"
+                                    ),
+                                });
+                                continue;
+                            }
+                        }
                     }
-                    if state.core.is_none() || state.streams.contains_key(&source_id) {
+                    if state.streams.contains_key(&source_id) {
                         continue;
                     }
                     let Some(core) = state.core.clone() else {
@@ -405,7 +463,7 @@ fn capture_thread(commands: mpsc::Receiver<CaptureCommand>, frames: mpsc::Sender
                 CaptureCommand::Shutdown => {
                     state.streams.clear();
                     state.core.take();
-                    if let Some(mainloop) = timer_loop.upgrade() {
+                    if let Some(mainloop) = loop_weak.upgrade() {
                         mainloop.quit();
                     }
                     return;
@@ -413,12 +471,6 @@ fn capture_thread(commands: mpsc::Receiver<CaptureCommand>, frames: mpsc::Sender
             }
         }
     });
-    let _ = timer
-        .update_timer(
-            Some(std::time::Duration::from_millis(5)),
-            Some(std::time::Duration::from_millis(5)),
-        )
-        .into_result();
     mainloop.run();
 }
 

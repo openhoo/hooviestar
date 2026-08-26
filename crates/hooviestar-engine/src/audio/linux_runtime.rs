@@ -47,12 +47,13 @@ use pipewire::{
 use uuid::Uuid;
 
 use crate::{
-    audio::{GainRamp, LIMITER_CEILING, MediaAudioBus, PcmRing, SAMPLE_RATE},
+    audio::{GainRamp, LIMITER_CEILING, MediaAudioBus, PcmRing, SAMPLE_RATE, emit_availability},
     engine::{AudioWarningKind, EngineEvent, LevelEntry},
     project::{AudioSessionBinding, ProjectV1, Source},
 };
 
-/// Maximale Anzahl gemischter Quellen im Echtzeit-Mix; weitere bleiben ungemischt.
+/// Maximale Anzahl gemischter Quellen im Echtzeit-Mix; weitere Bindungen
+/// werden abgelehnt und melden „Mixer-Kapazität erreicht“.
 const MAX_MIX_INPUTS: usize = 16;
 /// Kapazität je Quellring in Frames (100 ms bei 48 kHz).
 const RING_CAPACITY_FRAMES: usize = 4_800;
@@ -62,6 +63,12 @@ const CONTROL_TICK: Duration = Duration::from_millis(100);
 const MAX_RAMP_FRAMES: u32 = 480;
 /// Nach drei fehlgeschlagenen Bindungsversuchen wird erst nach dieser Tick-Anzahl erneut versucht.
 const RETRY_TICKS_AFTER_FAILURES: u32 = 10;
+/// Neustartversuche der PipeWire-Ausgabe bei unmittelbar wiederholten Fehlern.
+const PIPEWIRE_MAX_CONSECUTIVE_RESTARTS: u32 = 5;
+const PIPEWIRE_RESTART_BACKOFF_INITIAL: Duration = Duration::from_millis(500);
+const PIPEWIRE_RESTART_BACKOFF_MAX: Duration = Duration::from_secs(8);
+/// Läuft ein Versuch länger als gesund, gilt die Fehlerkette als unterbrochen.
+const PIPEWIRE_HEALTHY_RUNTIME: Duration = Duration::from_secs(60);
 
 pub struct AudioRuntime {
     stop: Arc<AtomicBool>,
@@ -77,19 +84,59 @@ impl AudioRuntime {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let last_failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let thread_last_failure = last_failure.clone();
         let thread = thread::Builder::new()
             .name("pipewire-mixer".into())
             .spawn(move || {
-                if let Err(error) = run_pipewire(
-                    project,
-                    events.clone(),
-                    media_audio,
-                    thread_stop,
-                    ready_sender,
-                ) {
-                    let _ = events.send(EngineEvent::EngineError {
-                        message: format!("PipeWire-Ausgabe beendet: {error}"),
-                    });
+                let mut consecutive_failures: u32 = 0;
+                let mut backoff = PIPEWIRE_RESTART_BACKOFF_INITIAL;
+                // Meldung über ausgeschöpfte Neustarts nur einmal pro Fehlerkette.
+                let mut exhausted_reported = false;
+                while !thread_stop.load(Ordering::Acquire) {
+                    let started = Instant::now();
+                    let result = run_pipewire(
+                        project.clone(),
+                        events.clone(),
+                        media_audio.clone(),
+                        thread_stop.clone(),
+                        ready_sender.clone(),
+                    );
+                    match result {
+                        Ok(()) => return, // Sauberer Stopp über das Stop-Flag.
+                        Err(error) => {
+                            *thread_last_failure.lock() = Some(error.clone());
+                            eprintln!("PipeWire mixer stopped: {error}");
+                            let _ = events.send(EngineEvent::EngineError {
+                                message: format!(
+                                    "PipeWire-Ausgabe wurde unerwartet beendet: {error}"
+                                ),
+                            });
+                            if started.elapsed() >= PIPEWIRE_HEALTHY_RUNTIME {
+                                consecutive_failures = 0;
+                                backoff = PIPEWIRE_RESTART_BACKOFF_INITIAL;
+                                exhausted_reported = false;
+                            } else {
+                                consecutive_failures += 1;
+                            }
+                            if consecutive_failures >= PIPEWIRE_MAX_CONSECUTIVE_RESTARTS
+                                && !exhausted_reported
+                            {
+                                exhausted_reported = true;
+                                let _ = events.send(EngineEvent::EngineError {
+                                    message: "PipeWire-Ausgabe konnte nach wiederholten \
+                                        Fehlern vorübergehend nicht neu gestartet werden; \
+                                        weitere Versuche laufen im Hintergrund."
+                                        .into(),
+                                });
+                            }
+                            // Nie dauerhaft enden, solange nicht gestoppt
+                            // wurde: Ein späterer Neustart des PipeWire-
+                            // Daemons belebt die Ausgabe erneut.
+                            sleep_stoppable(&thread_stop, backoff);
+                            backoff = (backoff * 2).min(PIPEWIRE_RESTART_BACKOFF_MAX);
+                        }
+                    }
                 }
             })
             .map_err(|error| error.to_string())?;
@@ -99,13 +146,23 @@ impl AudioRuntime {
                 thread: Mutex::new(Some(thread)),
             }),
             Ok(Err(error)) => {
+                // Der Thread wiederholt Fehler intern mit Backoff; hier
+                // endgültig anhalten, sonst blockiert das Join Minuten.
+                stop.store(true, Ordering::Release);
                 let _ = thread.join();
                 Err(error)
             }
             Err(error) => {
                 stop.store(true, Ordering::Release);
                 let _ = thread.join();
-                Err(error.to_string())
+                // Echtgrund melden statt generischem Timeout, wenn die
+                // Ausgabe vorher wiederholt scheiterte (z. B. fehlender
+                // PipeWire-Daemon).
+                let detail = last_failure.lock().take();
+                Err(match detail {
+                    Some(failure) => format!("PipeWire-Ausgabe wurde nicht bereit: {failure}"),
+                    None => error.to_string(),
+                })
             }
         }
     }
@@ -124,6 +181,18 @@ impl Drop for AudioRuntime {
         if let Some(thread) = self.thread.get_mut().take() {
             let _ = thread.join();
         }
+    }
+}
+
+/// Schläft die Dauer ab, bricht aber früh bei gesetztem Stopp-Flag aus.
+fn sleep_stoppable(stop: &AtomicBool, duration: Duration) {
+    let deadline = Instant::now() + duration;
+    while !stop.load(Ordering::Acquire) {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100).min(deadline - now));
     }
 }
 
@@ -199,10 +268,10 @@ fn tracked_from_props(id: u32, get: &dyn Fn(&str) -> Option<String>) -> Option<T
 }
 
 /// Bindet nur bei genau einem Treffer; niemals still an den ersten Treffer.
-fn resolve_binding(binding: &AudioSessionBinding, nodes: &[TrackedNode]) -> BindResult {
+fn resolve_binding(binding: &AudioSessionBinding, nodes: &HashMap<u32, TrackedNode>) -> BindResult {
     let wanted_path = canonical_process_path(&binding.process_path);
     let matches: Vec<&TrackedNode> = nodes
-        .iter()
+        .values()
         .filter(|node| {
             node.process_path == wanted_path && node.grouping_id == binding.session_grouping_id
         })
@@ -284,9 +353,14 @@ struct CounterWarning {
 }
 
 /// Vergleicht Ringzähler gegen die zuletzt gemeldeten Stände und liefert
-/// Warnungen nur für tatsächliche Differenzen.
+/// Warnungen nur für tatsächliche Differenzen. Parität zu Windows: Medien-
+/// quellen besitzen kein Producer-Liveness-Signal und melden bewusst keinen
+/// Unterlauf (auch nicht nach Seek/Ring-Reset während der Wiedergabe); bei
+/// Anwendungs-Captures wird der Unterlauf einmal je Stillstandsphase
+/// gemeldet und erst wieder freigegeben, wenn erneut Frames fließen.
+/// Überläufe bleiben ungefilterte Deltameldungen.
 fn counter_warnings(
-    last: &mut HashMap<Uuid, (u64, u64)>,
+    last: &mut HashMap<Uuid, (u64, u64, bool)>,
     inputs: &[Arc<MixInput>],
 ) -> Vec<CounterWarning> {
     let mut warnings = Vec::new();
@@ -295,10 +369,10 @@ fn counter_warnings(
             let ring = input.ring.lock();
             (ring.overruns(), ring.underruns())
         };
-        let entry = last.entry(input.source_id).or_insert((0, 0));
+        let entry = last.entry(input.source_id).or_insert((0, 0, false));
         let new_overruns = overruns.saturating_sub(entry.0);
         let new_underruns = underruns.saturating_sub(entry.1);
-        *entry = (overruns, underruns);
+        *entry = (overruns, underruns, entry.2);
         if new_overruns > 0 {
             warnings.push(CounterWarning {
                 kind: AudioWarningKind::Overrun,
@@ -308,14 +382,22 @@ fn counter_warnings(
                 ),
             });
         }
+        if input.media {
+            continue;
+        }
         if new_underruns > 0 {
-            warnings.push(CounterWarning {
-                kind: AudioWarningKind::Underrun,
-                message: format!(
-                    "Tonpuffer-Unterlauf für Quelle „{}“ ({new_underruns} Frames still)",
-                    input.name
-                ),
-            });
+            if !entry.2 {
+                entry.2 = true;
+                warnings.push(CounterWarning {
+                    kind: AudioWarningKind::Underrun,
+                    message: format!(
+                        "Tonpuffer-Unterlauf für Quelle „{}“ ({new_underruns} Frames still)",
+                        input.name
+                    ),
+                });
+            }
+        } else {
+            entry.2 = false;
         }
     }
     warnings
@@ -336,6 +418,9 @@ struct MixInput {
     peak_bits: AtomicU32,
     square_sum_bits: AtomicU64,
     frames: AtomicU64,
+    /// Medienquellen ohne Producer-Liveness-Signal: keine Unterlauf-
+    /// Warnungen (Parität zu windows_runtime).
+    media: bool,
 }
 
 impl MixInput {
@@ -345,6 +430,7 @@ impl MixInput {
         ring: Arc<Mutex<PcmRing>>,
         volume: f32,
         muted: bool,
+        media: bool,
     ) -> Self {
         Self {
             source_id,
@@ -356,6 +442,7 @@ impl MixInput {
             peak_bits: AtomicU32::new(0.0f32.to_bits()),
             square_sum_bits: AtomicU64::new(0.0f64.to_bits()),
             frames: AtomicU64::new(0),
+            media,
         }
     }
 
@@ -365,10 +452,11 @@ impl MixInput {
         self.muted.store(muted, Ordering::Relaxed);
     }
 
-    /// Veröffentlicht Blockpegel aus dem Echtzeit-Callback ohne Sperren.
-    fn publish_sample(&self, left: f32, right: f32) {
+    /// Veröffentlicht akkumulierte Blockpegel aus dem Echtzeit-Callback ohne
+    /// Sperren; einmal je Block je Eingang statt je Frame.
+    fn publish_block(&self, peak: f32, square_sum: f64, frames: u64) {
         // Positive Floats ordnen bitweise monoton, daher genügt ein CAS-Maximum.
-        let peak_bits = left.abs().max(right.abs()).to_bits();
+        let peak_bits = peak.to_bits();
         let mut current = self.peak_bits.load(Ordering::Relaxed);
         while peak_bits > current {
             match self.peak_bits.compare_exchange_weak(
@@ -381,7 +469,7 @@ impl MixInput {
                 Err(actual) => current = actual,
             }
         }
-        let add = (f64::from(left * left + right * right) * 0.5).to_bits();
+        let add = square_sum.to_bits();
         let mut current = self.square_sum_bits.load(Ordering::Relaxed);
         loop {
             let sum = f64::from_bits(current) + f64::from_bits(add);
@@ -395,7 +483,7 @@ impl MixInput {
                 Err(actual) => current = actual,
             }
         }
-        self.frames.fetch_add(1, Ordering::Relaxed);
+        self.frames.fetch_add(frames, Ordering::Relaxed);
     }
 
     /// Entleert die Pegelzähler in eine LevelEntry.
@@ -467,11 +555,30 @@ fn run_pipewire(
         .map_err(|error| error.to_string())?;
     thread_loop.start();
     let setup_lock = thread_loop.lock();
+    // Stop-Checks zwischen den blockierenden Init-Schritten: connect_rc ist
+    // mit der aktuellen pipewire-rs-API nicht unterbrechbar, daher bleibt
+    // der Join im Aufrufer bis zu deren Rückkehr hängen — ein vorher
+    // gesetzter Stopp überspringt die verbleibenden Schritte aber sofort.
+    if stop.load(Ordering::Acquire) {
+        drop(setup_lock);
+        thread_loop.stop();
+        return Ok(());
+    }
     let context =
         pw::context::ContextRc::new(&thread_loop, None).map_err(|error| error.to_string())?;
+    if stop.load(Ordering::Acquire) {
+        drop(setup_lock);
+        thread_loop.stop();
+        return Ok(());
+    }
     let core = context
         .connect_rc(None)
         .map_err(|error| error.to_string())?;
+    if stop.load(Ordering::Acquire) {
+        drop(setup_lock);
+        thread_loop.stop();
+        return Ok(());
+    }
     let registry = core.get_registry_rc().map_err(|error| error.to_string())?;
 
     let (notice_sender, notice_receiver) = mpsc::channel::<Notice>();
@@ -572,6 +679,8 @@ fn run_pipewire(
                     ramps[slot] = Some(ramp);
                     rings[slot] = Some(input.ring.lock());
                 }
+                let mut block_peaks = [0.0f32; MAX_MIX_INPUTS];
+                let mut block_squares = [0.0f64; MAX_MIX_INPUTS];
                 for frame_index in 0..frame_count {
                     let mut mixed = [0.0f32; 2];
                     for (slot, input) in snapshot.iter().enumerate().take(MAX_MIX_INPUTS) {
@@ -587,7 +696,8 @@ fn run_pipewire(
                         let right = sample[1] * gain;
                         mixed[0] += left;
                         mixed[1] += right;
-                        input.publish_sample(left, right);
+                        block_peaks[slot] = block_peaks[slot].max(left.abs()).max(right.abs());
+                        block_squares[slot] += f64::from(left * left + right * right) * 0.5;
                     }
                     let peak = mixed[0].abs().max(mixed[1].abs());
                     let limiter = if peak > LIMITER_CEILING {
@@ -599,6 +709,18 @@ fn run_pipewire(
                     bytes[offset..offset + 4].copy_from_slice(&(mixed[0] * limiter).to_le_bytes());
                     bytes[offset + 4..offset + 8]
                         .copy_from_slice(&(mixed[1] * limiter).to_le_bytes());
+                }
+                // Pegel einmal je Block je Eingang veröffentlichen; nur für
+                // tatsächlich gemischte Eingänge (Ramp-Guard), damit Frames
+                // nicht für übersprungene Quellen gezählt werden.
+                for slot in 0..snapshot.len().min(MAX_MIX_INPUTS) {
+                    if ramps[slot].is_some() {
+                        snapshot[slot].publish_block(
+                            block_peaks[slot],
+                            block_squares[slot],
+                            frame_count as u64,
+                        );
+                    }
                 }
                 let chunk = data.chunk_mut();
                 *chunk.offset_mut() = 0;
@@ -630,7 +752,7 @@ fn run_pipewire(
     let mut availability: HashMap<Uuid, bool> = HashMap::new();
     let mut failures: HashMap<Uuid, u32> = HashMap::new();
     let mut retry_cooldown: HashMap<Uuid, u32> = HashMap::new();
-    let mut last_counters: HashMap<Uuid, (u64, u64)> = HashMap::new();
+    let mut last_counters: HashMap<Uuid, (u64, u64, bool)> = HashMap::new();
     let mut last_tick = Instant::now();
 
     while !stop.load(Ordering::Acquire) {
@@ -654,6 +776,7 @@ fn run_pipewire(
                         captures.retain(|capture| capture.source_id != source_id);
                     }
                     mixers.remove(&source_id);
+                    last_counters.remove(&source_id);
                     rebuild_snapshot(&mixers, &mix_inputs);
                     emit_availability(
                         &events,
@@ -763,6 +886,7 @@ fn run_pipewire(
                         captures.retain(|capture| capture.source_id != *source_id);
                     }
                     mixers.remove(source_id);
+                    last_counters.remove(source_id);
                     rebuild_snapshot(&mixers, &mix_inputs);
                     emit_availability(
                         &events,
@@ -780,8 +904,18 @@ fn run_pipewire(
                     }
                     retry_cooldown.remove(source_id);
                 }
+                if mixers.len() >= MAX_MIX_INPUTS {
+                    emit_availability(
+                        &events,
+                        &mut availability,
+                        *source_id,
+                        false,
+                        "Mixer-Kapazität erreicht",
+                    );
+                    continue;
+                }
 
-                match resolve_binding(binding, &nodes.values().cloned().collect::<Vec<_>>()) {
+                match resolve_binding(binding, &nodes) {
                     BindResult::Bound(node_id) => {
                         let attempts = failures.get(source_id).copied().unwrap_or(0);
                         let ring = Arc::new(Mutex::new(PcmRing::new(RING_CAPACITY_FRAMES)));
@@ -791,6 +925,7 @@ fn run_pipewire(
                             ring.clone(),
                             *volume,
                             *muted,
+                            false,
                         ));
                         let stream_pair = {
                             let _loop_lock = thread_loop.lock();
@@ -872,18 +1007,38 @@ fn run_pipewire(
                 let bus_ring = media_audio.lock().get(source_id).cloned();
                 match bus_ring {
                     Some(ring) => {
-                        mixers.insert(
-                            *source_id,
-                            Arc::new(MixInput::new(
+                        if mixers.len() >= MAX_MIX_INPUTS {
+                            emit_availability(
+                                &events,
+                                &mut availability,
                                 *source_id,
-                                name.clone(),
-                                ring,
-                                *volume,
-                                *muted,
-                            )),
-                        );
-                        rebuild_snapshot(&mixers, &mix_inputs);
-                        emit_availability(&events, &mut availability, *source_id, true, "");
+                                false,
+                                "Mixer-Kapazität erreicht",
+                            );
+                        } else {
+                            let (overruns, underruns) = {
+                                let mut ring_guard = ring.lock();
+                                ring_guard.clear();
+                                (ring_guard.overruns(), ring_guard.underruns())
+                            };
+                            // Baselines auf den Ist-Stand setzen: Der
+                            // Medienring dekodiert auch vor der Mischung
+                            // weiter; dieser Vorschub ist keine Warnung.
+                            last_counters.insert(*source_id, (overruns, underruns, false));
+                            mixers.insert(
+                                *source_id,
+                                Arc::new(MixInput::new(
+                                    *source_id,
+                                    name.clone(),
+                                    ring,
+                                    *volume,
+                                    *muted,
+                                    true,
+                                )),
+                            );
+                            rebuild_snapshot(&mixers, &mix_inputs);
+                            emit_availability(&events, &mut availability, *source_id, true, "");
+                        }
                     }
                     None => {
                         emit_availability(
@@ -929,29 +1084,6 @@ fn run_pipewire(
     }
     thread_loop.stop();
     Ok(())
-}
-
-/// Sendet Verfügbarkeitsereignisse nur bei echten Zustandsübergängen.
-fn emit_availability(
-    events: &mpsc::Sender<EngineEvent>,
-    state: &mut HashMap<Uuid, bool>,
-    source_id: Uuid,
-    available: bool,
-    reason: &str,
-) {
-    if state.get(&source_id) == Some(&available) {
-        return;
-    }
-    state.insert(source_id, available);
-    let event = if available {
-        EngineEvent::SourceAvailable { source_id }
-    } else {
-        EngineEvent::SourceUnavailable {
-            source_id,
-            reason: reason.to_string(),
-        }
-    };
-    let _ = events.send(event);
 }
 
 /// Ersetzt den Mix-Snapshot durch die aktuelle Eingabemenge.
@@ -1089,7 +1221,7 @@ mod tests {
 
     #[test]
     fn resolve_binding_requires_unique_match() {
-        let nodes = vec![
+        let nodes: HashMap<u32, TrackedNode> = vec![
             TrackedNode {
                 id: 11,
                 process_path: "/usr/bin/game".into(),
@@ -1105,7 +1237,10 @@ mod tests {
                 process_path: "/opt/other/bin".into(),
                 grouping_id: "other".into(),
             },
-        ];
+        ]
+        .into_iter()
+        .map(|node| (node.id, node))
+        .collect();
         assert_eq!(
             resolve_binding(&binding("/usr/bin/game", "game"), &nodes),
             BindResult::Ambiguous(2)
@@ -1194,10 +1329,11 @@ mod tests {
     fn mix_input_accumulates_and_drains_levels() {
         let ring = Arc::new(Mutex::new(PcmRing::new(RING_CAPACITY_FRAMES)));
         let id = Uuid::new_v4();
-        let input = MixInput::new(id, "Test".into(), ring, 1.0, false);
-        for _ in 0..100 {
-            input.publish_sample(0.5, -0.25);
-        }
+        let input = MixInput::new(id, "Test".into(), ring, 1.0, false, false);
+        // 100 Frames à (0.5, -0.25) als ein Block veröffentlichen.
+        let peak = 0.5_f32.max((-0.25_f32).abs());
+        let squares = f64::from(0.5_f32 * 0.5 + (-0.25_f32) * (-0.25_f32)) * 0.5 * 100.0;
+        input.publish_block(peak, squares, 100);
         let entry = input.drain_level();
         assert_eq!(entry.source_id, id);
         assert!((entry.peak - 0.5).abs() < 1e-6);
@@ -1212,7 +1348,14 @@ mod tests {
     fn counter_warnings_only_report_new_counts() {
         let ring = Arc::new(Mutex::new(PcmRing::new(2)));
         let id = Uuid::new_v4();
-        let input = Arc::new(MixInput::new(id, "Spiel".into(), ring.clone(), 1.0, false));
+        let input = Arc::new(MixInput::new(
+            id,
+            "Spiel".into(),
+            ring.clone(),
+            1.0,
+            false,
+            false,
+        ));
         let mut last = HashMap::new();
 
         assert!(counter_warnings(&mut last, std::slice::from_ref(&input)).is_empty());

@@ -8,7 +8,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         mpsc,
     },
     thread::{self, JoinHandle},
@@ -103,33 +103,13 @@ use windows::{
 };
 use windows_numerics::Matrix3x2;
 
-use super::{GpuFrame, LatestFrame, MediaControlBus};
+use super::MediaControlBus;
 use crate::{
     audio::{MediaAudioBus, PcmRing, SAMPLE_RATE},
     engine::{DeviceRecoveryPhase, EngineEvent, NativeSurfaces},
-    project::{DisplayBinding, ProjectV1, Source, TextAlign, Transform},
+    project::{DisplayBinding, OutputConfig, ProjectV1, Scene, Source, TextAlign, Transform},
 };
 use parking_lot::RwLock;
-
-pub const D3D11_CREATE_DEVICE_BGRA_SUPPORT: u32 = 0x20;
-pub const D3D11_CREATE_DEVICE_VIDEO_SUPPORT: u32 = 0x800;
-pub const DXGI_FORMAT_R16G16B16A16_FLOAT: u32 = 10;
-pub const DXGI_SWAP_EFFECT_FLIP_DISCARD: u32 = 4;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DeviceDescriptor {
-    pub creation_flags: u32,
-    pub single_immediate_context: bool,
-}
-
-impl Default for DeviceDescriptor {
-    fn default() -> Self {
-        Self {
-            creation_flags: D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-            single_immediate_context: true,
-        }
-    }
-}
 
 pub struct D3d11Device {
     pub device: ID3D11Device,
@@ -178,7 +158,7 @@ impl D3d11Device {
     ) -> Result<ID3D11Texture2D, WindowsVideoError> {
         if descriptor.width == 0
             || descriptor.height == 0
-            || descriptor.format != DXGI_FORMAT_R16G16B16A16_FLOAT
+            || descriptor.format != FLOAT16_FORMAT.0 as u32
         {
             return Err(WindowsVideoError::InvalidSceneTexture);
         }
@@ -356,9 +336,10 @@ pub struct D3d11Compositor {
     scene_texture: ID3D11Texture2D,
     d2d_context: ID2D1DeviceContext,
     _scene_bitmap: ID2D1Bitmap1,
-    source_bitmaps: HashMap<usize, ID2D1Bitmap1>,
+    source_bitmaps: HashMap<usize, (u64, ID2D1Bitmap1)>,
+    bitmap_cache_tick: u64,
     dwrite_factory: IDWriteFactory,
-    text_formats: HashMap<String, IDWriteTextFormat>,
+    text_formats: HashMap<(u64, u32, u16, u8), (String, IDWriteTextFormat)>,
     brushes: HashMap<String, ID2D1SolidColorBrush>,
     text_buffers: HashMap<String, Vec<u16>>,
     program: SwapChainTarget,
@@ -417,6 +398,7 @@ impl D3d11Compositor {
             d2d_context,
             _scene_bitmap: scene_bitmap,
             source_bitmaps: HashMap::new(),
+            bitmap_cache_tick: 0,
             program,
             dwrite_factory,
             text_formats: HashMap::new(),
@@ -486,6 +468,7 @@ impl D3d11Compositor {
                 );
             }
         }
+        let mut rendered_texts: HashSet<&str> = HashSet::new();
         for text in texts {
             let destination = D2D_RECT_F {
                 left: text.transform.x,
@@ -519,10 +502,15 @@ impl D3d11Compositor {
                 self.d2d_context.SetTransform(&matrix);
                 self.d2d_context.FillRectangle(&destination, &background);
             }
+            rendered_texts.insert(text.text);
+            if !self.text_buffers.contains_key(text.text) {
+                self.text_buffers
+                    .insert(text.text.to_string(), text.text.encode_utf16().collect());
+            }
             let buffer = self
                 .text_buffers
-                .entry(text.text.to_string())
-                .or_insert_with(|| text.text.encode_utf16().collect());
+                .get_mut(text.text)
+                .expect("text buffer was inserted above");
             unsafe {
                 self.d2d_context.DrawText(
                     buffer,
@@ -534,6 +522,12 @@ impl D3d11Compositor {
                 );
             }
         }
+
+        // Puffer nicht mehr gezeichneter Texte freigeben: der Cache
+        // bleibt auf den aktuellen Durchlauf begrenzt statt fuer die
+        // Laufzeit des Compositors zu wachsen.
+        self.text_buffers
+            .retain(|key, _| rendered_texts.contains(key.as_str()));
         unsafe {
             self.d2d_context.SetTransform(&Matrix3x2::identity());
             self.d2d_context.EndDraw(None, None)
@@ -553,11 +547,28 @@ impl D3d11Compositor {
 
     fn bitmap_for(&mut self, texture: &ID3D11Texture2D) -> Result<ID2D1Bitmap1, WindowsVideoError> {
         let key = Interface::as_raw(texture) as usize;
-        if let Some(bitmap) = self.source_bitmaps.get(&key) {
-            return Ok(bitmap.clone());
+        // Ein Tick je Bitmap-Suche: Treffer und neue Eintraege schreiben
+        // monoton steigende Recency, die Verdraengung unten erwischt
+        // damit den echten least-recently-used-Eintrag.
+        self.bitmap_cache_tick += 1;
+        if let Some(entry) = self.source_bitmaps.get_mut(&key) {
+            entry.0 = self.bitmap_cache_tick;
+            return Ok(entry.1.clone());
         }
-        if self.source_bitmaps.len() >= 32 {
-            self.source_bitmaps.clear();
+        // Gezielte Verdraengung statt Wholesale-Clear: jeder Treffer hebt
+        // die Verwendung an, ueber der Kapazitaet weicht der least
+        // recently verwendete Eintrag. Zwei Pool-Texturen je Live-Capture
+        // bleiben so dauerhaft im Cache.
+        while self.source_bitmaps.len() >= SOURCE_BITMAP_CACHE_CAPACITY {
+            let Some(oldest) = self
+                .source_bitmaps
+                .iter()
+                .min_by_key(|(_, (last_use, _))| *last_use)
+                .map(|(key, _)| *key)
+            else {
+                break;
+            };
+            self.source_bitmaps.remove(&oldest);
         }
         let surface = texture
             .cast::<IDXGISurface>()
@@ -578,7 +589,8 @@ impl D3d11Compositor {
                 .CreateBitmapFromDxgiSurface(&surface, Some(&properties))
         }
         .map_err(|error| WindowsVideoError::DeviceCreation(error.to_string()))?;
-        self.source_bitmaps.insert(key, bitmap.clone());
+        self.source_bitmaps
+            .insert(key, (self.bitmap_cache_tick, bitmap.clone()));
         Ok(bitmap)
     }
 
@@ -606,10 +618,26 @@ impl D3d11Compositor {
         weight: u16,
         align: &TextAlign,
     ) -> Result<IDWriteTextFormat, WindowsVideoError> {
-        let key = format!("{family}\\0{size}\\0{weight}\\0{align:?}");
-        if let Some(format) = self.text_formats.get(&key) {
-            return Ok(format.clone());
+        // Copy-Key ohne Heap-Allokation: FNV-1a ueber den Familiennamen
+        // plus Groesse/Gewicht/Ausrichtung. Der gespeicherte Name
+        // verifiziert Treffer, sodass Hash-Kollisionen korrekt zum
+        // Neuaufbau fallen statt ein fremdes Format zu liefern.
+        let key = (
+            fnv1a_utf8(family),
+            size.to_bits(),
+            weight,
+            match align {
+                TextAlign::Left => 0u8,
+                TextAlign::Center => 1u8,
+                TextAlign::Right => 2u8,
+            },
+        );
+        if let Some((cached_family, format)) = self.text_formats.get(&key) {
+            if cached_family == family {
+                return Ok(format.clone());
+            }
         }
+        let family_name = family.to_string();
         let family: Vec<u16> = family.encode_utf16().chain(Some(0)).collect();
         let locale: Vec<u16> = "de-DE".encode_utf16().chain(Some(0)).collect();
         let format = unsafe {
@@ -633,9 +661,20 @@ impl D3d11Compositor {
             .map_err(|error| WindowsVideoError::DeviceCreation(error.to_string()))?;
         unsafe { format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER) }
             .map_err(|error| WindowsVideoError::DeviceCreation(error.to_string()))?;
-        self.text_formats.insert(key, format.clone());
+        self.text_formats.insert(key, (family_name, format.clone()));
         Ok(format)
     }
+}
+
+/// FNV-1a ueber UTF-8-Bytes: prozess-lokaler Cache-Key-Hash ohne
+/// Heap-Allokation fuer Hot Paths.
+fn fnv1a_utf8(value: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash
 }
 
 /// WGC-Handler laufen auf ThreadPool-Threads (Send-Grenze). Der Zeiger wird
@@ -643,8 +682,13 @@ impl D3d11Compositor {
 struct SendDirect3DDevice(IDirect3DDevice);
 
 impl SendDirect3DDevice {
-    fn recreate_pool(&self, pool: &Direct3D11CaptureFramePool, width: i32, height: i32) {
-        let _ = pool.Recreate(
+    fn recreate_pool(
+        &self,
+        pool: &Direct3D11CaptureFramePool,
+        width: i32,
+        height: i32,
+    ) -> windows::core::Result<()> {
+        pool.Recreate(
             &self.0,
             DirectXPixelFormat::B8G8R8A8UIntNormalized,
             2,
@@ -652,7 +696,7 @@ impl SendDirect3DDevice {
                 Width: width,
                 Height: height,
             },
-        );
+        )
     }
 }
 
@@ -680,6 +724,21 @@ impl Drop for ComApartment {
     }
 }
 
+/// Obergrenze aufeinanderfolgender Recovery-Eingriffe nach Renderfehlern
+/// — unabhaengig davon, ob das Create gelang —, bevor der Render-Thread
+/// endgueltig aufgibt.
+const MAX_RECOVERY_FAILURES: u32 = 8;
+
+/// Gueltige Frames in Folge, nach denen der Recovery-Streak abgeklungen
+/// ist und auf 0 faellt.
+const RECOVERY_STREAK_RESET_FRAMES: u32 = 60;
+
+/// Obergrenze der zwischengespeicherten Quell-Bitmaps pro Compositor;
+/// deckt zwei Pool-Texturen je Live-Capture bis weit ueber den
+/// ausgelegten Betriebsbereich ab. Bei Neuem weicht der least recently
+/// verwendete Eintrag, statt den Cache komplett zu leeren.
+const SOURCE_BITMAP_CACHE_CAPACITY: usize = 128;
+
 pub struct RenderRuntime {
     stop: Arc<AtomicBool>,
     thread: Mutex<Option<JoinHandle<()>>>,
@@ -695,7 +754,7 @@ impl RenderRuntime {
     ) -> Result<Self, WindowsVideoError> {
         if surfaces.program == 0 || surfaces.preview == 0 {
             return Err(WindowsVideoError::SwapChain(
-                "Program and Preview window handles are required".into(),
+                "Programm- und Preview-Fensterhandles sind erforderlich".into(),
             ));
         }
         let stop = Arc::new(AtomicBool::new(false));
@@ -727,90 +786,139 @@ impl RenderRuntime {
                         return;
                     }
                 };
-                let mut media_context = MediaFoundationContext::start(&compositor.device).ok();
+                let mut media_context = None;
+                let mut mf_last_error: Option<String> = None;
+                restart_media_context(&mut media_context, &mut mf_last_error, &compositor.device);
                 let mut media_sources: HashMap<Uuid, (String, MediaVideoSource)> = HashMap::new();
                 let mut captures: HashMap<Uuid, WindowCapture> = HashMap::new();
                 let mut frames: HashMap<Uuid, D3d11CapturedFrame> = HashMap::new();
                 let mut stale_windows: HashSet<Uuid> = HashSet::new();
                 let mut image_textures: HashMap<Uuid, (String, ID3D11Texture2D)> = HashMap::new();
                 let mut display_captures: HashMap<Uuid, DisplayCapture> = HashMap::new();
+                let mut available_displays: HashSet<Uuid> = HashSet::new();
                 let mut previous_visible: HashSet<Uuid> = HashSet::new();
+                let mut last_media_state: HashMap<Uuid, (bool, f64)> = HashMap::new();
+                let mut ended_media: HashSet<Uuid> = HashSet::new();
                 let mut last_source_sync = Instant::now() - Duration::from_secs(2);
                 let mut deadline = Instant::now();
+                let mut recovery_streak: u32 = 0;
+                let mut rendered_frames_since_recovery: u32 = 0;
+                let mut last_failures: HashMap<(Uuid, FailureKind), String> = HashMap::new();
+                let mut read_backoff: HashSet<Uuid> = HashSet::new();
+                let mut resize_retry_failures: u32 = 0;
+                let mut next_resize_attempt = Instant::now();
+                let mut sync_tick_index: u32 = 0;
                 while !thread_stop.load(Ordering::Acquire) {
                     let snapshot = project.read().clone();
                     let next_output = snapshot.output.clone();
-                    if next_output.width != output.width || next_output.height != output.height {
-                        let _ = events.send(EngineEvent::DeviceRecovery {
-                            phase: DeviceRecoveryPhase::Started,
-                            detail: None,
-                        });
-                        media_sources.clear();
-                        drop(media_context.take());
-                        captures.clear();
-                        frames.clear();
-                        stale_windows.clear();
-                        display_captures.clear();
-                        image_textures.clear();
-                        previous_visible.clear();
-                        match D3d11Compositor::create(
-                            surfaces.program,
-                            surfaces.preview,
-                            next_output.width,
-                            next_output.height,
-                        ) {
-                            Ok(recreated) => {
-                                compositor = recreated;
-                                media_context =
-                                    MediaFoundationContext::start(&compositor.device).ok();
-                                output = next_output;
-                                last_source_sync = Instant::now() - Duration::from_secs(2);
-                                let _ = events.send(EngineEvent::DeviceRecovery {
-                                    phase: DeviceRecoveryPhase::Succeeded,
-                                    detail: None,
-                                });
-                            }
-                            Err(error) => {
-                                let _ = events.send(EngineEvent::DeviceRecovery {
-                                    phase: DeviceRecoveryPhase::Failed,
-                                    detail: Some(error.to_string()),
-                                });
-                                break;
-                            }
-                        }
-                    } else {
-                        output = next_output;
-                    }
+                    try_resize_compositor(
+                        next_output,
+                        surfaces,
+                        &mut output,
+                        &mut compositor,
+                        &mut media_context,
+                        &mut mf_last_error,
+                        &mut media_sources,
+                        &mut last_media_state,
+                        &mut last_failures,
+                        &mut read_backoff,
+                        &mut captures,
+                        &mut frames,
+                        &mut stale_windows,
+                        &mut display_captures,
+                        &mut image_textures,
+                        &mut previous_visible,
+                        &mut last_source_sync,
+                        &mut resize_retry_failures,
+                        &mut next_resize_attempt,
+                        &events,
+                    );
 
                     if last_source_sync.elapsed() >= Duration::from_secs(1) {
-                        synchronize_window_captures(
-                            &snapshot,
-                            surfaces,
-                            &compositor.device,
-                            &events,
-                            &mut captures,
-                            &mut frames,
-                        );
-                        synchronize_display_captures(
-                            &snapshot,
-                            &compositor.device,
-                            &events,
-                            &mut display_captures,
-                        );
-                        synchronize_images(
-                            &snapshot,
-                            &compositor.device,
-                            &events,
-                            &mut image_textures,
-                        );
-                        if let Some(context) = &media_context {
-                            synchronize_media(
-                                &snapshot,
-                                context,
-                                &events,
-                                &media_audio,
-                                &mut media_sources,
-                            );
+                        let mut creations_this_tick: u32 = 0;
+                        // Fairness: Alle vier Synchronisierer teilen sich das
+                        // Erstellungs-Budget dieses Ticks. Die Reihenfolge
+                        // rotiert pro Tick, damit kein Quelltyp dauerhaft den
+                        // ersten Slot bekommt und die anderen hungern.
+                        let rotation = sync_tick_index % 4;
+                        sync_tick_index = sync_tick_index.wrapping_add(1);
+                        for pass in match rotation {
+                            0 => [
+                                SyncPass::Window,
+                                SyncPass::Display,
+                                SyncPass::Images,
+                                SyncPass::Media,
+                            ],
+                            1 => [
+                                SyncPass::Display,
+                                SyncPass::Images,
+                                SyncPass::Media,
+                                SyncPass::Window,
+                            ],
+                            2 => [
+                                SyncPass::Images,
+                                SyncPass::Media,
+                                SyncPass::Window,
+                                SyncPass::Display,
+                            ],
+                            _ => [
+                                SyncPass::Media,
+                                SyncPass::Window,
+                                SyncPass::Display,
+                                SyncPass::Images,
+                            ],
+                        } {
+                            match pass {
+                                SyncPass::Window => synchronize_window_captures(
+                                    &snapshot,
+                                    surfaces,
+                                    &compositor.device,
+                                    &events,
+                                    &mut captures,
+                                    &mut frames,
+                                    &mut last_failures,
+                                    &mut creations_this_tick,
+                                ),
+                                SyncPass::Display => synchronize_display_captures(
+                                    &snapshot,
+                                    &compositor.device,
+                                    &events,
+                                    &mut display_captures,
+                                    &mut last_failures,
+                                    &mut creations_this_tick,
+                                ),
+                                SyncPass::Images => synchronize_images(
+                                    &snapshot,
+                                    &compositor.device,
+                                    &events,
+                                    &mut image_textures,
+                                    &mut last_failures,
+                                    &mut creations_this_tick,
+                                ),
+                                SyncPass::Media => {
+                                    if media_context.is_none() {
+                                        // Start fehlgeschlagen (z.B. nach
+                                        // Device-Recovery): einmal pro
+                                        // Sync-Tick erneut versuchen.
+                                        restart_media_context(
+                                            &mut media_context,
+                                            &mut mf_last_error,
+                                            &compositor.device,
+                                        );
+                                    }
+                                    if let Some(context) = &media_context {
+                                        synchronize_media(
+                                            &snapshot,
+                                            context,
+                                            &events,
+                                            &media_audio,
+                                            &mut media_sources,
+                                            &mut last_failures,
+                                            &mut creations_this_tick,
+                                        );
+                                    }
+                                }
+                            }
                         }
                         last_source_sync = Instant::now();
                     }
@@ -819,147 +927,31 @@ impl RenderRuntime {
                         .scenes
                         .iter()
                         .find(|scene| scene.id == snapshot.active_scene_id);
-                    if let Some(scene) = active_scene {
-                        for item in scene.items.iter().filter(|item| item.visible) {
-                            if let Some(capture) = captures.get(&item.source_id) {
-                                if let Some(frame) = capture.take_latest() {
-                                    frames.insert(item.source_id, frame);
-                                    if stale_windows.remove(&item.source_id) {
-                                        let _ = events.send(EngineEvent::SourceAvailable {
-                                            source_id: item.source_id,
-                                        });
-                                    }
-                                } else if capture.is_stale(Duration::from_millis(750)) {
-                                    // WGC liefert Frames nur bei sichtbarer Aenderung des
-                                    // Fensters. Ein statisches Fenster bleibt daher ohne
-                                    // neue Frames, ist aber nicht offline: Solange mindestens
-                                    // ein Frame angekommen ist, bleibt der letzte Texturstand
-                                    // in `frames` und wird weitergerendert. Erst ein
-                                    // GraphicsCaptureItem.Closed-Signal oder eine nie
-                                    // gelieferte Captive gilt als offline.
-                                    if !capture.has_delivered() || capture.is_closed() {
-                                        frames.remove(&item.source_id);
-                                        if stale_windows.insert(item.source_id) {
-                                            let reason = if capture.is_closed() {
-                                                "Fenster wurde geschlossen"
-                                            } else {
-                                                "Fenster liefert keine Live-Frames"
-                                            };
-                                            let _ = events.send(EngineEvent::SourceUnavailable {
-                                                source_id: item.source_id,
-                                                reason: reason.into(),
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    let mut failed_displays: Vec<Uuid> = Vec::new();
-                    for (source_id, capture) in &mut display_captures {
-                        match capture.acquire_latest(
-                            &compositor.device.immediate_context,
-                            &compositor.device.device,
-                        ) {
-                            Ok(true) => {
-                                let _ = events.send(EngineEvent::SourceAvailable {
-                                    source_id: *source_id,
-                                });
-                            }
-                            Ok(false) => {}
-                            Err(error) => {
-                                let _ = events.send(EngineEvent::SourceUnavailable {
-                                    source_id: *source_id,
-                                    reason: error.to_string(),
-                                });
-                                failed_displays.push(*source_id);
-                            }
-                        }
-                    }
-                    // Tote Duplikation (z.B. ACCESS_LOST) wegwerfen; der naechste
-                    // synchronize_display_captures-Lauf baut sie neu auf.
-                    for source_id in failed_displays {
-                        display_captures.remove(&source_id);
-                    }
-                    let visible_ids: HashSet<Uuid> = active_scene
-                        .into_iter()
-                        .flat_map(|scene| {
-                            scene
-                                .items
-                                .iter()
-                                .filter(|item| item.visible)
-                                .map(|item| item.source_id)
-                        })
-                        .collect();
-                    // Versteckte Quellen halten alte Pool-Frames fest; nur sichtbare behalten.
-                    frames.retain(|source_id, _| visible_ids.contains(source_id));
-                    for source in &snapshot.sources {
-                        if let Source::Media {
-                            id,
-                            continue_when_hidden,
-                            restart_on_show,
-                            looped,
-                            ..
-                        } = source
-                        {
-                            let control = media_control.read().get(id).copied().unwrap_or_default();
-                            let Some((_, media)) = media_sources.get_mut(id) else {
-                                continue;
-                            };
-                            if *restart_on_show
-                                && visible_ids.contains(id)
-                                && !previous_visible.contains(id)
-                            {
-                                let _ = media.seek(0.0);
-                            }
-                            if let Some(position) = control.seek_seconds {
-                                if let Err(error) = media.seek(position) {
-                                    let _ = events.send(EngineEvent::UnsupportedMedia {
-                                        source_id: *id,
-                                        reason: error.to_string(),
-                                    });
-                                }
-                                media_control.write().entry(*id).or_default().seek_seconds = None;
-                            }
-                            if !control.playing {
-                                let _ = events.send(EngineEvent::MediaState {
-                                    source_id: *id,
-                                    state: crate::engine::MediaRuntimeState {
-                                        playing: false,
-                                        position_seconds: media.timestamp_100ns() as f64
-                                            / 10_000_000.0,
-                                        duration_seconds: None,
-                                    },
-                                });
-                                continue;
-                            }
-                            if visible_ids.contains(id) || *continue_when_hidden {
-                                match media.read_next() {
-                                    Ok(false) if *looped => {
-                                        let _ = media.seek(0.0);
-                                    }
-                                    Ok(_) => {
-                                        let _ = events.send(EngineEvent::MediaState {
-                                            source_id: *id,
-                                            state: crate::engine::MediaRuntimeState {
-                                                playing: true,
-                                                position_seconds: media.timestamp_100ns() as f64
-                                                    / 10_000_000.0,
-                                                duration_seconds: None,
-                                            },
-                                        });
-                                    }
-                                    Err(error) => {
-                                        let _ = events.send(EngineEvent::UnsupportedMedia {
-                                            source_id: *id,
-                                            reason: error.to_string(),
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    previous_visible = visible_ids;
+                    pump_window_frames(
+                        active_scene,
+                        &captures,
+                        &mut frames,
+                        &mut stale_windows,
+                        &events,
+                    );
+                    pump_displays(
+                        &compositor.device,
+                        &mut display_captures,
+                        &mut available_displays,
+                        &events,
+                    );
+                    pump_media(
+                        &snapshot,
+                        active_scene,
+                        &media_control,
+                        &mut media_sources,
+                        &mut last_media_state,
+                        &mut ended_media,
+                        &mut last_failures,
+                        &mut read_backoff,
+                        &mut previous_visible,
+                        &events,
+                    );
 
                     let items = active_scene.into_iter().flat_map(|scene| {
                         scene.items.iter().filter_map(|item| {
@@ -1027,8 +1019,17 @@ impl RenderRuntime {
                                 || image_textures.contains_key(&item.source_id)
                                 || media_sources
                                     .get(&item.source_id)
-                                    .and_then(|(_, media)| media.texture())
-                                    .is_some();
+                                    .is_some_and(|(_, media)| {
+                                        // Audio-only-Medien (video_enabled =
+                                        // false) haben nie eine Textur, sind
+                                        // aber praesent: kein Offline-Schild.
+                                        // Ebenso bleibt ein pausiertes Medium
+                                        // nach einem Seek praesent, solange
+                                        // mindestens ein Bild dekodiert wurde.
+                                        !media.video_enabled
+                                            || media.texture().is_some()
+                                            || media.decoded_video()
+                                    });
                             if has_texture {
                                 continue;
                             }
@@ -1064,11 +1065,44 @@ impl RenderRuntime {
                         items,
                         texts.chain(offline_texts),
                     ) {
-                        let _ = events.send(EngineEvent::DeviceRecovery {
-                            phase: DeviceRecoveryPhase::Failed,
-                            detail: Some(error.to_string()),
-                        });
-                        break;
+                        if recover_after_render_error(
+                            &error,
+                            surfaces,
+                            &output,
+                            &mut compositor,
+                            &mut media_context,
+                            &mut mf_last_error,
+                            &mut media_sources,
+                            &mut last_media_state,
+                            &mut last_failures,
+                            &mut read_backoff,
+                            &mut captures,
+                            &mut frames,
+                            &mut stale_windows,
+                            &mut display_captures,
+                            &mut image_textures,
+                            &mut previous_visible,
+                            &mut recovery_streak,
+                            &mut rendered_frames_since_recovery,
+                            &mut last_source_sync,
+                            &thread_stop,
+                            &events,
+                        ) {
+                            break;
+                        }
+                        continue;
+                    }
+                    // Gueltige Frames zaehlen gegen den Recovery-Streak:
+                    // erst RECOVERY_STREAK_RESET_FRAMES Frames in Folge
+                    // gilt die Quelle als stabil und der Streak faellt auf
+                    // 0. Ein einzelner transienter Fehler klingt damit ab,
+                    // eine Flatter-Serie terminiert am Streak-Limit.
+                    if recovery_streak > 0 {
+                        rendered_frames_since_recovery += 1;
+                        if rendered_frames_since_recovery >= RECOVERY_STREAK_RESET_FRAMES {
+                            recovery_streak = 0;
+                            rendered_frames_since_recovery = 0;
+                        }
                     }
                     let frame_time = Duration::from_secs_f64(1.0 / f64::from(output.fps.max(1)));
                     deadline += frame_time;
@@ -1115,12 +1149,686 @@ impl Drop for RenderRuntime {
     }
 }
 
+/// Media-Foundation-Kontext (neu) starten und die Fehlerlage nur bei
+/// Zustandswechsel melden: Ein dauerhaft scheiternder Start flutet
+/// sonst das Log, ein einmaliger wird nicht verschluckt.
+fn restart_media_context(
+    context: &mut Option<MediaFoundationContext>,
+    last_error: &mut Option<String>,
+    device: &D3d11Device,
+) {
+    match MediaFoundationContext::start(device) {
+        Ok(started) => {
+            *context = Some(started);
+            *last_error = None;
+        }
+        Err(error) => {
+            let reason = error.to_string();
+            if last_error.as_deref() != Some(reason.as_str()) {
+                eprintln!("[hooviestar] Media Foundation Kontext fehlgeschlagen: {reason}");
+            }
+            *last_error = Some(reason);
+        }
+    }
+}
+
+/// Geraeteabhaengigen Zustand nach Device-Verlust verwerfen; der
+/// naechste Sync-Tick baut die Quellen neu auf. `available_displays`
+/// bleibt absichtlich unberuehrt (historisches Verhalten).
+fn clear_device_tied_state(
+    media_sources: &mut HashMap<Uuid, (String, MediaVideoSource)>,
+    last_media_state: &mut HashMap<Uuid, (bool, f64)>,
+    last_failures: &mut HashMap<(Uuid, FailureKind), String>,
+    read_backoff: &mut HashSet<Uuid>,
+    media_context: &mut Option<MediaFoundationContext>,
+    captures: &mut HashMap<Uuid, WindowCapture>,
+    frames: &mut HashMap<Uuid, D3d11CapturedFrame>,
+    stale_windows: &mut HashSet<Uuid>,
+    display_captures: &mut HashMap<Uuid, DisplayCapture>,
+    image_textures: &mut HashMap<Uuid, (String, ID3D11Texture2D)>,
+    previous_visible: &mut HashSet<Uuid>,
+) {
+    media_sources.clear();
+    last_media_state.clear();
+    last_failures.clear();
+    read_backoff.clear();
+    drop(media_context.take());
+    captures.clear();
+    frames.clear();
+    stale_windows.clear();
+    display_captures.clear();
+    image_textures.clear();
+    previous_visible.clear();
+}
+
+/// Groessenaenderung lazily retryen: der alte Kompositor rendert in
+/// der alten Groesse weiter, eine nicht erzeugbare Groesse kostet
+/// nicht das fatale Recovery-Budget.
+fn try_resize_compositor(
+    next_output: OutputConfig,
+    surfaces: NativeSurfaces,
+    output: &mut OutputConfig,
+    compositor: &mut D3d11Compositor,
+    media_context: &mut Option<MediaFoundationContext>,
+    mf_last_error: &mut Option<String>,
+    media_sources: &mut HashMap<Uuid, (String, MediaVideoSource)>,
+    last_media_state: &mut HashMap<Uuid, (bool, f64)>,
+    last_failures: &mut HashMap<(Uuid, FailureKind), String>,
+    read_backoff: &mut HashSet<Uuid>,
+    captures: &mut HashMap<Uuid, WindowCapture>,
+    frames: &mut HashMap<Uuid, D3d11CapturedFrame>,
+    stale_windows: &mut HashSet<Uuid>,
+    display_captures: &mut HashMap<Uuid, DisplayCapture>,
+    image_textures: &mut HashMap<Uuid, (String, ID3D11Texture2D)>,
+    previous_visible: &mut HashSet<Uuid>,
+    last_source_sync: &mut Instant,
+    resize_retry_failures: &mut u32,
+    next_resize_attempt: &mut Instant,
+    events: &mpsc::Sender<EngineEvent>,
+) {
+    // Nicht-Groessen-Aenderungen (fps, Hintergrund) greifen sofort,
+    // unabhaengig vom ausstehenden Retry einer nicht erzeugbaren
+    // Groesse; nur width/height bleiben an das gelungene Recreate
+    // gebunden.
+    output.fps = next_output.fps;
+    output.background = next_output.background.clone();
+    if next_output.width != output.width || next_output.height != output.height {
+        // Groessenaenderung lazily retryen: der alte
+        // Kompositor rendert in der alten Groesse weiter,
+        // eine nicht erzeugbare Groesse kostet nicht das
+        // fatale Recovery-Budget.
+        if Instant::now() >= *next_resize_attempt {
+            let _ = events.send(EngineEvent::DeviceRecovery {
+                phase: DeviceRecoveryPhase::Started,
+                detail: None,
+            });
+            match D3d11Compositor::create(
+                surfaces.program,
+                surfaces.preview,
+                next_output.width,
+                next_output.height,
+            ) {
+                Ok(recreated) => {
+                    // Geraeteabhaengiger Zustand erst nach
+                    // erfolgreichem Create verwerfen:
+                    // scheitert das Create, bleibt der alte
+                    // Kompositor mit allen Quellen
+                    // weiter lauffaehig.
+                    clear_device_tied_state(
+                        media_sources,
+                        last_media_state,
+                        last_failures,
+                        read_backoff,
+                        media_context,
+                        captures,
+                        frames,
+                        stale_windows,
+                        display_captures,
+                        image_textures,
+                        previous_visible,
+                    );
+                    *compositor = recreated;
+                    restart_media_context(media_context, mf_last_error, &compositor.device);
+                    *output = next_output;
+                    *last_source_sync = Instant::now() - Duration::from_secs(2);
+                    *resize_retry_failures = 0;
+                    *next_resize_attempt = Instant::now();
+                    let _ = events.send(EngineEvent::DeviceRecovery {
+                        phase: DeviceRecoveryPhase::Succeeded,
+                        detail: None,
+                    });
+                }
+                Err(error) => {
+                    *resize_retry_failures += 1;
+                    let _ = events.send(EngineEvent::DeviceRecovery {
+                        phase: DeviceRecoveryPhase::Failed,
+                        detail: Some(error.to_string()),
+                    });
+                    *next_resize_attempt =
+                        Instant::now() + backoff_duration(*resize_retry_failures);
+                }
+            }
+        }
+    } else {
+        *output = next_output;
+        *resize_retry_failures = 0;
+        *next_resize_attempt = Instant::now();
+    }
+}
+
+/// Neueste WGC-Frames der sichtbaren Fensterquellen in den
+/// Render-Cache uebernehmen.
+fn pump_window_frames(
+    active_scene: Option<&Scene>,
+    captures: &HashMap<Uuid, WindowCapture>,
+    frames: &mut HashMap<Uuid, D3d11CapturedFrame>,
+    stale_windows: &mut HashSet<Uuid>,
+    events: &mpsc::Sender<EngineEvent>,
+) {
+    if let Some(scene) = active_scene {
+        for item in scene.items.iter().filter(|item| item.visible) {
+            if let Some(capture) = captures.get(&item.source_id) {
+                if let Some(frame) = capture.take_latest() {
+                    frames.insert(item.source_id, frame);
+                    if stale_windows.remove(&item.source_id) {
+                        let _ = events.send(EngineEvent::SourceAvailable {
+                            source_id: item.source_id,
+                        });
+                    }
+                } else if capture.is_stale(Duration::from_millis(750)) {
+                    // WGC liefert Frames nur bei sichtbarer Aenderung des
+                    // Fensters. Ein statisches Fenster bleibt daher ohne
+                    // neue Frames, ist aber nicht offline: Solange mindestens
+                    // ein Frame angekommen ist, bleibt der letzte Texturstand
+                    // in `frames` und wird weitergerendert. Erst ein
+                    // GraphicsCaptureItem.Closed-Signal oder eine nie
+                    // gelieferte Captive gilt als offline.
+                    if !capture.has_delivered() || capture.is_closed() {
+                        frames.remove(&item.source_id);
+                        if stale_windows.insert(item.source_id) {
+                            let reason = if capture.is_closed() {
+                                "Fenster wurde geschlossen"
+                            } else {
+                                "Fenster liefert keine Live-Frames"
+                            };
+                            let _ = events.send(EngineEvent::SourceUnavailable {
+                                source_id: item.source_id,
+                                reason: reason.into(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Desktop-Duplication-Frames abholen; tote Duplikationen
+/// (z.B. ACCESS_LOST) entfernen, der naechste Sync-Tick baut
+/// sie neu auf.
+fn pump_displays(
+    device: &D3d11Device,
+    display_captures: &mut HashMap<Uuid, DisplayCapture>,
+    available_displays: &mut HashSet<Uuid>,
+    events: &mpsc::Sender<EngineEvent>,
+) {
+    let mut failed_displays: Vec<Uuid> = Vec::new();
+    for (source_id, capture) in &mut *display_captures {
+        match capture.acquire_latest(&device.immediate_context, &device.device) {
+            Ok(true) => {
+                // Nur beim Uebergang melden, nicht bei jedem
+                // erfassten Desktop-Frame (wie stale_windows).
+                if available_displays.insert(*source_id) {
+                    let _ = events.send(EngineEvent::SourceAvailable {
+                        source_id: *source_id,
+                    });
+                }
+            }
+            Ok(false) => {}
+            Err(error) => {
+                available_displays.remove(source_id);
+                let _ = events.send(EngineEvent::SourceUnavailable {
+                    source_id: *source_id,
+                    reason: error.to_string(),
+                });
+                failed_displays.push(*source_id);
+            }
+        }
+    }
+    // Tote Duplikation (z.B. ACCESS_LOST) wegwerfen; der naechste
+    // synchronize_display_captures-Lauf baut sie neu auf.
+    for source_id in failed_displays {
+        display_captures.remove(&source_id);
+    }
+}
+
+/// Medien-PTS-Pacing: Lesentscheid, Pausen, Seek-Wuensche und
+/// MediaState-Events; Unsichtbarkeit pausiert, sofern die Quelle
+/// nicht continue_when_hidden gesetzt hat.
+fn pump_media(
+    snapshot: &ProjectV1,
+    active_scene: Option<&Scene>,
+    media_control: &MediaControlBus,
+    media_sources: &mut HashMap<Uuid, (String, MediaVideoSource)>,
+    last_media_state: &mut HashMap<Uuid, (bool, f64)>,
+    ended_media: &mut HashSet<Uuid>,
+    last_failures: &mut HashMap<(Uuid, FailureKind), String>,
+    read_backoff: &mut HashSet<Uuid>,
+    previous_visible: &mut HashSet<Uuid>,
+    events: &mpsc::Sender<EngineEvent>,
+) {
+    let visible_ids: HashSet<Uuid> = active_scene
+        .into_iter()
+        .flat_map(|scene| {
+            scene
+                .items
+                .iter()
+                .filter(|item| item.visible)
+                .map(|item| item.source_id)
+        })
+        .collect();
+    for source in &snapshot.sources {
+        if let Source::Media {
+            id,
+            continue_when_hidden,
+            restart_on_show,
+            looped,
+            ..
+        } = source
+        {
+            let control = media_control.read().get(id).copied().unwrap_or_default();
+            let Some((_, media)) = media_sources.get_mut(id) else {
+                continue;
+            };
+            if *restart_on_show && visible_ids.contains(id) && !previous_visible.contains(id) {
+                if media.seek(0.0).is_ok() {
+                    // Explizites Replay-on-Show entkraeftet den
+                    // Ended-Latch wie ein Nutzer-Seek.
+                    ended_media.remove(id);
+                }
+                last_failures.remove(&(*id, FailureKind::MediaRead));
+                read_backoff.remove(id);
+            }
+            let requested = media_control
+                .write()
+                .get_mut(id)
+                .and_then(|control| control.seek_seconds.take());
+            if let Some(position) = requested {
+                if let Err(error) = media.seek(position) {
+                    let _ = events.send(EngineEvent::UnsupportedMedia {
+                        source_id: *id,
+                        reason: error.to_string(),
+                    });
+                } else {
+                    // Seek setzt einen haengenden Leserfehler
+                    // zurueck: eine neue identische Stoerung
+                    // wird erneut gemeldet.
+                    last_failures.remove(&(*id, FailureKind::MediaRead));
+                    read_backoff.remove(id);
+                    // MediaState-Dedup verwerfen: der
+                    // naechste Publish meldet das Seek-Ziel
+                    // sofort, auch bei <0,25 s Sprung im
+                    // pausierten Zustand.
+                    last_media_state.remove(id);
+                    // Nutzer-Seek entkraeftet den Ended-Latch
+                    // (Linux: ended = false nach erfolgreichem Seek).
+                    ended_media.remove(id);
+                }
+            }
+            // Beendetes Medium bleibt pausiert, bis der Nutzer explizit
+            // Play oder Seek sendet (Linux-Paritaet: der Neustart nach
+            // natuerlichem Ende laeuft ueber den Ended-Latch, nicht
+            // ueber einen stillen Autoplay — auch nicht nach
+            // Device-Recovery, das die Quelle neu oeffnet).
+            if ended_media.contains(id) {
+                if control.playing {
+                    // Play nach Ende: Neustart von null; scheitert der
+                    // Seek, bleibt der Latch bestehen und der naechste
+                    // Play retryt den Neustart.
+                    match media.seek(0.0) {
+                        Ok(()) => {
+                            ended_media.remove(id);
+                            last_failures.remove(&(*id, FailureKind::MediaRead));
+                            read_backoff.remove(id);
+                            last_media_state.remove(id);
+                        }
+                        Err(error) => {
+                            // Scheiternder Neustart-Seek schreibt den
+                            // Playing-Wunsch zurueck (wie beim EOF):
+                            // nur ein neuer Nutzer-Play retryt den
+                            // Neustart statt eines Versuchs pro Tick.
+                            // Ein zwischenzeitlicher Nutzer-Play hat die
+                            // Epoche erhoeht und wird hier nicht
+                            // ueberschrieben.
+                            let mut bus = media_control.write();
+                            let entry = bus.entry(*id).or_default();
+                            if entry.epoch == control.epoch {
+                                entry.playing = false;
+                            }
+                            let _ = events.send(EngineEvent::UnsupportedMedia {
+                                source_id: *id,
+                                reason: error.to_string(),
+                            });
+                        }
+                    }
+                }
+                if ended_media.contains(id) {
+                    media.set_paused(true);
+                    send_media_state(
+                        events,
+                        last_media_state,
+                        *id,
+                        false,
+                        media.timestamp_100ns() as f64 / 10_000_000.0,
+                    );
+                    continue;
+                }
+            }
+            if !control.playing {
+                // Pausierte Medien liefern keinen neuen Stand:
+                // MediaState nur bei Aenderung senden statt in
+                // jedem Durchlauf. Die Wanduhr friert ein.
+                media.set_paused(true);
+                send_media_state(
+                    events,
+                    last_media_state,
+                    *id,
+                    false,
+                    media.timestamp_100ns() as f64 / 10_000_000.0,
+                );
+                continue;
+            }
+            if visible_ids.contains(id) || *continue_when_hidden {
+                if read_backoff.remove(id) {
+                    // Ein-Tick-Backoff nach Leserfehler: auch
+                    // diese Pause zaehlt nicht als Wiedergabe.
+                    media.set_paused(true);
+                } else {
+                    media.set_paused(false);
+                    match media.read_next() {
+                        Ok(ReadOutcome::Eof) => {
+                            if *looped {
+                                if let Err(error) = media.seek(0.0) {
+                                    // Dauerhaft scheiternder Loop-Seek
+                                    // nicht jeden Tick still retryen:
+                                    // beendet latching (Linux: ended =
+                                    // true, Ring stumm) und den Neustart
+                                    // dem naechsten Play ueberlassen.
+                                    eprintln!("[hooviestar] Loop-Seek fehlgeschlagen: {error}");
+                                    *media.audio_ring.lock() =
+                                        PcmRing::new(SAMPLE_RATE as usize * 2);
+                                    // Ein zwischenzeitlicher Nutzer-Play
+                                    // hat die Epoche erhoeht und wird
+                                    // nicht ueberschrieben.
+                                    let mut bus = media_control.write();
+                                    let entry = bus.entry(*id).or_default();
+                                    if entry.epoch == control.epoch {
+                                        entry.playing = false;
+                                    }
+                                    ended_media.insert(*id);
+                                    send_media_state(
+                                        events,
+                                        last_media_state,
+                                        *id,
+                                        false,
+                                        media.timestamp_100ns() as f64 / 10_000_000.0,
+                                    );
+                                }
+                            } else {
+                                // EOF eines nicht loopenden Mediums:
+                                // einmalig "beendet" melden; read_next
+                                // liefert bis zum naechsten Seek kein
+                                // neues Sample mehr (kein ReadSample).
+                                // Beendet-Wunsch im Bus persistieren
+                                // (Linux: desired_playing = false),
+                                // damit ein Device-Recovery die Quelle
+                                // pausiert neu oeffnet statt das
+                                // fertige Medium spontan neu zu starten.
+                                // Ein zwischenzeitlicher Nutzer-Play hat
+                                // die Epoche erhoeht und wird hier nicht
+                                // ueberschrieben; der Ended-Latch plus
+                                // Gate behandeln den Neustart konsistent.
+                                let mut bus = media_control.write();
+                                let entry = bus.entry(*id).or_default();
+                                if entry.epoch == control.epoch {
+                                    entry.playing = false;
+                                }
+                                ended_media.insert(*id);
+                                send_media_state(
+                                    events,
+                                    last_media_state,
+                                    *id,
+                                    false,
+                                    media.timestamp_100ns() as f64 / 10_000_000.0,
+                                );
+                                last_failures.remove(&(*id, FailureKind::MediaRead));
+                            }
+                        }
+                        Ok(ReadOutcome::Advanced) => {
+                            send_media_state(
+                                events,
+                                last_media_state,
+                                *id,
+                                true,
+                                media.timestamp_100ns() as f64 / 10_000_000.0,
+                            );
+                            last_failures.remove(&(*id, FailureKind::MediaRead));
+                        }
+                        Ok(ReadOutcome::Paced) => {
+                            // Pufferziel erreicht bzw. Video der
+                            // Wanduhr voraus: kein Standwechsel und
+                            // bewusst kein EOF (ein Loop wuerde
+                            // sonst jede Sekunde neu starten).
+                        }
+                        Err(error) => {
+                            read_backoff.insert(*id);
+                            let reason = error.to_string();
+                            let changed = should_report_failure(
+                                last_failures,
+                                *id,
+                                FailureKind::MediaRead,
+                                &reason,
+                            );
+                            if changed {
+                                let _ = events.send(EngineEvent::UnsupportedMedia {
+                                    source_id: *id,
+                                    reason,
+                                });
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Unsichtbar ohne continue_when_hidden: Uhr
+                // anhalten, damit das Resuemee nicht vorspringt.
+                media.set_paused(true);
+            }
+        }
+    }
+    *previous_visible = visible_ids;
+}
+
+/// Renderfehler (z.B. D2DERR_RECREATE_TARGET nach TDR) beendet den
+/// Thread nicht: Geraeteabhaengigen Zustand neu aufbauen und
+/// weiterlaufen. Rueckgabe `true`: endgueltig aufgegeben, der
+/// Aufrufer beendet die Schleife.
+fn recover_after_render_error(
+    error: &WindowsVideoError,
+    surfaces: NativeSurfaces,
+    output: &OutputConfig,
+    compositor: &mut D3d11Compositor,
+    media_context: &mut Option<MediaFoundationContext>,
+    mf_last_error: &mut Option<String>,
+    media_sources: &mut HashMap<Uuid, (String, MediaVideoSource)>,
+    last_media_state: &mut HashMap<Uuid, (bool, f64)>,
+    last_failures: &mut HashMap<(Uuid, FailureKind), String>,
+    read_backoff: &mut HashSet<Uuid>,
+    captures: &mut HashMap<Uuid, WindowCapture>,
+    frames: &mut HashMap<Uuid, D3d11CapturedFrame>,
+    stale_windows: &mut HashSet<Uuid>,
+    display_captures: &mut HashMap<Uuid, DisplayCapture>,
+    image_textures: &mut HashMap<Uuid, (String, ID3D11Texture2D)>,
+    previous_visible: &mut HashSet<Uuid>,
+    recovery_streak: &mut u32,
+    rendered_frames_since_recovery: &mut u32,
+    last_source_sync: &mut Instant,
+    thread_stop: &AtomicBool,
+    events: &mpsc::Sender<EngineEvent>,
+) -> bool {
+    // Jeder Eingriff zaehlt — unabhaengig vom Create-Ausgang: Eine
+    // Flatter-Serie (Create gelingt, Rendern scheitert weiter) muss
+    // ueber Backoff abgebremst werden und am Streak-Limit terminieren.
+    *recovery_streak += 1;
+    *rendered_frames_since_recovery = 0;
+    let _ = events.send(EngineEvent::DeviceRecovery {
+        phase: DeviceRecoveryPhase::Started,
+        detail: Some(error.to_string()),
+    });
+    clear_device_tied_state(
+        media_sources,
+        last_media_state,
+        last_failures,
+        read_backoff,
+        media_context,
+        captures,
+        frames,
+        stale_windows,
+        display_captures,
+        image_textures,
+        previous_visible,
+    );
+    *last_source_sync = Instant::now() - Duration::from_secs(2);
+    match D3d11Compositor::create(
+        surfaces.program,
+        surfaces.preview,
+        output.width,
+        output.height,
+    ) {
+        Ok(recreated) => {
+            *compositor = recreated;
+            restart_media_context(media_context, mf_last_error, &compositor.device);
+            let _ = events.send(EngineEvent::DeviceRecovery {
+                phase: DeviceRecoveryPhase::Succeeded,
+                detail: None,
+            });
+            if *recovery_streak > 1 {
+                // Wiederholter Eingriff: auch nach gegluecktem Create
+                // drosseln, sonst flutet eine Flatter-Serie den
+                // Event-Kanal und der Thread rotiert heiss.
+                sleep_backoff(thread_stop, *recovery_streak);
+            }
+            if *recovery_streak >= MAX_RECOVERY_FAILURES {
+                // Endgueltig aufgeben: Terminal-Event, damit
+                // das Frontend 'retryt' von 'Render-Thread
+                // dauerhaft tot' unterscheiden kann.
+                let _ = events.send(EngineEvent::DeviceRecovery {
+                    phase: DeviceRecoveryPhase::Failed,
+                    detail: Some(format!(
+                        "Wiederherstellung endgültig aufgegeben: {} Eingriffe in Folge ohne stabilen Frame",
+                        *recovery_streak
+                    )),
+                });
+                return true;
+            }
+        }
+        Err(create_error) => {
+            let _ = events.send(EngineEvent::DeviceRecovery {
+                phase: DeviceRecoveryPhase::Failed,
+                detail: Some(create_error.to_string()),
+            });
+            if *recovery_streak >= MAX_RECOVERY_FAILURES {
+                // Endgueltig aufgeben: Terminal-Event, damit
+                // das Frontend 'retryt' von 'Render-Thread
+                // dauerhaft tot' unterscheiden kann.
+                let _ = events.send(EngineEvent::DeviceRecovery {
+                    phase: DeviceRecoveryPhase::Failed,
+                    detail: Some(format!(
+                        "Wiederherstellung endgültig aufgegeben nach {} fehlgeschlagenen Versuchen",
+                        MAX_RECOVERY_FAILURES
+                    )),
+                });
+                return true;
+            }
+            sleep_backoff(thread_stop, *recovery_streak);
+        }
+    }
+    false
+}
+
+/// Backoff-Dauer nach fehlgeschlagener Recovery: 200ms je Fehlschlag,
+/// max. 2s.
+fn backoff_duration(failures: u32) -> Duration {
+    Duration::from_millis(200)
+        .saturating_mul(failures)
+        .min(Duration::from_secs(2))
+}
+
+/// Backoff nach fehlgeschlagener Recovery: durch Shutdown unterbrechbar
+/// — der Thread rotiert nie heiss.
+fn sleep_backoff(stop: &AtomicBool, failures: u32) {
+    let deadline = Instant::now() + backoff_duration(failures);
+    while Instant::now() < deadline && !stop.load(Ordering::Acquire) {
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Fehlerart fuer das Transition-Dedup von Failure-Events: identische
+/// Meldungen pro (Quelle, Art) werden nur einmal gesendet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+enum FailureKind {
+    MediaOpen,
+    MediaRead,
+    Image,
+    Display,
+    Window,
+}
+
+/// True, wenn ein Failure-Event gesendet werden soll: identische
+/// Fehlermeldungen werden unterdrueckt, bis Erfolg oder Recovery den
+/// Eintrag loescht.
+fn should_report_failure(
+    failures: &mut HashMap<(Uuid, FailureKind), String>,
+    source_id: Uuid,
+    kind: FailureKind,
+    reason: &str,
+) -> bool {
+    if failures.get(&(source_id, kind)).map(String::as_str) == Some(reason) {
+        return false;
+    }
+    failures.insert((source_id, kind), reason.to_string());
+    true
+}
+
+/// MediaState nur bei Aenderung senden: ein Wechsel von `playing` geht
+/// sofort raus, Positionsfortschritt ist auf 0,25 s quantisiert, damit
+/// Wiedergabe nicht pro Frame ein Event erzeugt.
+fn send_media_state(
+    events: &mpsc::Sender<EngineEvent>,
+    last_media_state: &mut HashMap<Uuid, (bool, f64)>,
+    source_id: Uuid,
+    playing: bool,
+    position_seconds: f64,
+) {
+    const POSITION_EVENT_STEP_SECONDS: f64 = 0.25;
+    let changed = match last_media_state.get(&source_id).copied() {
+        None => true,
+        Some((last_playing, last_position)) => {
+            playing != last_playing
+                || (position_seconds - last_position).abs() >= POSITION_EVENT_STEP_SECONDS
+        }
+    };
+    if changed {
+        last_media_state.insert(source_id, (playing, position_seconds));
+        let _ = events.send(EngineEvent::MediaState {
+            source_id,
+            state: crate::engine::MediaRuntimeState {
+                playing,
+                position_seconds,
+                duration_seconds: None,
+            },
+        });
+    }
+}
+
+/// Rotationsreihenfolge der Quell-Synchronisierer pro Sync-Tick: alle
+/// vier teilen sich das Erstellungs-Budget des Ticks; die rotierende
+/// Reihenfolge verhindert dauerhafte Bevorzugung eines Quelltyps.
+#[derive(Clone, Copy)]
+enum SyncPass {
+    Window,
+    Display,
+    Images,
+    Media,
+}
+
 fn synchronize_media(
     project: &ProjectV1,
     context: &MediaFoundationContext,
     events: &mpsc::Sender<EngineEvent>,
     media_audio: &MediaAudioBus,
     sources: &mut HashMap<Uuid, (String, MediaVideoSource)>,
+    failures: &mut HashMap<(Uuid, FailureKind), String>,
+    creations: &mut u32,
 ) {
     let desired: HashMap<Uuid, &str> = project
         .sources
@@ -1141,6 +1849,12 @@ fn synchronize_media(
         {
             continue;
         }
+        if *creations > 0 {
+            // Hoechstens eine teure Quell-Neuanlage pro Sync-Tick:
+            // Fehlschlaege retryen im naechsten Tick, nicht im selben.
+            continue;
+        }
+        *creations += 1;
         let ring = media_audio
             .lock()
             .entry(source_id)
@@ -1149,13 +1863,14 @@ fn synchronize_media(
         match context.open_video(Path::new(path), ring) {
             Ok(source) => {
                 sources.insert(source_id, (path.to_string(), source));
+                failures.remove(&(source_id, FailureKind::MediaOpen));
                 let _ = events.send(EngineEvent::SourceAvailable { source_id });
             }
             Err(error) => {
-                let _ = events.send(EngineEvent::UnsupportedMedia {
-                    source_id,
-                    reason: error.to_string(),
-                });
+                let reason = error.to_string();
+                if should_report_failure(failures, source_id, FailureKind::MediaOpen, &reason) {
+                    let _ = events.send(EngineEvent::UnsupportedMedia { source_id, reason });
+                }
             }
         }
     }
@@ -1166,6 +1881,8 @@ fn synchronize_images(
     device: &D3d11Device,
     events: &mpsc::Sender<EngineEvent>,
     textures: &mut HashMap<Uuid, (String, ID3D11Texture2D)>,
+    failures: &mut HashMap<(Uuid, FailureKind), String>,
+    creations: &mut u32,
 ) {
     let desired: HashMap<Uuid, &str> = project
         .sources
@@ -1183,16 +1900,23 @@ fn synchronize_images(
         {
             continue;
         }
+        if *creations > 0 {
+            // Hoechstens eine teure Quell-Neuanlage pro Sync-Tick:
+            // Fehlschlaege retryen im naechsten Tick, nicht im selben.
+            continue;
+        }
+        *creations += 1;
         match device.load_image(Path::new(path)) {
             Ok(texture) => {
                 textures.insert(source_id, (path.to_string(), texture));
+                failures.remove(&(source_id, FailureKind::Image));
                 let _ = events.send(EngineEvent::SourceAvailable { source_id });
             }
             Err(error) => {
-                let _ = events.send(EngineEvent::SourceUnavailable {
-                    source_id,
-                    reason: error.to_string(),
-                });
+                let reason = error.to_string();
+                if should_report_failure(failures, source_id, FailureKind::Image, &reason) {
+                    let _ = events.send(EngineEvent::SourceUnavailable { source_id, reason });
+                }
             }
         }
     }
@@ -1203,6 +1927,8 @@ fn synchronize_display_captures(
     device: &D3d11Device,
     events: &mpsc::Sender<EngineEvent>,
     captures: &mut HashMap<Uuid, DisplayCapture>,
+    failures: &mut HashMap<(Uuid, FailureKind), String>,
+    creations: &mut u32,
 ) {
     let desired: HashMap<Uuid, &DisplayBinding> = project
         .sources
@@ -1217,16 +1943,23 @@ fn synchronize_display_captures(
         if captures.contains_key(&source_id) {
             continue;
         }
+        if *creations > 0 {
+            // Hoechstens eine teure Quell-Neuanlage pro Sync-Tick:
+            // Fehlschlaege retryen im naechsten Tick, nicht im selben.
+            continue;
+        }
+        *creations += 1;
         match DisplayCapture::create(device, binding) {
             Ok(capture) => {
                 captures.insert(source_id, capture);
+                failures.remove(&(source_id, FailureKind::Display));
                 let _ = events.send(EngineEvent::SourceAvailable { source_id });
             }
             Err(error) => {
-                let _ = events.send(EngineEvent::SourceUnavailable {
-                    source_id,
-                    reason: error.to_string(),
-                });
+                let reason = error.to_string();
+                if should_report_failure(failures, source_id, FailureKind::Display, &reason) {
+                    let _ = events.send(EngineEvent::SourceUnavailable { source_id, reason });
+                }
             }
         }
     }
@@ -1239,6 +1972,8 @@ fn synchronize_window_captures(
     events: &mpsc::Sender<EngineEvent>,
     captures: &mut HashMap<Uuid, WindowCapture>,
     frames: &mut HashMap<Uuid, D3d11CapturedFrame>,
+    failures: &mut HashMap<(Uuid, FailureKind), String>,
+    creations: &mut u32,
 ) {
     let desired: HashMap<Uuid, &crate::project::WindowBinding> = project
         .sources
@@ -1256,19 +1991,26 @@ fn synchronize_window_captures(
         if captures.contains_key(&source_id) {
             continue;
         }
+        if *creations > 0 {
+            // Hoechstens eine teure Quell-Neuanlage pro Sync-Tick:
+            // Fehlschlaege retryen im naechsten Tick, nicht im selben.
+            continue;
+        }
+        *creations += 1;
         let capture = crate::discovery::windows::resolve_window(binding, &excluded)
             .map_err(WindowsVideoError::SourceUnavailable)
-            .and_then(|window| WindowCapture::start(device, source_id, window));
+            .and_then(|window| WindowCapture::start(device, window));
         match capture {
             Ok(capture) => {
                 captures.insert(source_id, capture);
+                failures.remove(&(source_id, FailureKind::Window));
                 let _ = events.send(EngineEvent::SourceAvailable { source_id });
             }
             Err(error) => {
-                let _ = events.send(EngineEvent::SourceUnavailable {
-                    source_id,
-                    reason: error.to_string(),
-                });
+                let reason = error.to_string();
+                if should_report_failure(failures, source_id, FailureKind::Window, &reason) {
+                    let _ = events.send(EngineEvent::SourceUnavailable { source_id, reason });
+                }
             }
         }
     }
@@ -1304,8 +2046,6 @@ fn parse_hex_color(value: &str) -> [f32; 4] {
 }
 
 pub struct D3d11CapturedFrame {
-    pub source_id: Uuid,
-    pub sequence: u64,
     pub texture: ID3D11Texture2D,
     frame: Direct3D11CaptureFrame,
 }
@@ -1329,25 +2069,17 @@ pub struct WindowCapture {
 }
 
 impl WindowCapture {
-    pub fn start(
-        device: &D3d11Device,
-        source_id: Uuid,
-        window: usize,
-    ) -> Result<Self, WindowsVideoError> {
+    pub fn start(device: &D3d11Device, window: usize) -> Result<Self, WindowsVideoError> {
         unsafe { RoInitialize(RO_INIT_MULTITHREADED) }
             .map_err(|error| WindowsVideoError::CaptureApi(error.to_string()))?;
-        let result = Self::start_initialized(device, source_id, window);
+        let result = Self::start_initialized(device, window);
         if result.is_err() {
             unsafe { RoUninitialize() };
         }
         result
     }
 
-    fn start_initialized(
-        device: &D3d11Device,
-        source_id: Uuid,
-        window: usize,
-    ) -> Result<Self, WindowsVideoError> {
+    fn start_initialized(device: &D3d11Device, window: usize) -> Result<Self, WindowsVideoError> {
         if window == 0 {
             return Err(WindowsVideoError::SourceUnavailable(
                 "window handle is null".into(),
@@ -1399,8 +2131,6 @@ impl WindowCapture {
         let callback_latest = latest.clone();
         let last_frame = Arc::new(Mutex::new(None));
         let callback_last_frame = last_frame.clone();
-        let sequence = Arc::new(AtomicU64::new(0));
-        let callback_sequence = sequence.clone();
         let content_size = Arc::new(Mutex::new((size.Width, size.Height)));
         let callback_content_size = content_size.clone();
         let recreating = Arc::new(Mutex::new(()));
@@ -1417,20 +2147,22 @@ impl WindowCapture {
                     let mut last = callback_content_size.lock();
                     if (last.0, last.1) != (content.Width, content.Height)
                         && let Some(_guard) = callback_recreating.try_lock()
+                        && callback_device
+                            .recreate_pool(pool, content.Width, content.Height)
+                            .is_ok()
                     {
+                        // Erst nach erfolgreichem Recreate committen, damit
+                        // der naechste Frame eine fehlgeschlagene Groessen-
+                        // aenderung erneut versucht.
                         *last = (content.Width, content.Height);
-                        callback_device.recreate_pool(pool, content.Width, content.Height);
                     }
                 }
                 let surface = frame.Surface()?;
                 let access = surface.cast::<IDirect3DDxgiInterfaceAccess>()?;
                 let texture = unsafe { access.GetInterface::<ID3D11Texture2D>()? };
-                callback_latest.lock().replace(D3d11CapturedFrame {
-                    source_id,
-                    sequence: callback_sequence.fetch_add(1, Ordering::Relaxed) + 1,
-                    texture,
-                    frame,
-                });
+                callback_latest
+                    .lock()
+                    .replace(D3d11CapturedFrame { texture, frame });
                 *callback_last_frame.lock() = Some(Instant::now());
                 Ok(())
             });
@@ -1598,18 +2330,30 @@ impl MediaFoundationContext {
     pub fn start(device: &D3d11Device) -> Result<Self, WindowsVideoError> {
         unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }
             .map_err(|error| WindowsVideoError::UnsupportedMedia(error.to_string()))?;
-        let mut reset_token = 0;
-        let mut manager = None;
-        if let Err(error) = unsafe { MFCreateDXGIDeviceManager(&mut reset_token, &mut manager) } {
-            let _ = unsafe { MFShutdown() };
-            return Err(WindowsVideoError::UnsupportedMedia(error.to_string()));
+        // MFStartup/MFShutdown sind prozessweit refcounted: Jeder
+        // Fehlerpfad nach dem Startup muss die Referenz wieder ausgleichen,
+        // sonst leckt jede fehlgeschlagene Initialisierung.
+        let setup = || -> Result<IMFDXGIDeviceManager, WindowsVideoError> {
+            let mut reset_token = 0;
+            let mut manager = None;
+            unsafe { MFCreateDXGIDeviceManager(&mut reset_token, &mut manager) }
+                .map_err(|error| WindowsVideoError::UnsupportedMedia(error.to_string()))?;
+            let manager = manager.ok_or_else(|| {
+                WindowsVideoError::UnsupportedMedia(
+                    "Media Foundation returned no DXGI manager".into(),
+                )
+            })?;
+            unsafe { manager.ResetDevice(&device.device, reset_token) }
+                .map_err(|error| WindowsVideoError::UnsupportedMedia(error.to_string()))?;
+            Ok(manager)
+        };
+        match setup() {
+            Ok(manager) => Ok(Self { manager }),
+            Err(error) => {
+                let _ = unsafe { MFShutdown() };
+                Err(error)
+            }
         }
-        let manager = manager.ok_or_else(|| {
-            WindowsVideoError::UnsupportedMedia("Media Foundation returned no DXGI manager".into())
-        })?;
-        unsafe { manager.ResetDevice(&device.device, reset_token) }
-            .map_err(|error| WindowsVideoError::UnsupportedMedia(error.to_string()))?;
-        Ok(Self { manager })
     }
 
     pub fn open_video(
@@ -1671,6 +2415,14 @@ impl MediaFoundationContext {
             audio_ring,
             audio_enabled,
             video_enabled,
+            decoded_video: false,
+            video_ended: false,
+            audio_ended: false,
+            // Uhr startet lazy mit dem ersten read_next: Das Medium kann
+            // lange vor der ersten Sichtbarkeit geoeffnet werden.
+            play_epoch: Instant::now(),
+            play_offset_100ns: 0,
+            clock_paused: true,
         })
     }
 }
@@ -1681,6 +2433,23 @@ impl Drop for MediaFoundationContext {
     }
 }
 
+/// Audio-Nachschubziel pro Medium: 200 ms Ringfuellstand bei 48 kHz. Der
+/// WASAPI-Mixer verbraucht Echtzeit; darunter drohen Underruns, drueber
+/// wächst die A/V-Latenz ungebunden.
+const AUDIO_TARGET_FRAMES: usize = SAMPLE_RATE as usize * 2 / 10;
+/// PTS-Vorlauf fuer den Video-Leseentscheid: 50 ms in 100-ns-Einheiten.
+const VIDEO_LEAD_100NS: i64 = 500_000;
+
+/// Ergebnis eines Lesezyklus: Fortschritt, gepaced (nichts faellig) oder
+/// Stream-Ende. Paced ist bewusst NICHT `false`: Der Aufrufer behandelt
+/// `false` als EOF inklusive Loop-Restart per seek(0).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReadOutcome {
+    Advanced,
+    Paced,
+    Eof,
+}
+
 pub struct MediaVideoSource {
     reader: IMFSourceReader,
     texture: Option<ID3D11Texture2D>,
@@ -1688,21 +2457,77 @@ pub struct MediaVideoSource {
     audio_ring: Arc<Mutex<PcmRing>>,
     audio_enabled: bool,
     video_enabled: bool,
+    // Einmal erfolgreich dekodiert: bleibt ueber einen Seek hinweg
+    // gesetzt (der Seek leert nur die Textur bis zum naechsten
+    // Frame); Reset ausschliesslich beim Neuoeffnen der Quelle.
+    decoded_video: bool,
+    video_ended: bool,
+    audio_ended: bool,
+    play_epoch: Instant,
+    play_offset_100ns: i64,
+    clock_paused: bool,
 }
 
 impl MediaVideoSource {
-    pub fn read_next(&mut self) -> Result<bool, WindowsVideoError> {
-        let video = if self.video_enabled {
-            self.read_video()?
+    pub(crate) fn read_next(&mut self) -> Result<ReadOutcome, WindowsVideoError> {
+        if self.streams_ended() {
+            // Beide Streams am Ende: bis zum naechsten Seek kein
+            // ReadSample mehr — MF liefert sonst jeden Aufruf EOS.
+            return Ok(ReadOutcome::Eof);
+        }
+        let mut advanced = false;
+        if self.video_enabled && self.video_due() {
+            advanced |= self.read_video()?;
+        }
+        if self.audio_enabled {
+            advanced |= self.refill_audio()?;
+        }
+        if advanced {
+            Ok(ReadOutcome::Advanced)
+        } else if self.streams_ended() {
+            // Beide Streams endeten genau in diesem Zyklus.
+            Ok(ReadOutcome::Eof)
         } else {
-            false
-        };
-        let audio = if self.audio_enabled {
-            self.read_audio()?
+            Ok(ReadOutcome::Paced)
+        }
+    }
+
+    fn streams_ended(&self) -> bool {
+        (!self.video_enabled || self.video_ended) && (!self.audio_enabled || self.audio_ended)
+    }
+
+    /// Wanduhr des Mediums in 100-ns-PTS-Einheiten; waehrend Pause eingefroren.
+    fn media_clock_100ns(&self) -> i64 {
+        let elapsed = if self.clock_paused {
+            0
         } else {
-            false
+            (self.play_epoch.elapsed().as_nanos() / 100) as i64
         };
-        Ok(video || audio)
+        self.play_offset_100ns + elapsed
+    }
+
+    /// Pausiert/resumiert die Wanduhr; idempotent, Aufruf in jedem Tick ok.
+    pub fn set_paused(&mut self, paused: bool) {
+        if paused == self.clock_paused {
+            return;
+        }
+        if paused {
+            // Einfrieren: verstrichene Zeit in den Offset konsolidieren.
+            self.play_offset_100ns = self.media_clock_100ns();
+            self.clock_paused = true;
+        } else {
+            self.play_epoch = Instant::now();
+            self.clock_paused = false;
+        }
+    }
+
+    /// Video nur lesen, wenn die Wanduhr den letzten Frame eingeholt hat
+    /// (plus Vorlauf); der erste Frame nach Open/Seek kommt immer sofort.
+    fn video_due(&self) -> bool {
+        if self.texture.is_none() {
+            return true;
+        }
+        self.timestamp_100ns <= self.media_clock_100ns() + VIDEO_LEAD_100NS
     }
 
     fn read_video(&mut self) -> Result<bool, WindowsVideoError> {
@@ -1722,6 +2547,7 @@ impl MediaVideoSource {
         }
         .map_err(|error| WindowsVideoError::UnsupportedMedia(error.to_string()))?;
         let Some(sample) = sample else {
+            self.video_ended = true;
             return Ok(false);
         };
         let buffer = unsafe { sample.GetBufferByIndex(0) }
@@ -1734,11 +2560,41 @@ impl MediaVideoSource {
         unsafe { dxgi.GetResource(&ID3D11Texture2D::IID, &mut raw) }
             .map_err(|error| WindowsVideoError::UnsupportedMedia(error.to_string()))?;
         self.texture = Some(unsafe { ID3D11Texture2D::from_raw(raw) });
+        self.decoded_video = true;
         self.timestamp_100ns = timestamp;
         Ok(true)
     }
 
-    fn read_audio(&mut self) -> Result<bool, WindowsVideoError> {
+    /// Nachschub nach Ringfuellstand (Echtzeit-Verbrauch des WASAPI-Mixers),
+    /// nicht nach Tickrhythmus: fuellt auf bis zum 200-ms-Ziel oder EOF.
+    fn refill_audio(&mut self) -> Result<bool, WindowsVideoError> {
+        let mut advanced = false;
+        let mut idle_probes = 0;
+        while self.audio_ring.lock().filled_frames() < AUDIO_TARGET_FRAMES {
+            match self.read_audio_once()? {
+                None => {
+                    self.audio_ended = true;
+                    break;
+                }
+                Some(0) => {
+                    // Entartete Probe ohne Frames: Schleife begrenzen.
+                    idle_probes += 1;
+                    if idle_probes >= 4 {
+                        break;
+                    }
+                }
+                Some(_) => {
+                    idle_probes = 0;
+                    advanced = true;
+                }
+            }
+        }
+        Ok(advanced)
+    }
+
+    /// Ein ReadSample-Zyklus: None = Stream-Ende, Some(n) = n Stereo-Frames
+    /// in den Ring geschoben (ein Lock-Zyklus pro Sample-Batch).
+    fn read_audio_once(&mut self) -> Result<Option<usize>, WindowsVideoError> {
         let mut stream = 0;
         let mut flags = 0;
         let mut timestamp = 0;
@@ -1755,7 +2611,7 @@ impl MediaVideoSource {
         }
         .map_err(|error| WindowsVideoError::UnsupportedMedia(error.to_string()))?;
         let Some(sample) = sample else {
-            return Ok(false);
+            return Ok(None);
         };
         let buffer = unsafe { sample.ConvertToContiguousBuffer() }
             .map_err(|error| WindowsVideoError::UnsupportedMedia(error.to_string()))?;
@@ -1763,17 +2619,18 @@ impl MediaVideoSource {
         let mut length = 0;
         unsafe { buffer.Lock(&mut data, None, Some(&mut length)) }
             .map_err(|error| WindowsVideoError::UnsupportedMedia(error.to_string()))?;
-        if !data.is_null() && length >= 8 {
+        let frames = if !data.is_null() && length >= 8 {
             let samples =
                 unsafe { std::slice::from_raw_parts(data.cast::<f32>(), length as usize / 4) };
-            let mut ring = self.audio_ring.lock();
-            for frame in samples.chunks_exact(2) {
-                ring.push([frame[0], frame[1]]);
-            }
-        }
+            let stereo_frames = samples.len() / 2;
+            self.audio_ring.lock().push_slice(samples);
+            stereo_frames
+        } else {
+            0
+        };
         unsafe { buffer.Unlock() }
             .map_err(|error| WindowsVideoError::UnsupportedMedia(error.to_string()))?;
-        Ok(true)
+        Ok(Some(frames))
     }
 
     pub fn seek(&mut self, seconds: f64) -> Result<(), WindowsVideoError> {
@@ -1807,11 +2664,20 @@ impl MediaVideoSource {
         }
         self.texture = None;
         self.timestamp_100ns = ticks;
+        self.video_ended = false;
+        self.audio_ended = false;
+        // Wallclock neu aufsetzen: die Wiedergabe gliedert ab `ticks`.
+        self.play_offset_100ns = ticks;
+        self.play_epoch = Instant::now();
         Ok(())
     }
 
     pub fn texture(&self) -> Option<&ID3D11Texture2D> {
         self.texture.as_ref()
+    }
+
+    pub fn decoded_video(&self) -> bool {
+        self.decoded_video
     }
 
     pub fn timestamp_100ns(&self) -> i64 {
@@ -1833,55 +2699,17 @@ impl SceneTextureDescriptor {
         Self {
             width,
             height,
-            format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+            format: FLOAT16_FORMAT.0 as u32,
             render_target: true,
             shader_resource: true,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SwapChainDescriptor {
-    pub buffer_count: u32,
-    pub swap_effect: u32,
-    pub allow_tearing: bool,
-}
-
-impl Default for SwapChainDescriptor {
-    fn default() -> Self {
-        Self {
-            buffer_count: 2,
-            swap_effect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
-            allow_tearing: false,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CaptureKind {
-    WindowGraphicsCapture,
-    DesktopDuplication,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CaptureState {
-    Offline,
-    Starting,
-    Live,
-    Unavailable,
-    Stopped,
-}
-
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 pub enum WindowsVideoError {
     #[error("source unavailable: {0}")]
     SourceUnavailable(String),
-    #[error("protected content cannot be captured")]
-    ProtectedContent,
-    #[error("D3D11 device removed: HRESULT {0:#x}")]
-    DeviceRemoved(i32),
-    #[error("capture state transition is invalid")]
-    InvalidTransition,
     #[error("D3D11 device creation failed: {0}")]
     DeviceCreation(String),
     #[error("invalid Float16 scene texture descriptor")]
@@ -1894,103 +2722,4 @@ pub enum WindowsVideoError {
     UnsupportedImage(String),
     #[error("unsupported media: {0}")]
     UnsupportedMedia(String),
-}
-
-pub struct CaptureSession {
-    pub source_id: Uuid,
-    pub kind: CaptureKind,
-    state: CaptureState,
-    latest: LatestFrame,
-}
-
-impl CaptureSession {
-    pub fn new(source_id: Uuid, kind: CaptureKind) -> Self {
-        Self {
-            source_id,
-            kind,
-            state: CaptureState::Offline,
-            latest: LatestFrame::default(),
-        }
-    }
-
-    pub fn start(&mut self) -> Result<(), WindowsVideoError> {
-        if self.state != CaptureState::Offline && self.state != CaptureState::Unavailable {
-            return Err(WindowsVideoError::InvalidTransition);
-        }
-        self.state = CaptureState::Starting;
-        Ok(())
-    }
-
-    pub fn publish_texture(&mut self, frame: Arc<GpuFrame>) -> Result<(), WindowsVideoError> {
-        if self.state != CaptureState::Starting && self.state != CaptureState::Live {
-            return Err(WindowsVideoError::InvalidTransition);
-        }
-        self.latest.publish(frame);
-        self.state = CaptureState::Live;
-        Ok(())
-    }
-
-    pub fn take_latest(&self) -> Option<Arc<GpuFrame>> {
-        self.latest.take()
-    }
-
-    pub fn unavailable(&mut self, reason: impl Into<String>) -> WindowsVideoError {
-        let _ = self.latest.take();
-        self.state = CaptureState::Unavailable;
-        WindowsVideoError::SourceUnavailable(reason.into())
-    }
-
-    pub fn stop(&mut self) {
-        let _ = self.latest.take();
-        self.state = CaptureState::Stopped;
-    }
-
-    pub fn state(&self) -> CaptureState {
-        self.state
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RecoveryStep {
-    StopCaptureAndMedia,
-    ReleaseResources,
-    CreateDevice,
-    CreateDeviceManager,
-    CreateFramePools,
-    CreateDecoders,
-    CreateSwapchains,
-    RebindScene,
-}
-
-pub const RECOVERY_ORDER: [RecoveryStep; 8] = [
-    RecoveryStep::StopCaptureAndMedia,
-    RecoveryStep::ReleaseResources,
-    RecoveryStep::CreateDevice,
-    RecoveryStep::CreateDeviceManager,
-    RecoveryStep::CreateFramePools,
-    RecoveryStep::CreateDecoders,
-    RecoveryStep::CreateSwapchains,
-    RecoveryStep::RebindScene,
-];
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unavailable_source_drops_queued_texture() {
-        let mut session = CaptureSession::new(Uuid::new_v4(), CaptureKind::WindowGraphicsCapture);
-        session.start().unwrap();
-        session
-            .publish_texture(Arc::new(GpuFrame {
-                source_id: session.source_id,
-                sequence: 1,
-                timestamp_ns: 0,
-                native_texture: 1,
-            }))
-            .unwrap();
-        session.unavailable("minimized");
-        assert!(session.take_latest().is_none());
-        assert_eq!(session.state(), CaptureState::Unavailable);
-    }
 }
