@@ -60,6 +60,22 @@ function stateUnchanged(next: EngineState): boolean {
 }
 function publish(next: EngineState) { state = next; listeners.forEach((listener) => listener()); }
 
+/** Status-Präfixe, die eine Fehlerlage signalisieren (siehe start()). */
+export const STATUS_ERROR_PREFIXES = [
+  "Engine-Fehler:",
+  "Grafikfehler:",
+  "Quelle nicht verfügbar:",
+  "Audiowarnung:",
+  "Medium nicht unterstützt:",
+  "Hotkey-Fehler:",
+  "Engine-Status nicht bestätigt:",
+  "Engine nicht erreichbar:",
+] as const;
+
+/** „error“, solange der sichtbare Status auf eine Fehlerlage zeigt. */
+export function statusTone(status: string): "ok" | "error" {
+  return STATUS_ERROR_PREFIXES.some((prefix) => status.startsWith(prefix)) ? "error" : "ok";
+}
 export const engineStore = {
   subscribe(listener: Listener) { listeners.add(listener); return () => listeners.delete(listener); },
   getSnapshot() { return state; },

@@ -1,6 +1,7 @@
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useMemo, useRef } from "react";
 import type { Source } from "../types";
 import type { ItemAction } from "./SourceInspectorPanel";
+import { useArmedConfirm } from "../hooks/useArmedConfirm";
 import {
   ArrowDownIcon,
   ArrowUpIcon,
@@ -9,7 +10,6 @@ import {
   LockIcon,
   MinusIcon,
   PlusIcon,
-  TrashIcon,
   UnlockIcon,
 } from "./icons";
 
@@ -27,7 +27,7 @@ interface SourcesPanelProps {
   addButtonRef: React.RefObject<HTMLButtonElement | null>;
   onSelectSource: (sourceId: string) => void;
   onAddClick: () => void;
-  onRemoveSource: (sourceId: string) => void;
+  onRemoveSource: (sourceId: string) => void | Promise<void>;
   onItemAction: (itemId: string, action: ItemAction) => void;
 }
 
@@ -61,41 +61,13 @@ function SourcesPanelImpl({
   onRemoveSource,
   onItemAction,
 }: SourcesPanelProps) {
-  const [armed, setArmed] = useState(false);
   const minusButtonRef = useRef<HTMLButtonElement>(null);
-  const trashButtonRef = useRef<HTMLButtonElement>(null);
-
-  // Auswahlwechsel entschärft eine offene Löschbestätigung.
-  useEffect(() => {
-    setArmed(false);
-  }, [selectedSourceId]);
-
-  // Klick außerhalb der Entfernen-Knöpfe entschärft die Bestätigung wieder.
-  useEffect(() => {
-    if (!armed) return;
-    const disarmOutside = (event: PointerEvent) => {
-      if (!(event.target instanceof Node)) return;
-      if (
-        minusButtonRef.current?.contains(event.target) ||
-        trashButtonRef.current?.contains(event.target)
-      ) {
-        return;
-      }
-      setArmed(false);
-    };
-    window.addEventListener("pointerdown", disarmOutside);
-    return () => window.removeEventListener("pointerdown", disarmOutside);
-  }, [armed]);
-
-  const handleRemoveClick = () => {
-    if (!selectedSourceId) return;
-    if (!armed) {
-      setArmed(true);
-      return;
-    }
-    setArmed(false);
-    onRemoveSource(selectedSourceId);
-  };
+  const removeTriggerRefs = useMemo(() => [minusButtonRef], []);
+  // Geteilte Zwei-Klick-Entfernung: Auswahlwechsel, Klick außerhalb und
+  // Escape entschärfen; während der Bestätigung werden weitere Klicks ignoriert.
+  const { armed, trigger: handleRemoveClick } = useArmedConfirm(() => {
+    if (selectedSourceId) onRemoveSource(selectedSourceId);
+  }, selectedSourceId, removeTriggerRefs);
 
   const removeClassName = armed ? "icon-button armed" : "icon-button";
   const removeTitle = armed ? "Erneut klicken zum Entfernen" : "Ausgewählte Quelle entfernen";
@@ -123,16 +95,6 @@ function SourcesPanelImpl({
             onClick={handleRemoveClick}
           >
             <MinusIcon />
-          </button>
-          <button
-            ref={trashButtonRef}
-            type="button"
-            className={removeClassName}
-            title={removeTitle}
-            disabled={!selectedSourceId}
-            onClick={handleRemoveClick}
-          >
-            <TrashIcon />
           </button>
         </div>
       </div>

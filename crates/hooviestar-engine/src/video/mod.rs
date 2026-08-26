@@ -60,9 +60,6 @@ impl LatestFrame {
     pub fn take(&self) -> Option<Arc<GpuFrame>> {
         self.slot.lock().take()
     }
-    pub fn depth(&self) -> usize {
-        usize::from(self.slot.lock().is_some())
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -99,23 +96,21 @@ pub fn item_vertices(transform: Transform) -> ItemVertices {
 mod tests {
     use super::*;
     #[test]
-    fn latest_depth_never_exceeds_one() {
+    fn latest_slot_holds_single_frame() {
         let slot = LatestFrame::default();
         let id = Uuid::new_v4();
         for sequence in 0..10 {
-            slot.publish(Arc::new(GpuFrame {
+            let previous = slot.publish(Arc::new(GpuFrame {
                 source_id: id,
                 sequence,
                 timestamp_ns: 0,
                 native_texture: 1,
             }));
-            assert_eq!(slot.depth(), 1)
+            assert_eq!(previous.is_some(), sequence > 0);
         }
         assert_eq!(slot.take().unwrap().sequence, 9);
-        assert_eq!(slot.depth(), 0)
+        assert!(slot.take().is_none());
     }
-
-    // MediaControl-Standard: Wiedergabe laeuft sofort, keine anstehende Suche, Epoche null.
     #[test]
     fn default_starts_playing_without_seek() {
         let control = MediaControl::default();
@@ -185,5 +180,37 @@ mod tests {
             assert!((vs[i][0] - (vb[i][0] - 16384.0)).abs() < 1e-2);
             assert!((vs[i][1] - (vb[i][1] + 32768.0)).abs() < 1e-2);
         }
+    }
+    /// Rueckschreib-Protokoll der Render-Threads: Eine Bus-Rueckschreibung
+    /// mit aelterer Epoche darf ein unter neuer Epoche gesetztes
+    /// playing=true nicht ueberschreiben; nur bei passender Epoche greift
+    /// das Guard-Muster `if entry.epoch == control.epoch { .. }`.
+    #[test]
+    fn stale_media_writeback_cannot_overwrite_newer_epoch() {
+        let bus = media_control_bus();
+        let id = Uuid::new_v4();
+        // Render-Thread sichert den Stand VOR dem User-Eingriff.
+        let stale_control = *bus.write().entry(id).or_default();
+        assert!(stale_control.playing);
+        // User-Play wie command(): Epoche erhoehen, dann playing setzen.
+        {
+            let mut guard = bus.write();
+            let entry = guard.get_mut(&id).unwrap();
+            entry.epoch = entry.epoch.wrapping_add(1);
+            entry.playing = true;
+        }
+        // Veraltete Rueckschreibung nach fehlgeschlagenem Restart-Seek:
+        // Epoche passt nicht -> der Play-Wunsch bleibt erhalten.
+        if bus.read().get(&id).unwrap().epoch == stale_control.epoch {
+            bus.write().get_mut(&id).unwrap().playing = false;
+        }
+        assert!(bus.read().get(&id).unwrap().playing);
+        // Frischer Snapshot nach dem Play: passende Epoche -> Rueckschreibung greift.
+        let fresh_control = *bus.read().get(&id).unwrap();
+        assert_ne!(fresh_control.epoch, stale_control.epoch);
+        if bus.read().get(&id).unwrap().epoch == fresh_control.epoch {
+            bus.write().get_mut(&id).unwrap().playing = false;
+        }
+        assert!(!bus.read().get(&id).unwrap().playing);
     }
 }

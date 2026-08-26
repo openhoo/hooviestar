@@ -1,5 +1,6 @@
 import { memo } from "react";
 import type { OutputConfig } from "../types";
+import { isWindowsPlatform } from "../platform";
 
 interface PreviewPanelProps {
   output: OutputConfig;
@@ -22,7 +23,7 @@ function PreviewPanelImpl({ output, activeSceneName, onAttachBounds }: PreviewPa
         >
           <div className="preview-placeholder">
             <strong>{activeSceneName}</strong>
-            <span>{navigator.platform.toLowerCase().includes("win") ? "Native D3D11-Vorschau" : "Separates Vulkan-Preview-Fenster"}</span>
+            <span>{isWindowsPlatform() ? "Native D3D11-Vorschau" : "Separates Vulkan-Preview-Fenster"}</span>
           </div>
         </div>
       </section>

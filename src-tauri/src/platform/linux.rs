@@ -92,7 +92,7 @@ impl NativePreview {
         ))
     }
 
-    pub fn hwnd(&self) -> usize {
+    pub fn native_handle(&self) -> usize {
         self.pointer
     }
 

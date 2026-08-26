@@ -49,7 +49,7 @@ export type EngineCommand =
   | { type: "remove_scene"; sceneId: Uuid }
   | { type: "rename_scene"; sceneId: Uuid; name: string }
   | { type: "set_active_scene"; sceneId: Uuid }
-  /** Transaktional in der Engine: neuer Hotkey zuerst registrieren. */
+  /** Transaktional im Tauri-Shell (update_scene_hotkey): neuer Hotkey zuerst registrieren, dann committen. */
   | { type: "set_scene_hotkey"; sceneId: Uuid; hotkey: string | null }
   /** Item am Ende der Zeichenreihenfolge (oben) einfügen. */
   | { type: "add_scene_item"; sceneId: Uuid; itemId: Uuid; sourceId: Uuid; transform: Transform }

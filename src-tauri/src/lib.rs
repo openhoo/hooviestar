@@ -179,9 +179,21 @@ fn engine_status(app: tauri::AppHandle, state: State<'_, AppState>) -> &'static 
     // Der Webview haengt seinen Listener vor diesem Aufruf an (engineStore
     // start(): listen() vor engine_status), darum gehen hier verpasste
     // Ereignisse direkt an den selben Emit-Pfad wie der Forwarder-Thread.
-    for event in &events {
+    for (index, event) in events.iter().enumerate() {
         if let Err(error) = app.emit("engine-event", event) {
             eprintln!("[hooviestar] failed to emit replayed engine event: {error}");
+            let mut pending_guard = state
+                .inner()
+                .pending_events
+                .lock()
+                .expect("pending event mutex poisoned");
+            // Nicht emittierte Ereignisse vor den zwischenzeitlich
+            // eingetroffenen wieder einreihen; die Reihenfolge bleibt
+            // erhalten und events_ready bleibt gesetzt.
+            let mut requeued = events[index..].to_vec();
+            requeued.extend(pending_guard.drain(..));
+            *pending_guard = requeued;
+            break;
         }
     }
     "running"
@@ -204,15 +216,15 @@ async fn canonicalize_file(path: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let canonical = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
         if !canonical.is_file() {
-            return Err("selected path is not a regular file".into());
+            return Err("Ausgewählter Pfad ist keine reguläre Datei".into());
         }
         canonical
             .into_os_string()
             .into_string()
-            .map_err(|_| "selected path is not valid Unicode".to_string())
+            .map_err(|_| "Ausgewählter Pfad ist kein gültiger Unicode-Pfad".to_string())
     })
     .await
-    .map_err(|error| format!("canonicalize_file task failed: {error}"))?
+    .map_err(|error| format!("Pfadprüfung fehlgeschlagen: {error}"))?
 }
 
 #[tauri::command]
@@ -226,7 +238,7 @@ fn set_preview_bounds(
 ) -> Result<(), String> {
     let studio = app
         .get_webview_window("studio")
-        .ok_or_else(|| "Studio window unavailable".to_string())?;
+        .ok_or_else(|| "Studio-Fenster nicht verfügbar".to_string())?;
     let scale = studio.scale_factor().map_err(|error| error.to_string())?;
     let physical = |value: f64| (value * scale).round() as i32;
     platform::set_preview_bounds(
@@ -266,7 +278,7 @@ pub fn run() {
                 .map_err(|error| error.to_string())?;
             spawn_audio_watchdog()?;
             let (preview, surfaces) = NativePreview::create(&studio, &program)?;
-            let preview_handle = preview.hwnd();
+            let preview_handle = preview.native_handle();
             let engine = Arc::new(
                 EngineHandle::start(surfaces, OutputConfig::default())
                     .map_err(|error| error.to_string())?,
@@ -465,7 +477,7 @@ fn update_scene_hotkey(
         .scenes
         .into_iter()
         .find(|scene| scene.id == scene_id)
-        .ok_or_else(|| "scene not found".to_string())?
+        .ok_or_else(|| "Szene nicht gefunden".to_string())?
         .hotkey;
     if old_shortcut == new_shortcut {
         // Identisches Neu-Speichern ist nur dann ein No-op, wenn die
@@ -476,13 +488,6 @@ fn update_scene_hotkey(
             && let Err(error) = register_hotkey(app, engine.clone(), scene_id, shortcut)
         {
             let message = format!("{shortcut}: {error}");
-            let _ = app.emit(
-                "engine-event",
-                EngineEvent::HotkeyError {
-                    scene_id,
-                    message: message.clone(),
-                },
-            );
             return Err(message);
         }
         return Ok(());
@@ -492,13 +497,6 @@ fn update_scene_hotkey(
         && let Err(error) = register_hotkey(app, engine.clone(), scene_id, shortcut)
     {
         let message = format!("{shortcut}: {error}");
-        let _ = app.emit(
-            "engine-event",
-            EngineEvent::HotkeyError {
-                scene_id,
-                message: message.clone(),
-            },
-        );
         return Err(message);
     }
     if let Some(shortcut) = &old_shortcut {
@@ -536,8 +534,10 @@ fn register_hotkey(
 ) -> Result<(), String> {
     app.global_shortcut()
         .on_shortcut(shortcut, move |_app, _shortcut, event| {
-            if event.state == ShortcutState::Pressed {
-                let _ = engine.command(EngineCommand::SetActiveScene { scene_id });
+            if event.state == ShortcutState::Pressed
+                && let Err(error) = engine.command(EngineCommand::SetActiveScene { scene_id })
+            {
+                eprintln!("[hooviestar] hotkey scene switch failed for {scene_id}: {error}");
             }
         })
         .map_err(|error| error.to_string())

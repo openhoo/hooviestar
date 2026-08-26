@@ -562,6 +562,7 @@ fn run_pipewire(
     if stop.load(Ordering::Acquire) {
         drop(setup_lock);
         thread_loop.stop();
+        let _ = ready.send(Ok(()));
         return Ok(());
     }
     let context =
@@ -569,6 +570,7 @@ fn run_pipewire(
     if stop.load(Ordering::Acquire) {
         drop(setup_lock);
         thread_loop.stop();
+        let _ = ready.send(Ok(()));
         return Ok(());
     }
     let core = context
@@ -577,6 +579,7 @@ fn run_pipewire(
     if stop.load(Ordering::Acquire) {
         drop(setup_lock);
         thread_loop.stop();
+        let _ = ready.send(Ok(()));
         return Ok(());
     }
     let registry = core.get_registry_rc().map_err(|error| error.to_string())?;

@@ -1318,37 +1318,44 @@ fn pump_window_frames(
                             source_id: item.source_id,
                         });
                     }
-                } else if capture.is_stale(Duration::from_millis(750)) {
-                    // WGC liefert Frames nur bei sichtbarer Aenderung des
-                    // Fensters. Ein statisches Fenster bleibt daher ohne
-                    // neue Frames, ist aber nicht offline: Solange mindestens
-                    // ein Frame angekommen ist, bleibt der letzte Texturstand
-                    // in `frames` und wird weitergerendert. Erst ein
-                    // GraphicsCaptureItem.Closed-Signal oder eine nie
-                    // gelieferte Captive gilt als offline.
-                    if !capture.has_delivered() || capture.is_closed() {
-                        frames.remove(&item.source_id);
-                        if stale_windows.insert(item.source_id) {
-                            let reason = if capture.is_closed() {
-                                "Fenster wurde geschlossen"
-                            } else {
-                                "Fenster liefert keine Live-Frames"
-                            };
-                            let _ = events.send(EngineEvent::SourceUnavailable {
-                                source_id: item.source_id,
-                                reason: reason.into(),
-                            });
-                        }
-                        if capture.is_closed() {
-                            // Geschlossene Captive entsorgen; der
-                            // naechste synchronize_window_captures-Lauf
-                            // baut sie neu auf, sobald wieder ein
-                            // passendes Fenster existiert.
-                            closed_windows.push(item.source_id);
-                            // Die Verfuegbarkeits-Vormerkung gehoert zur
-                            // alten Captive; der Neuaufbau meldet den
-                            // Uebergang zurueck zu verfuegbar selbst.
-                            stale_windows.remove(&item.source_id);
+                } else {
+                    // Kein neuer Frame: ein vorgemerktes, fehlgeschlagenes
+                    // Pool-Recreate hier nachholen — statische Fenster
+                    // liefern sonst nie den Anlass dafuer. Nur der Render-
+                    // Thread ruft das auf, niemals der WGC-Callback.
+                    capture.retry_resize();
+                    if capture.is_stale(Duration::from_millis(750)) {
+                        // WGC liefert Frames nur bei sichtbarer Aenderung des
+                        // Fensters. Ein statisches Fenster bleibt daher ohne
+                        // neue Frames, ist aber nicht offline: Solange mindestens
+                        // ein Frame angekommen ist, bleibt der letzte Texturstand
+                        // in `frames` und wird weitergerendert. Erst ein
+                        // GraphicsCaptureItem.Closed-Signal oder eine nie
+                        // gelieferte Captive gilt als offline.
+                        if !capture.has_delivered() || capture.is_closed() {
+                            frames.remove(&item.source_id);
+                            if stale_windows.insert(item.source_id) {
+                                let reason = if capture.is_closed() {
+                                    "Fenster wurde geschlossen"
+                                } else {
+                                    "Fenster liefert keine Live-Frames"
+                                };
+                                let _ = events.send(EngineEvent::SourceUnavailable {
+                                    source_id: item.source_id,
+                                    reason: reason.into(),
+                                });
+                            }
+                            if capture.is_closed() {
+                                // Geschlossene Captive entsorgen; der
+                                // naechste synchronize_window_captures-Lauf
+                                // baut sie neu auf, sobald wieder ein
+                                // passendes Fenster existiert.
+                                closed_windows.push(item.source_id);
+                                // Die Verfuegbarkeits-Vormerkung gehoert zur
+                                // alten Captive; der Neuaufbau meldet den
+                                // Uebergang zurueck zu verfuegbar selbst.
+                                stale_windows.remove(&item.source_id);
+                            }
                         }
                     }
                 }
@@ -2082,6 +2089,10 @@ pub struct WindowCapture {
     latest: Arc<Mutex<Option<D3d11CapturedFrame>>>,
     last_frame: Arc<Mutex<Option<Instant>>>,
     closed: Arc<AtomicBool>,
+    winrt_device: SendDirect3DDevice,
+    content_size: Arc<Mutex<(i32, i32)>>,
+    recreating: Arc<Mutex<()>>,
+    pending_size: Arc<Mutex<Option<(i32, i32)>>>,
     created_at: Instant,
     ro_initialized: bool,
     _thread_affinity: PhantomData<Rc<()>>,
@@ -2154,6 +2165,8 @@ impl WindowCapture {
         let callback_content_size = content_size.clone();
         let recreating = Arc::new(Mutex::new(()));
         let callback_recreating = recreating.clone();
+        let pending_size: Arc<Mutex<Option<(i32, i32)>>> = Arc::new(Mutex::new(None));
+        let callback_pending_size = pending_size.clone();
         let callback_device = SendDirect3DDevice(winrt_device.clone());
         let handler =
             TypedEventHandler::<Direct3D11CaptureFramePool, IInspectable>::new(move |sender, _| {
@@ -2166,14 +2179,23 @@ impl WindowCapture {
                     let mut last = callback_content_size.lock();
                     if (last.0, last.1) != (content.Width, content.Height)
                         && let Some(_guard) = callback_recreating.try_lock()
-                        && callback_device
+                    {
+                        if callback_device
                             .recreate_pool(pool, content.Width, content.Height)
                             .is_ok()
-                    {
-                        // Erst nach erfolgreichem Recreate committen, damit
-                        // der naechste Frame eine fehlgeschlagene Groessen-
-                        // aenderung erneut versucht.
-                        *last = (content.Width, content.Height);
+                        {
+                            // Erst nach erfolgreichem Recreate committen, damit
+                            // der naechste Frame eine fehlgeschlagene Groessen-
+                            // aenderung erneut versucht.
+                            *last = (content.Width, content.Height);
+                            *callback_pending_size.lock() = None;
+                        } else {
+                            // Fehlgeschlagenes Recreate vormerken: Statische
+                            // Fenster liefern keinen Folgeframe, daher holt
+                            // der Render-Thread den Versuch per retry_resize
+                            // nach.
+                            *callback_pending_size.lock() = Some((content.Width, content.Height));
+                        }
                     }
                 }
                 let surface = frame.Surface()?;
@@ -2201,14 +2223,39 @@ impl WindowCapture {
             latest,
             last_frame,
             closed,
+            winrt_device: SendDirect3DDevice(winrt_device.clone()),
+            content_size,
+            recreating,
+            pending_size,
             created_at: Instant::now(),
             ro_initialized: true,
             _thread_affinity: PhantomData,
         })
     }
-
     pub fn take_latest(&self) -> Option<D3d11CapturedFrame> {
         self.latest.lock().take()
+    }
+
+    /// Holt ein fehlgeschlagenes Pool-Recreate nach (nur Render-Thread).
+    /// Nimmt denselben Recreate-Guard wie der WGC-Callback; committet die
+    /// neue Groesse weiterhin nur bei Erfolg, die Vormerkung bleibt bei
+    /// Fehler bestehen und wird beim naechsten Tick erneut versucht.
+    pub fn retry_resize(&self) -> bool {
+        let _guard = self.recreating.lock();
+        let Some((width, height)) = *self.pending_size.lock() else {
+            return false;
+        };
+        match self
+            .winrt_device
+            .recreate_pool(&self.frame_pool, width, height)
+        {
+            Ok(()) => {
+                *self.content_size.lock() = (width, height);
+                self.pending_size.lock().take();
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     pub fn is_stale(&self, maximum_age: Duration) -> bool {

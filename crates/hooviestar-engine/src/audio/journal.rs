@@ -142,19 +142,23 @@ fn replace_file(temporary: &Path, path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    fn restore_entry(
+        session_instance_id: &str,
+        process_path: &str,
+        original_mute: bool,
+    ) -> SessionRestoreEntry {
+        SessionRestoreEntry {
+            session_instance_id: session_instance_id.into(),
+            process_path: process_path.into(),
+            original_mute,
+        }
+    }
+
     #[test]
     fn upsert_preserves_original_session_identity() {
         let mut journal = RestoreJournal::default();
-        journal.upsert(SessionRestoreEntry {
-            session_instance_id: "session-1".into(),
-            process_path: "game.exe".into(),
-            original_mute: false,
-        });
-        journal.upsert(SessionRestoreEntry {
-            session_instance_id: "session-1".into(),
-            process_path: "game.exe".into(),
-            original_mute: true,
-        });
+        journal.upsert(restore_entry("session-1", "game.exe", false));
+        journal.upsert(restore_entry("session-1", "game.exe", true));
         assert_eq!(journal.entries.len(), 1);
         assert!(journal.entries[0].original_mute);
     }
@@ -183,16 +187,8 @@ mod tests {
     fn record_remove_round_trip() {
         // Zwei Sessions aufnehmen, eine entfernen - nur die andere bleibt.
         let mut journal = RestoreJournal::default();
-        journal.upsert(SessionRestoreEntry {
-            session_instance_id: "session-1".into(),
-            process_path: "game.exe".into(),
-            original_mute: true,
-        });
-        journal.upsert(SessionRestoreEntry {
-            session_instance_id: "session-2".into(),
-            process_path: "other.exe".into(),
-            original_mute: false,
-        });
+        journal.upsert(restore_entry("session-1", "game.exe", true));
+        journal.upsert(restore_entry("session-2", "other.exe", false));
         journal.remove("session-1");
         assert_eq!(journal.entries.len(), 1);
         assert_eq!(journal.entries[0].session_instance_id, "session-2");
@@ -211,11 +207,7 @@ mod tests {
             .join("deep")
             .join("audio-restore.json");
         let mut journal = RestoreJournal::default();
-        journal.upsert(SessionRestoreEntry {
-            session_instance_id: "session-7".into(),
-            process_path: "/usr/bin/game".into(),
-            original_mute: true,
-        });
+        journal.upsert(restore_entry("session-7", "/usr/bin/game", true));
         journal.save_atomic(&path).unwrap();
         assert_eq!(RestoreJournal::load(&path).unwrap(), journal);
     }

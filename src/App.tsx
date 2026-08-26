@@ -6,6 +6,8 @@ import { engineStore } from "./engineStore";
 import { pipTransform } from "./types";
 import type { EngineCommand, Scene, Source, SourceCandidate, TextSource, Transform } from "./types";
 import { runGuarded } from "./guarded";
+import { useAudioFieldBridge } from "./hooks/useAudioFieldBridge";
+import { isWindowsPlatform } from "./platform";
 import { AddSourceDialog } from "./components/AddSourceDialog";
 import { ScenesPanel } from "./components/ScenesPanel";
 import { PreviewPanel } from "./components/PreviewPanel";
@@ -65,12 +67,17 @@ export default function App() {
   // überlagert, damit ein parallel laufendes update_source sie nicht mit dem
   // Snapshot-Stand zurücküberschreibt.
   const pendingSourceFieldsRef = useRef(new Map<string, Record<string, unknown>>());
-  // IPC-Koaleszierung für Lautstärke/Stumm: ausstehende Befehle je Quelle+Feld,
-  // geflusht einmal pro Animation-Frame (letzter Schreibzugriff gewinnt).
-  const audioPendingDispatchRef = useRef(new Map<string, EngineCommand>());
-  const audioFlushFrameRef = useRef<number | null>(null);
+  // Audio-Brücke: IPC-Koaleszierung für Lautstärke/Stumm besitzt die Hook;
+  // das Feld-Overlay (pendingSourceFieldsRef) bleibt hier und wird übergeben.
+  const {
+    audioError,
+    setAudioField,
+    toggleMixerMute,
+    setMixerVolume,
+    pendingField,
+    prunePendingFields,
+  } = useAudioFieldBridge(pendingSourceFieldsRef);
   const [textError, setTextError] = useState<string | null>(null);
-  const [audioError, setAudioError] = useState<string | null>(null);
   const addButton = useRef<HTMLButtonElement>(null);
   // Native-Vorschau: das Element überlebt Projekt-Updates; Beobachter und
   // Meldung werden genau einmal eingerichtet (siehe attachPreviewBounds).
@@ -80,28 +87,12 @@ export default function App() {
   useEffect(() => {
     void engineStore.start();
   }, []);
-  useEffect(() => () => {
-    if (audioFlushFrameRef.current !== null) cancelAnimationFrame(audioFlushFrameRef.current);
-    // Ausstehende Audio-Befehle beim Aushängen synchron flushen, damit die
-    // letzten Lautstärke-/Stumm-Änderungen nicht mit dem rAF verloren gehen.
-    const batch = audioPendingDispatchRef.current;
-    audioPendingDispatchRef.current = new Map();
-    dispatchAudioBatch(batch);
-  }, []);
   useEffect(() => {
     if (!project) return;
-    const pendingBySource = pendingSourceFieldsRef.current;
-    for (const source of project.sources) {
-      const pending = pendingBySource.get(source.id);
-      if (!pending) continue;
-      for (const key of Object.keys(pending)) {
-        if (pending[key] === (source as unknown as Record<string, unknown>)[key]) delete pending[key];
-      }
-      if (Object.keys(pending).length === 0) pendingBySource.delete(source.id);
-    }
+    prunePendingFields(project);
     // Onboarding nur einmal pro Session automatisch öffnen; "Später" bleibt klebrig.
     if (!onboardingDismissedRef.current && project.sources.length === 0) setOnboarding(true);
-  }, [project]);
+  }, [project, prunePendingFields]);
   useEffect(() => () => {
     previewObserverRef.current?.disconnect();
     previewObserverRef.current = null;
@@ -109,7 +100,7 @@ export default function App() {
 
   const reportPreviewBounds = useCallback(() => {
     const preview = previewNodeRef.current;
-    if (!preview || !navigator.platform.toLowerCase().includes("win")) return;
+    if (!preview || !isWindowsPlatform()) return;
     const bounds = preview.getBoundingClientRect();
     void invoke("set_preview_bounds", {
       x: bounds.x,
@@ -126,7 +117,7 @@ export default function App() {
     if (previous === node) return;
     if (previous) previewObserverRef.current?.unobserve(previous);
     previewNodeRef.current = node;
-    if (!node || !navigator.platform.toLowerCase().includes("win")) return;
+    if (!node || !isWindowsPlatform()) return;
     if (!previewObserverRef.current) {
       previewObserverRef.current = new ResizeObserver(() => reportPreviewBounds());
     }
@@ -344,31 +335,6 @@ export default function App() {
     [],
   );
 
-
-  const flushAudioFields = useCallback(() => {
-    audioFlushFrameRef.current = null;
-    const batch = audioPendingDispatchRef.current;
-    if (batch.size === 0) return;
-    audioPendingDispatchRef.current = new Map();
-    dispatchAudioBatch(batch);
-  }, []);
-
-  const setAudioField = useCallback((sourceId: string, field: "volume" | "muted", value: number | boolean) => {
-    const pending = pendingSourceFieldsRef.current.get(sourceId);
-    pendingSourceFieldsRef.current.set(sourceId, { ...pending, [field]: value });
-    // Overlay sofort setzen; der IPC wird pro Animation-Frame koalesziert,
-    // damit Slider-Ticks sich gegenseitig im Pending-Map überschreiben.
-    audioPendingDispatchRef.current.set(
-      `${sourceId}:${field}`,
-      field === "volume"
-        ? { type: "set_audio_volume", sourceId, volume: value as number }
-        : { type: "set_audio_muted", sourceId, muted: value as boolean },
-    );
-    if (audioFlushFrameRef.current === null) {
-      audioFlushFrameRef.current = requestAnimationFrame(flushAudioFields);
-    }
-  }, []);
-
   const closeDialog = useCallback(() => {
     setAddOpen(false);
     requestAnimationFrame(() => addButton.current?.focus());
@@ -394,11 +360,6 @@ export default function App() {
     setTextError(null);
   }, []);
 
-  const pendingField = useCallback(<T,>(sourceId: string, field: string, fallback: T): T => {
-    const pending = pendingSourceFieldsRef.current.get(sourceId)?.[field];
-    return pending == null ? fallback : pending as T;
-  }, []);
-
   const handleTextChange = useCallback((source: TextSource, event: React.ChangeEvent<HTMLTextAreaElement>) => {
     const textarea = event.currentTarget;
     const attempted = textarea.value;
@@ -411,18 +372,6 @@ export default function App() {
       textarea.value = authoritative && authoritative.type === "text" ? authoritative.text : "";
     });
   }, [updateSource]);
-
-  const toggleMixerMute = useCallback((sourceId: string) => {
-    // Snapshot statt Render-Closure: der Kanal kann zwischen Renders verschwunden sein.
-    const source = engineStore.getSnapshot().project?.sources.find((entry) => entry.id === sourceId);
-    if (!source || !("muted" in source)) return;
-    const muted = pendingField(sourceId, "muted", source.muted);
-    setAudioField(sourceId, "muted", !muted);
-  }, [pendingField, setAudioField]);
-
-  const setMixerVolume = useCallback((sourceId: string, volume: number) => {
-    setAudioField(sourceId, "volume", volume);
-  }, [setAudioField]);
 
   // Item-Aktionen lesen den Snapshot zum Aufrufzeitpunkt; Randklicks der
   // relativen Neuanordnung (±1) sind clientseitig stumme No-Ops, sodass die
@@ -453,9 +402,11 @@ export default function App() {
     void runGuarded(() => engineStore.dispatch(command), setItemError);
   }, []);
 
-  const removeScene = useCallback((sceneId: string) => {
-    void runGuarded(() => engineStore.dispatch({ type: "remove_scene", sceneId }), setSceneError);
-  }, []);
+  const removeScene = useCallback(
+    (sceneId: string) =>
+      runGuarded(() => engineStore.dispatch({ type: "remove_scene", sceneId }), setSceneError),
+    [],
+  );
 
   const renameScene = useCallback((sceneId: string, name: string) => {
     void runGuarded(() => engineStore.dispatch({ type: "rename_scene", sceneId, name }), setSceneError);
@@ -467,7 +418,7 @@ export default function App() {
     setSelectedSourceId((current) => (current === sourceId ? null : current));
     setItemError(null);
     setTextError(null);
-    void runGuarded(() => engineStore.dispatch({ type: "remove_source", sourceId }), setItemError);
+    return runGuarded(() => engineStore.dispatch({ type: "remove_source", sourceId }), setItemError);
   }, []);
 
   const quitStudio = useCallback(() => {
@@ -554,31 +505,6 @@ export default function App() {
     return targets;
   }
 
-  // Lautstärke/Stumm laufen über eigene Engine-Befehle statt update_source; damit
-  // ein gleichzeitiges update_source sie nicht mit dem letzten veröffentlichten
-  // Snapshot zurücküberschreibt, durchlaufen sie denselben Overlay-Pfad und
-  // werden vom Feldabgleich in updateSource bestätigt und verworfen.
-  function dispatchAudioBatch(batch: Map<string, EngineCommand>) {
-    for (const [key, command] of batch) {
-      if (command.type !== "set_audio_volume" && command.type !== "set_audio_muted") continue;
-      const value = command.type === "set_audio_volume" ? command.volume : command.muted;
-      void engineStore.dispatch(command).catch((error: unknown) => {
-        // Fehlschlag sichtbar machen und das Overlay selbst heilen lassen:
-        // der Pending-Eintrag fällt weg, sofern nicht inzwischen ein neuerer
-        // Wert geschrieben wurde (dann bleibt dessen Optimistik erhalten).
-        const separator = key.lastIndexOf(":");
-        const sourceId = key.slice(0, separator);
-        const field = key.slice(separator + 1);
-        const pending = pendingSourceFieldsRef.current.get(sourceId);
-        if (pending && Object.is(pending[field], value)) {
-          delete pending[field];
-          if (Object.keys(pending).length === 0) pendingSourceFieldsRef.current.delete(sourceId);
-        }
-        setAudioError(String(error));
-      });
-    }
-  }
-
   return (
     <main className="studio">
       <header className="topbar">
@@ -631,13 +557,11 @@ export default function App() {
           onToggleMute={toggleMixerMute}
         />
         <SourceInspectorPanel
-          selectedSourceId={selectedSourceId}
           selectedSource={selectedSource}
           selectedItem={selectedItem}
           mediaState={selectedMediaState}
           itemError={itemError}
           textError={textError}
-          onSelectSource={selectSource}
           onItemAction={runItemAction}
           onTextChange={handleTextChange}
           onAudioField={setAudioField}

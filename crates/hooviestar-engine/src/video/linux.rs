@@ -36,6 +36,12 @@ use uuid::Uuid;
 /// value asks PipeWire to fixate the modifier when the producer can export one.
 pub const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 
+/// Stable terminal reason for a lost portal transport: no usable PipeWire
+/// core and no fresh remote fd remain. The renderer latches sources that
+/// report exactly this string until a new selection (generation switch)
+/// arrives; do not reword it without updating the renderer side.
+pub const PORTAL_LOST_REASON: &str = "Portal-Verbindung nicht verfügbar – Quelle neu auswählen";
+
 /// A stream returned by the portal.  `id` is the portal stream id (when the
 /// compositor provides one), while `mapping_id` identifies the selected
 /// window/monitor across the response.
@@ -423,9 +429,12 @@ fn capture_thread(
                         continue;
                     }
                     let Some(core) = state.core.clone() else {
+                        // Terminal: ohne Remote-fd und ohne Kern lässt sich
+                        // der Transport nicht wiederherstellen; jede weitere
+                        // Runde wäre ein verlorener Restart-Versuch.
                         let _ = state.frames.send(FrameMessage::SourceError {
                             source_id,
-                            reason: "PipeWire-Portalverbindung nicht verfügbar".into(),
+                            reason: PORTAL_LOST_REASON.into(),
                         });
                         continue;
                     };
@@ -538,6 +547,10 @@ fn create_stream(
             match dma_buf_params(size.width, size.height) {
                 Ok(values) => {
                     let Some(pod) = pw::spa::pod::Pod::from_bytes(&values) else {
+                        let _ = data.frames.send(FrameMessage::SourceError {
+                            source_id: data.source_id,
+                            reason: "DMA-BUF-Aushandlung fehlgeschlagen".into(),
+                        });
                         return;
                     };
                     if let Err(error) = stream.update_params(&mut [pod]) {
@@ -676,7 +689,7 @@ fn create_stream(
             pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
             &mut params,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("DMA-BUF-Aushandlung fehlgeschlagen: {error}"))?;
     Ok(ActiveStream {
         stream,
         _listener: listener,

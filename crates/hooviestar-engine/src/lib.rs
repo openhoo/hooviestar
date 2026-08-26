@@ -2,7 +2,6 @@ pub mod audio;
 pub mod discovery;
 pub mod engine;
 pub mod persistence;
-pub mod platform;
 pub mod project;
 pub mod video;
 

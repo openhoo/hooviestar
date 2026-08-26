@@ -76,6 +76,8 @@ const STALE_RING_TICKS: u32 = 30;
 /// danach kehrt ein Fehler zum Supervisor-Neustart zurück statt stiller
 /// Dauerschleife.
 const WASAPI_MAX_WAIT_TIMEOUTS: u32 = 50;
+/// Obergrenze gleichzeitig gemischter Eingaben (Parität zu Linux).
+const MAX_MIX_INPUTS: usize = 16;
 #[implement(IActivateAudioInterfaceCompletionHandler)]
 struct ActivationHandler {
     sender: StdMutex<Option<mpsc::Sender<Result<IAudioClient, String>>>>,
@@ -735,6 +737,18 @@ fn synchronize_sources(
             // Abgelaufene oder nicht mehr zutreffende Sperre entfernen.
             retry_cooldown.remove(source_id);
         }
+        // Kapazitätsgrenze für neue Quellen (Parität zu Linux); bestehende
+        // Quellen erhalten weiter Lautstärke-/Stummschaltungs-Updates.
+        if !handles.contains_key(source_id) && handles.len() >= MAX_MIX_INPUTS {
+            emit_availability(
+                events,
+                availability,
+                *source_id,
+                false,
+                "Mixer-Kapazität erreicht",
+            );
+            continue;
+        }
         let prepared = match desired_input {
             DesiredInput::Application(binding) => (|| {
                 let pid = resolve_audio_process(binding)?;
@@ -1059,10 +1073,18 @@ fn capture_thread_initialized(
         }
     };
     let _ = ready.send(Ok(()));
+    // Aufeinanderfolgende Warte-Timeouts zählen: Ein gesunder Prozess-
+    // Loopback meldet sich spätestens nach 100 ms.
+    let mut wait_timeouts: u32 = 0;
     while !stop.load(Ordering::Acquire) {
         if unsafe { WaitForSingleObject(stream.event, 100) } != WAIT_OBJECT_0 {
+            wait_timeouts += 1;
+            if wait_timeouts >= WASAPI_MAX_WAIT_TIMEOUTS {
+                return Err("Prozess-Loopback meldet keine Ereignisse mehr".into());
+            }
             continue;
         }
+        wait_timeouts = 0;
         loop {
             let frames =
                 unsafe { capture.GetNextPacketSize() }.map_err(|error| error.to_string())?;

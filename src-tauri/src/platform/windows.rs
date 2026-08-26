@@ -59,7 +59,7 @@ impl NativePreview {
         ))
     }
 
-    pub fn hwnd(&self) -> usize {
+    pub fn native_handle(&self) -> usize {
         self.hwnd
     }
 
@@ -84,7 +84,7 @@ pub async fn enumerate_sources(surfaces: NativeSurfaces) -> Result<SourceEnumera
         Ok::<_, String>((candidates, message))
     })
     .await
-    .map_err(|error| format!("enumerate_sources task failed: {error}"))??;
+    .map_err(|error| format!("Quellenauflösung fehlgeschlagen: {error}"))??;
     Ok(SourceEnumeration {
         candidates,
         portal_selection_required: false,
@@ -114,7 +114,7 @@ pub fn set_preview_bounds(
     height: i32,
 ) -> Result<(), String> {
     if width <= 0 || height <= 0 {
-        return Err("preview bounds must be positive".into());
+        return Err("Vorschauabmessungen müssen positiv sein".into());
     }
     unsafe {
         SetWindowPos(

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import fixture from "../../contracts/project-v1.json";
-import { parseProjectV1 } from "./project";
+import { parseProjectV1, SOURCE_TYPES } from "./project";
 import { ENGINE_COMMAND_TYPES, ENGINE_EVENT_TYPES, parseEngineEvent } from "./engine";
 import commandSamples from "../../contracts/commands-v1.json";
 import eventSamples from "../../contracts/events-v1.json";
@@ -9,7 +9,12 @@ describe("shared engine contract", () => {
   it("accepts every persisted source variant from Rust fixture", () => {
     const project = parseProjectV1(fixture);
     expect(project).not.toBeNull();
-    expect(project?.sources.map((source) => source.type)).toEqual(["window", "display", "image", "text", "media", "application_audio"]);
+    // Mengengleichheit in beide Richtungen: die Reihenfolge im Fixture ist
+    // kein Vertrag, nur die Menge der Varianten.
+    const parsedTypes = project!.sources.map((source) => source.type);
+    expect(parsedTypes).toHaveLength(SOURCE_TYPES.length);
+    for (const type of SOURCE_TYPES) expect(parsedTypes).toContain(type);
+    for (const type of parsedTypes) expect(SOURCE_TYPES).toContain(type);
   });
   it("rejects persisted audio volumes outside the mixer range", () => {
     const project = structuredClone(fixture);

@@ -38,6 +38,8 @@ pub struct NativeSurfaces {
     pub kind: NativeSurfaceKind,
     pub program_width: u32,
     pub program_height: u32,
+    /// Windows: initiale Kindfenster-Größe, vom Renderer nicht gelesen;
+    /// Linux: aktuelle Preview-Größe, vom Vulkan-Renderer konsumiert.
     pub preview_width: u32,
     pub preview_height: u32,
 }
@@ -1761,5 +1763,80 @@ mod tests {
              Item mitgerissen - die garantierte Verschraenkung ist \
              entfallen"
         );
+    }
+    #[test]
+    fn set_audio_volume_clamps_finite_out_of_range_values() {
+        let mut project = ProjectV1::empty();
+        let media = Uuid::new_v4();
+        apply(
+            &mut project,
+            EngineCommand::AddSource {
+                source: media_source(media),
+            },
+        )
+        .unwrap();
+        for (requested, expected) in [(1.7_f32, 1.0), (-0.25, 0.0)] {
+            apply(
+                &mut project,
+                EngineCommand::SetAudioVolume {
+                    source_id: media,
+                    volume: requested,
+                },
+            )
+            .unwrap();
+            match project.sources.iter().find(|source| source.id() == media) {
+                Some(Source::Media { volume, .. }) => assert_eq!(*volume, expected),
+                other => panic!("unerwartete Quelle nach Volume-Clamp: {other:?}"),
+            }
+        }
+    }
+
+    /// command() validiert nach apply(); NaN uebersteht das Clamp (Vergleiche
+    /// mit NaN sind false) und muss an der Projektvalidierung mit der
+    /// festgepinnten Meldung scheitern.
+    #[test]
+    fn set_audio_volume_nan_fails_validation_with_pinned_message() {
+        let mut project = ProjectV1::empty();
+        let media = Uuid::new_v4();
+        apply(
+            &mut project,
+            EngineCommand::AddSource {
+                source: media_source(media),
+            },
+        )
+        .unwrap();
+        apply(
+            &mut project,
+            EngineCommand::SetAudioVolume {
+                source_id: media,
+                volume: f32::NAN,
+            },
+        )
+        .unwrap();
+        assert_eq!(project.validate(), Err("invalid source volume".into()));
+    }
+
+    #[test]
+    fn set_audio_muted_requires_audio_capable_source() {
+        let mut project = ProjectV1::empty();
+        let text = Uuid::new_v4();
+        apply(
+            &mut project,
+            EngineCommand::AddSource {
+                source: text_source(text),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            apply(
+                &mut project,
+                EngineCommand::SetAudioMuted {
+                    source_id: text,
+                    muted: true
+                }
+            ),
+            Err(EngineError::InvalidProject(message))
+                if message == "source has no audio"
+        ));
     }
 }

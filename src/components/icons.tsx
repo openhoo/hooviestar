@@ -34,17 +34,6 @@ export function MinusIcon({ size = 14 }: IconProps) {
   );
 }
 
-export function TrashIcon({ size = 14 }: IconProps) {
-  return (
-    <svg {...SVG_BASE} width={size} height={size}>
-      <path d="M2.5 4.5h11" />
-      <path d="M6 4.5V3a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v1.5" />
-      <path d="M3.9 4.5l.6 8.2a1.6 1.6 0 0 0 1.6 1.5h3.8a1.6 1.6 0 0 0 1.6-1.5l.6-8.2" />
-      <path d="M6.6 7.5V11M9.4 7.5V11" />
-    </svg>
-  );
-}
-
 export function ArrowUpIcon({ size = 14 }: IconProps) {
   return (
     <svg {...SVG_BASE} width={size} height={size}>

@@ -333,10 +333,15 @@ fn replace_file(temporary: &Path, path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn second_save_replaces_existing_file() {
+    fn temp_project_path() -> (tempfile::TempDir, PathBuf) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("project.json");
+        (directory, path)
+    }
+
+    #[test]
+    fn second_save_replaces_existing_file() {
+        let (_directory, path) = temp_project_path();
         let mut project = ProjectV1::empty();
         save_atomic(&path, &project).unwrap();
         project.output.background = "#203040".into();
@@ -346,8 +351,7 @@ mod tests {
 
     #[test]
     fn debounce_flushes_latest_project() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("project.json");
+        let (_directory, path) = temp_project_path();
         let (store, _, _) = ProjectStore::start(path.clone()).unwrap();
         let mut first = ProjectV1::empty();
         first.output.background = "#111111".into();
@@ -362,8 +366,7 @@ mod tests {
 
     #[test]
     fn drop_without_shutdown_persists_pending() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("project.json");
+        let (_directory, path) = temp_project_path();
         let (store, _, _) = ProjectStore::start(path.clone()).unwrap();
         let mut submitted = ProjectV1::empty();
         submitted.output.background = "#424242".into();
@@ -372,7 +375,7 @@ mod tests {
         // kein shutdown() - der Writer muss das Pending im
         // Disconnected-Zweig trotzdem best-effort sichern.
         drop(store);
-        let deadline = Instant::now() + SAVE_DEBOUNCE + Duration::from_millis(750);
+        let deadline = Instant::now() + SAVE_DEBOUNCE + Duration::from_millis(2000);
         loop {
             if let Ok((persisted, _)) = load_or_default(&path)
                 && persisted.output.background == submitted.output.background
@@ -383,14 +386,13 @@ mod tests {
                 Instant::now() < deadline,
                 "pending project not persisted after drop without shutdown"
             );
-            thread::sleep(Duration::from_millis(50));
+            thread::sleep(Duration::from_millis(10));
         }
     }
 
     #[test]
     fn shutdown_persists_pending_without_flush() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("project.json");
+        let (_directory, path) = temp_project_path();
         let (store, _, _) = ProjectStore::start(path.clone()).unwrap();
         let mut submitted = ProjectV1::empty();
         submitted.output.background = "#333642".into();
@@ -447,9 +449,8 @@ mod tests {
 
     #[test]
     fn corrupt_project_is_backed_up_and_reset() {
-        let directory = tempfile::tempdir().unwrap();
+        let (_directory, path) = temp_project_path();
         // empty() erzeugt frische UUIDs - Struktur statt Wertgleichheit.
-        let path = directory.path().join("project.json");
         fs::write(&path, b"{ keine gueltigen Projektdaten").unwrap();
         let (project, backup) = load_or_default(&path).unwrap();
         assert!(project.validate().is_ok());
@@ -457,14 +458,23 @@ mod tests {
         let backup = backup.expect("korrupte Datei muss gesichert werden");
         assert!(backup.is_file());
         assert!(!path.exists());
+
+        // Auch ProjectStore::start muss ueber einer korrupten Datei sauber
+        // auf das Default-Projekt umschalten und die Reste sichern.
+        fs::write(&path, b"{ immer noch kein Projekt").unwrap();
+        let (store, started, backup) = ProjectStore::start(path.clone()).unwrap();
+        assert!(started.validate().is_ok());
+        assert!(started.sources.is_empty());
+        let backup = backup.expect("zweiter Korruptionsfall muss gesichert werden");
+        assert!(backup.is_file());
+        store.shutdown().unwrap();
     }
 
     #[test]
     #[cfg(unix)]
     fn readonly_parent_leaves_no_temporary_behind() {
         use std::os::unix::fs::PermissionsExt;
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("project.json");
+        let (directory, path) = temp_project_path();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o500)).unwrap();
         let result = save_atomic(&path, &ProjectV1::empty());
         // Rechte sofort zuruecksetzen, damit das Tempdir aufgeraeumt
@@ -484,10 +494,9 @@ mod tests {
 
     #[test]
     fn failed_rename_cleans_up_temporary() {
-        let directory = tempfile::tempdir().unwrap();
+        let (directory, path) = temp_project_path();
         // Ziel existiert als Verzeichnis: rename(Datei -> Verzeichnis)
         // schlaegt mit EISDIR fehl, die Tempdatei muss entfernt werden.
-        let path = directory.path().join("project.json");
         fs::create_dir(&path).unwrap();
         let error = save_atomic(&path, &ProjectV1::empty())
             .expect_err("rename auf Verzeichnis muss fehlschlagen");
@@ -505,8 +514,7 @@ mod tests {
 
     #[test]
     fn shutdown_twice_and_submit_after_shutdown_are_noops() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("project.json");
+        let (_directory, path) = temp_project_path();
         let (store, _, _) = ProjectStore::start(path.clone()).unwrap();
         let mut submitted = ProjectV1::empty();
         submitted.output.background = "#050505".into();

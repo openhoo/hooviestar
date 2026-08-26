@@ -6,13 +6,11 @@ import { MediaInspector } from "./MediaInspector";
 export type ItemAction = "toggleVisible" | "toggleLocked" | "moveUp" | "moveDown";
 
 interface SourceInspectorPanelProps {
-  selectedSourceId: string | null;
   selectedSource: Source | null;
   selectedItem: SceneItem | null;
   mediaState: MediaRuntimeState | null;
   itemError: string | null;
   textError: string | null;
-  onSelectSource: (sourceId: string) => void;
   onItemAction: (itemId: string, action: ItemAction) => void;
   onTextChange: (source: TextSource, event: React.ChangeEvent<HTMLTextAreaElement>) => void;
   onAudioField: (sourceId: string, field: "volume" | "muted", value: number | boolean) => void;

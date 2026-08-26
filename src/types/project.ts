@@ -155,7 +155,7 @@ export interface ProjectV1 {
 /* Laufzeit-Wächter (Validierung externer Daten, u. a. Fixtures)       */
 /* ------------------------------------------------------------------ */
 
-const SOURCE_TYPES: readonly SourceType[] = [
+export const SOURCE_TYPES: readonly SourceType[] = [
   "window",
   "display",
   "image",

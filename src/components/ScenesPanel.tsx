@@ -1,6 +1,7 @@
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useMemo, useRef, useState } from "react";
 import type { Scene } from "../types";
 import { MinusIcon, PlusIcon } from "./icons";
+import { useArmedConfirm } from "../hooks/useArmedConfirm";
 
 interface ScenesPanelProps {
   scenes: Scene[];
@@ -10,7 +11,7 @@ interface ScenesPanelProps {
   onAddScene: () => void;
   onSwitchScene: (scene: Scene) => void;
   onSaveHotkey: (event: React.FormEvent<HTMLFormElement>) => void;
-  onRemoveScene: (sceneId: string) => void;
+  onRemoveScene: (sceneId: string) => void | Promise<void>;
   onRenameScene: (sceneId: string, name: string) => void;
 }
 
@@ -25,25 +26,21 @@ function ScenesPanelImpl({
   onRemoveScene,
   onRenameScene,
 }: ScenesPanelProps) {
-  const [removeArmed, setRemoveArmed] = useState(false);
   const removeButtonRef = useRef<HTMLButtonElement>(null);
+  const removeTriggerRefs = useMemo(() => [removeButtonRef], []);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
   // Unterscheidet „Escape“ von „Commit über Blur“, da beim Aushängen des
   // Eingabefelds je nach Browser noch ein Blur-Event nachläuft.
   const renameCancelledRef = useRef(false);
 
-  // Armierung verfällt bei Szenewechsel und bei Klick außerhalb des Buttons.
-  useEffect(() => setRemoveArmed(false), [activeScene.id]);
-  useEffect(() => {
-    if (!removeArmed) return;
-    const handle = (event: PointerEvent) => {
-      if (event.target instanceof Node && removeButtonRef.current?.contains(event.target)) return;
-      setRemoveArmed(false);
-    };
-    window.addEventListener("pointerdown", handle);
-    return () => window.removeEventListener("pointerdown", handle);
-  }, [removeArmed]);
+  // Geteilte Zwei-Klick-Entfernung: Szenewechsel, Klick außerhalb und Escape
+  // entschärfen; während der Bestätigung werden weitere Klicks ignoriert.
+  const { armed: removeArmed, trigger: triggerRemove } = useArmedConfirm(
+    () => onRemoveScene(activeScene.id),
+    activeScene.id,
+    removeTriggerRefs,
+  );
 
   const startRename = (scene: Scene) => {
     renameCancelledRef.current = false;
@@ -78,14 +75,7 @@ function ScenesPanelImpl({
             aria-label={removeArmed ? "Erneut klicken zum Entfernen" : "Aktive Szene entfernen"}
             title={removeArmed ? "Erneut klicken zum Entfernen" : "Aktive Szene entfernen"}
             disabled={scenes.length <= 1}
-            onClick={() => {
-              if (removeArmed) {
-                setRemoveArmed(false);
-                onRemoveScene(activeScene.id);
-              } else {
-                setRemoveArmed(true);
-              }
-            }}
+            onClick={triggerRemove}
           >
             <MinusIcon />
           </button>
@@ -98,6 +88,7 @@ function ScenesPanelImpl({
               <input
                 className="rename-input"
                 autoFocus
+                aria-label={`Szene „${scene.name}“ umbenennen`}
                 value={renameDraft}
                 onChange={(event) => setRenameDraft(event.currentTarget.value)}
                 onBlur={commitRename}

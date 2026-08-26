@@ -32,7 +32,7 @@ use super::{
     image_cache::ImageCache,
     linux::{
         CaptureHandle, CapturedFrame, DRM_FORMAT_MOD_INVALID, FrameMemory, FrameMessage,
-        PipeWirePortalLink,
+        PORTAL_LOST_REASON, PipeWirePortalLink,
     },
     linux_media::{LinuxMedia, MediaCommand, MediaNotice, MediaVideoFrame},
     text_raster::{TextAlignKey, TextCache, TextKey, parse_color as parse_text_color},
@@ -1718,6 +1718,16 @@ impl RenderRuntime {
                 // recreations.
                 let mut import_failures: HashMap<Uuid, Instant> = HashMap::new();
                 let mut capture_started: HashMap<Uuid, Instant> = HashMap::new();
+                // Restart-Rückfallebene für frische Starts: Eine Quelle,
+                // deren capture.start fehlschlägt, wird erst nach
+                // IMPORT_RETRY_INTERVAL erneut versucht, statt die
+                // Capture-Verbindung jede Schleifenrunde neu aufzureißen.
+                let mut restart_backoff: HashMap<Uuid, Instant> = HashMap::new();
+                // Terminaler Portal-Verlust pro Quelle: Solange gesetzt,
+                // startet die Wanted-Schleife diese Quelle nicht erneut;
+                // erst ein Generationswechsel (neue Auswahl, neues fd)
+                // räumt die Sperre weg.
+                let mut portal_lost: HashSet<Uuid> = HashSet::new();
                 // Eviction/failure-report dedup: identical consecutive
                 // reasons are reported once until frames recover
                 // (mirrors windows.rs should_report_failure philosophy).
@@ -2068,6 +2078,8 @@ impl RenderRuntime {
                         available.clear();
                         capture_started.clear();
                         evict_notified.clear();
+                        restart_backoff.clear();
+                        portal_lost.clear();
                         generation = current_generation;
                     }
                     let selected = portal.streams();
@@ -2095,12 +2107,24 @@ impl RenderRuntime {
                         })
                         .collect();
                     for (source_id, node) in &wanted {
+                        if portal_lost.contains(source_id) {
+                            continue;
+                        }
                         if nodes.get(source_id) != Some(node) {
                             if nodes.contains_key(source_id) {
                                 capture.stop(*source_id);
+                            } else if restart_backoff
+                                .get(source_id)
+                                .is_some_and(|last| last.elapsed() < IMPORT_RETRY_INTERVAL)
+                            {
+                                // Fehlgeschlagener Start: Backoff abwarten,
+                                // kein Restart-Sturm über die Capture-Thread-
+                                // Verbindung.
+                                continue;
                             }
                             let remote = portal.take_remote();
                             capture.start(*source_id, *node, remote);
+                            restart_backoff.insert(*source_id, Instant::now());
                             nodes.insert(*source_id, *node);
                             capture_started.insert(*source_id, Instant::now());
                         }
@@ -2111,6 +2135,7 @@ impl RenderRuntime {
                             nodes.remove(&source_id);
                             capture_started.remove(&source_id);
                             evict_notified.remove(&source_id);
+                            restart_backoff.remove(&source_id);
                             if let Some(frame) = frames.remove(&source_id) {
                                 capture.return_buffer(source_id, frame.buffer_token);
                             }
@@ -2124,6 +2149,8 @@ impl RenderRuntime {
                         &mut nodes,
                         &import_failures,
                         &mut evict_notified,
+                        &mut restart_backoff,
+                        &mut portal_lost,
                         &events,
                     );
                     // Portal delivery is damage-driven: after a capture delivered its
@@ -2332,6 +2359,8 @@ fn drain_capture_messages(
     nodes: &mut HashMap<Uuid, u32>,
     import_failures: &HashMap<Uuid, Instant>,
     evict_notified: &mut HashMap<Uuid, String>,
+    restart_backoff: &mut HashMap<Uuid, Instant>,
+    portal_lost: &mut HashSet<Uuid>,
     events: &std::sync::mpsc::Sender<EngineEvent>,
 ) {
     while let Ok(message) = capture.try_recv() {
@@ -2344,6 +2373,7 @@ fn drain_capture_messages(
                 capture_started.remove(&source_id);
                 // Frames arrived again: re-arm eviction reporting.
                 evict_notified.remove(&source_id);
+                restart_backoff.remove(&source_id);
                 if available.insert(source_id) && !import_failures.contains_key(&source_id) {
                     let _ = events.send(EngineEvent::SourceAvailable { source_id });
                 }
@@ -2359,6 +2389,11 @@ fn drain_capture_messages(
                     capture.return_buffer(source_id, frame.buffer_token);
                 }
                 capture.stop(source_id);
+                // Portal-Tod terminal behandeln: Grund merken und weitere
+                // Startversuche bis zum Generationswechsel aussetzen.
+                if reason == PORTAL_LOST_REASON {
+                    portal_lost.insert(source_id);
+                }
                 if evict_notified.get(&source_id).map(String::as_str) != Some(reason.as_str()) {
                     evict_notified.insert(source_id, reason.clone());
                     let _ = events.send(EngineEvent::SourceUnavailable { source_id, reason });

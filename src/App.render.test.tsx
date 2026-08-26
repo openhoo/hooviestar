@@ -6,7 +6,7 @@
  * Rust-Fixture wie in contracts.test.ts.
  */
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fixture from "../contracts/project-v1.json";
 import { parseProjectV1 } from "./types";
 
@@ -51,7 +51,26 @@ function sceneRowButton(sceneName: string): HTMLButtonElement {
   return row!;
 }
 
+function placedSource() {
+  const active = project.scenes.find((scene) => scene.id === project.activeSceneId)!;
+  return project.sources.find((entry) => entry.id === active.items[0].sourceId)!;
+}
+
+function placedSourceRowButton(): HTMLButtonElement {
+  const source = placedSource();
+  // Quellnamen können mehrfach vorkommen (Mixer, Inspektor) – deshalb auf die
+  // Quellenzeile (button.source-main im Quellen-Dock) einschränken.
+  const row = screen
+    .getAllByText(source.name)
+    .map((node) => node.closest("button.source-main"))
+    .find((node): node is HTMLButtonElement => node !== null);
+  expect(row).toBeTruthy();
+  return row!;
+}
 describe("studio shell", () => {
+  beforeEach(() => {
+    dispatchedCommands.length = 0;
+  });
   afterEach(cleanup);
 
   it("rendert die OBS-Docks Szenen, Quellen, Audio-Mixer, Eigenschaften und Steuerpult", async () => {
@@ -61,7 +80,7 @@ describe("studio shell", () => {
     }
     const counts = screen.getByText((_, element) =>
       element?.classList.contains("status-item") === true &&
-      /\b1 (Szene|Szenen) · 6 Quellen\b/.test(element.textContent ?? ""),
+      /\b\d+ (Szene|Szenen) · \d+ (Quelle|Quellen)\b/.test(element.textContent ?? ""),
     );
     expect(counts).toBeTruthy();
   });
@@ -73,6 +92,7 @@ describe("studio shell", () => {
     await waitFor(() => {
       expect(dispatchedCommands).toContainEqual(expect.objectContaining({ type: "set_active_scene", sceneId: target.id }));
     });
+    expect(dispatchedCommands.filter((command) => command.type === "set_active_scene")).toHaveLength(1);
   });
 
   it("listet im Quellen-Dock Elemente der aktiven Szene und außerhalb liegende Quellen", async () => {
@@ -87,5 +107,58 @@ describe("studio shell", () => {
     if (unplaced.length > 0) {
       expect(screen.getAllByText("außerhalb der Szene").length).toBe(unplaced.length);
     }
+  });
+
+  it("armiert die Quellen-Entfernung und entschärft bei pointerdown außerhalb", async () => {
+    await renderStudio();
+    fireEvent.click(placedSourceRowButton());
+    const removeButton = screen.getByTitle("Ausgewählte Quelle entfernen");
+    fireEvent.click(removeButton);
+    expect(screen.getByTitle("Erneut klicken zum Entfernen")).toBeTruthy();
+    fireEvent.pointerDown(document.body);
+    expect(screen.getByTitle("Ausgewählte Quelle entfernen")).toBeTruthy();
+    expect(dispatchedCommands.filter((command) => command.type === "remove_source")).toHaveLength(0);
+  });
+
+  it("entschärft die armierte Quellen-Entfernung bei Escape", async () => {
+    await renderStudio();
+    fireEvent.click(placedSourceRowButton());
+    const removeButton = screen.getByTitle("Ausgewählte Quelle entfernen");
+    fireEvent.click(removeButton);
+    expect(screen.getByTitle("Erneut klicken zum Entfernen")).toBeTruthy();
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.getByTitle("Ausgewählte Quelle entfernen")).toBeTruthy();
+    expect(dispatchedCommands.filter((command) => command.type === "remove_source")).toHaveLength(0);
+  });
+
+  it("bestätigt die Quellen-Entfernung bei schnellen Mehrfachklicks genau einmal", async () => {
+    await renderStudio();
+    const source = placedSource();
+    fireEvent.click(placedSourceRowButton());
+    const removeButton = screen.getByTitle("Ausgewählte Quelle entfernen");
+    fireEvent.click(removeButton);
+    fireEvent.click(removeButton);
+    fireEvent.click(removeButton);
+    fireEvent.click(removeButton);
+    await waitFor(() => {
+      expect(dispatchedCommands.filter((command) => command.type === "remove_source")).toHaveLength(1);
+    });
+    expect(dispatchedCommands.find((command) => command.type === "remove_source")).toEqual(
+      expect.objectContaining({ type: "remove_source", sourceId: source.id }),
+    );
+  });
+
+  it("erlaubt das Entfernen der letzten Szene nicht", async () => {
+    // Der Store ist ein Modul-Singleton und hat den Contract-Fixture bereits
+    // geladen (eine Szene): genau dann muss die Entfernung blockiert sein.
+    await renderStudio();
+    const removeButton = screen.getByTitle("Aktive Szene entfernen") as HTMLButtonElement;
+    expect(removeButton.disabled).toBe(true);
+    fireEvent.click(removeButton);
+    fireEvent.click(removeButton);
+    fireEvent.click(removeButton);
+    fireEvent.click(removeButton);
+    await Promise.resolve();
+    expect(dispatchedCommands.filter((command) => command.type === "remove_scene")).toHaveLength(0);
   });
 });

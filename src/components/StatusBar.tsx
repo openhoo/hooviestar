@@ -1,5 +1,6 @@
 import { memo } from "react";
 import type { OutputConfig } from "../types";
+import { statusTone } from "../engineStore";
 
 interface StatusBarProps {
   status: string;
@@ -12,7 +13,7 @@ function StatusBarImpl({ status, output, sceneCount, sourceCount }: StatusBarPro
   return (
     <footer className="status-bar">
       <span className="status-item">
-        <span className="status-dot" />
+        <span className={statusTone(status) === "error" ? "status-dot error" : "status-dot"} />
         <span role="status">{status}</span>
       </span>
       <span className="status-item">

@@ -833,7 +833,14 @@ fn run_pipeline_once(
                                 },
                             );
                             eprintln!("loop media seek failed: {error:?}");
+                            playing = false;
                             ended = true;
+                            // Ehrlicher Zustand wie beim natürlichen Ende:
+                            // Der Pausen-Wunsch wird persistiert, damit der
+                            // 40-ms-State-Dedup State{playing:false} meldet
+                            // und ein späterer transienter Fehler pausiert
+                            // wieder öffnet statt weiterzulaufen.
+                            desired_playing.store(false, Ordering::Relaxed);
                             ring.lock().set_active(false);
                         } else {
                             // The FLUSH loop seek invalidated decoded PCM
