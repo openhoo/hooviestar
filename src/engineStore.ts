@@ -1,13 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { EngineCommand, EngineEvent, LevelsEvent, MediaRuntimeState, ProjectV1, SourceEnumeration } from "./types";
+import type { EngineCommand, LevelsEvent, MediaRuntimeState, ProjectV1, SourceEnumeration } from "./types";
 import { parseEngineEvent, parseProjectV1 } from "./types";
 
 type Listener = () => void;
 interface EngineState {
   project: ProjectV1 | null;
   status: string;
-  lastEvent: EngineEvent | null;
   levels: LevelsEvent["entries"];
   mediaStates: Record<string, MediaRuntimeState>;
 }
@@ -15,11 +14,50 @@ const listeners = new Set<Listener>();
 let state: EngineState = {
   project: null,
   status: "Engine wird gestartet",
-  lastEvent: null,
   levels: [],
   mediaStates: {},
 };
 let started = false;
+function levelsEqual(a: LevelsEvent["entries"], b: LevelsEvent["entries"]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i];
+    const y = b[i];
+    if (x.sourceId !== y.sourceId || x.peak !== y.peak || x.rms !== y.rms) return false;
+  }
+  return true;
+}
+
+function mediaStatesEqual(a: Record<string, MediaRuntimeState>, b: Record<string, MediaRuntimeState>): boolean {
+  if (a === b) return true;
+  const keys = Object.keys(a);
+  if (keys.length !== Object.keys(b).length) return false;
+  for (const key of keys) {
+    const x = a[key];
+    const y = b[key];
+    if (!y) return false;
+    if (
+      x.playing !== y.playing ||
+      x.positionSeconds !== y.positionSeconds ||
+      x.durationSeconds !== y.durationSeconds
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Wertgleiche Ereignisse (Pegel-/Medienstatus ohne sichtbare Änderung) dürfen
+// keinen Identitätswechsel erzeugen und damit kein Full-Tree-Re-Render auslösen.
+function stateUnchanged(next: EngineState): boolean {
+  return (
+    next.project === state.project &&
+    next.status === state.status &&
+    levelsEqual(next.levels, state.levels) &&
+    mediaStatesEqual(next.mediaStates, state.mediaStates)
+  );
+}
 function publish(next: EngineState) { state = next; listeners.forEach((listener) => listener()); }
 
 export const engineStore = {
@@ -71,17 +109,29 @@ export const engineStore = {
         const mediaStates =
           event.type === "media_state"
             ? { ...state.mediaStates, [event.sourceId]: event.state }
-            : state.mediaStates;
-        publish({
+            : event.type === "snapshot"
+              ? Object.fromEntries(
+                  Object.entries(state.mediaStates).filter(([sourceId]) =>
+                    event.project.sources.some((source) => source.id === sourceId),
+                  ),
+                )
+              : state.mediaStates;
+        const next: EngineState = {
           ...state,
           project: event.type === "snapshot" ? event.project : state.project,
           status,
-          lastEvent: event,
           levels,
           mediaStates,
-        });
+        };
+        if (!stateUnchanged(next)) publish(next);
       });
+      // Bereitschaftssignal: der Listener ist angehängt – vom Start verpasste
+      // Hotkey-Fehler des Backends jetzt nachliefern (drainiert den Puffer).
+      await invoke("engine_status").catch(() => {});
     } catch (error) {
+      // Fehlgeschlagenen Start nicht dauerhaft festschreiben: Der nächste
+      // start()-Aufruf (z. B. nach Remount) darf es erneut versuchen.
+      started = false;
       publish({ ...state, status: `Engine nicht erreichbar: ${String(error)}` });
     }
   },

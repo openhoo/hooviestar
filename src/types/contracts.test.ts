@@ -33,4 +33,28 @@ describe("shared engine contract", () => {
       reason: "codec",
     });
   });
+  it("rejects snapshot events with a malformed project payload", () => {
+    const broken = structuredClone(fixture);
+    broken.activeSceneId = "00000000-0000-4000-8000-0000000000ff";
+    expect(parseEngineEvent({ type: "snapshot", project: broken })).toBeNull();
+  });
+  it("rejects device_recovery events with an invalid phase", () => {
+    expect(parseEngineEvent({ type: "device_recovery", phase: "paused", detail: null })).toBeNull();
+  });
+  it("rejects levels entries missing rms", () => {
+    expect(
+      parseEngineEvent({
+        type: "levels",
+        entries: [{ sourceId: "00000000-0000-4000-8000-000000000001", peak: 0.5 }],
+      }),
+    ).toBeNull();
+  });
+  it("rejects unknown event types", () => {
+    expect(parseEngineEvent({ type: "scene_teleport" })).toBeNull();
+  });
+  it("rejects scene items referencing unknown sources", () => {
+    const project = structuredClone(fixture);
+    project.scenes[0].items[0].sourceId = "00000000-0000-4000-8000-0000000000ff";
+    expect(parseProjectV1(project)).toBeNull();
+  });
 });

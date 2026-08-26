@@ -1,18 +1,18 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
-import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { engineStore } from "./engineStore";
 import { pipTransform } from "./types";
-import type { Scene, Source, SourceCandidate, Transform } from "./types";
+import type { EngineCommand, Scene, Source, SourceCandidate, TextSource, Transform } from "./types";
+import { runGuarded } from "./guarded";
+import { AddSourceDialog } from "./components/AddSourceDialog";
+import { ScenesPanel } from "./components/ScenesPanel";
+import { PreviewPanel } from "./components/PreviewPanel";
+import { SourceInspectorPanel } from "./components/SourceInspectorPanel";
+import type { ItemAction } from "./components/SourceInspectorPanel";
+import { AudioMixerPanel } from "./components/AudioMixerPanel";
+import { OnboardingBanner } from "./components/OnboardingBanner";
 
-function sourceLabel(source: Source) {
-  if (source.type === "application_audio") return "Anwendungs-Audio";
-  if (source.type === "window") return "Fenster";
-  if (source.type === "display") return "Monitor";
-  if (source.type === "image") return "Bild";
-  if (source.type === "text") return "Text";
-  return "Medium";
-}
 
 function fullTransform(width: number, height: number): Transform {
   return {
@@ -29,6 +29,19 @@ function fullTransform(width: number, height: number): Transform {
   };
 }
 
+/**
+ * Stabile Rollenzuordnung der Standard-Szenen. Die Seeds in
+ * crates/hooviestar-engine/src/project.rs (`ProjectV1::empty`) erzeugen die
+ * Szenen-UUIDs bei jedem Start neu (`Uuid::new_v4`), daher sind die Hotkeys
+ * der einzige persistente Vertrag – Szenennamen dürfen sich jederzeit
+ * umbenennen lassen, ohne diese Zuordnung zu brechen.
+ */
+const GAME_SCENE_HOTKEY = "Ctrl+Alt+1";
+const VIDEO_SCENE_HOTKEY = "Ctrl+Alt+2";
+const BOTH_SCENE_HOTKEY = "Ctrl+Alt+3";
+
+interface SceneTarget { scene: Scene; transform: Transform; bottom?: boolean }
+
 export default function App() {
   const { project, status, levels, mediaStates } = useSyncExternalStore(
     engineStore.subscribe,
@@ -37,109 +50,118 @@ export default function App() {
   const [selectedSourceId, setSelectedSourceId] = useState<string | null>(null);
   const [addOpen, setAddOpen] = useState(false);
   const [onboarding, setOnboarding] = useState(false);
-  const [candidates, setCandidates] = useState<SourceCandidate[]>([]);
-  const [sourceMessage, setSourceMessage] = useState<string | null>(null);
-  const [portalRequired, setPortalRequired] = useState(false);
-  const [sourceLoading, setSourceLoading] = useState(false);
   const [hotkeyMessage, setHotkeyMessage] = useState<string | null>(null);
+  const [sceneError, setSceneError] = useState<string | null>(null);
+  const [itemError, setItemError] = useState<string | null>(null);
+  const onboardingDismissedRef = useRef(false);
+  // Optimistische Feld-Deltas je Quelle: überbrückt das Snapshot-Event-Lag, damit
+  // aufeinanderfolgende update_source-Aufrufe nicht gegenseitig Felder zurücksetzen.
+  // Lautstärke/Stumm gehen über eigene Engine-Befehle, werden aber ebenfalls hier
+  // überlagert, damit ein parallel laufendes update_source sie nicht mit dem
+  // Snapshot-Stand zurücküberschreibt.
+  const pendingSourceFieldsRef = useRef(new Map<string, Record<string, unknown>>());
+  // IPC-Koaleszierung für Lautstärke/Stumm: ausstehende Befehle je Quelle+Feld,
+  // geflusht einmal pro Animation-Frame (letzter Schreibzugriff gewinnt).
+  const audioPendingDispatchRef = useRef(new Map<string, EngineCommand>());
+  const audioFlushFrameRef = useRef<number | null>(null);
+  const [textError, setTextError] = useState<string | null>(null);
+  const [audioError, setAudioError] = useState<string | null>(null);
   const addButton = useRef<HTMLButtonElement>(null);
-  const dialog = useRef<HTMLElement>(null);
+  // Native-Vorschau: das Element überlebt Projekt-Updates; Beobachter und
+  // Meldung werden genau einmal eingerichtet (siehe attachPreviewBounds).
+  const previewNodeRef = useRef<HTMLDivElement | null>(null);
+  const previewObserverRef = useRef<ResizeObserver | null>(null);
 
   useEffect(() => {
     void engineStore.start();
   }, []);
-
+  useEffect(() => () => {
+    if (audioFlushFrameRef.current !== null) cancelAnimationFrame(audioFlushFrameRef.current);
+    // Ausstehende Audio-Befehle beim Aushängen synchron flushen, damit die
+    // letzten Lautstärke-/Stumm-Änderungen nicht mit dem rAF verloren gehen.
+    const batch = audioPendingDispatchRef.current;
+    audioPendingDispatchRef.current = new Map();
+    dispatchAudioBatch(batch);
+  }, []);
   useEffect(() => {
     if (!project) return;
-    if (project.sources.length === 0) setOnboarding(true);
+    const pendingBySource = pendingSourceFieldsRef.current;
+    for (const source of project.sources) {
+      const pending = pendingBySource.get(source.id);
+      if (!pending) continue;
+      for (const key of Object.keys(pending)) {
+        if (pending[key] === (source as unknown as Record<string, unknown>)[key]) delete pending[key];
+      }
+      if (Object.keys(pending).length === 0) pendingBySource.delete(source.id);
+    }
+    // Onboarding nur einmal pro Session automatisch öffnen; "Später" bleibt klebrig.
+    if (!onboardingDismissedRef.current && project.sources.length === 0) setOnboarding(true);
   }, [project]);
+  useEffect(() => () => {
+    previewObserverRef.current?.disconnect();
+    previewObserverRef.current = null;
+  }, []);
 
-  useEffect(() => {
-    if (!project || !navigator.platform.toLowerCase().includes("win")) return;
-    const preview = document.getElementById("native-preview-bounds");
-    if (!preview) return;
-    const report = () => {
-      const bounds = preview.getBoundingClientRect();
-      void invoke("set_preview_bounds", {
-        x: bounds.x,
-        y: bounds.y,
-        width: bounds.width,
-        height: bounds.height,
-      });
-    };
-    const observer = new ResizeObserver(report);
-    observer.observe(preview);
-    report();
-    return () => observer.disconnect();
-  }, [project]);
-
-  useEffect(() => {
-    if (!addOpen) return;
-    setSourceLoading(true);
-    void engineStore
-      .enumerateSources()
-      .then((result) => {
-        setCandidates(result.candidates);
-        setPortalRequired(result.portalSelectionRequired);
-        setSourceMessage(result.message);
-      })
-      .catch((error) => setSourceMessage(String(error)))
-      .finally(() => setSourceLoading(false));
-    requestAnimationFrame(() => {
-      dialog.current?.querySelector<HTMLElement>("button")?.focus();
+  const reportPreviewBounds = useCallback(() => {
+    const preview = previewNodeRef.current;
+    if (!preview || !navigator.platform.toLowerCase().includes("win")) return;
+    const bounds = preview.getBoundingClientRect();
+    void invoke("set_preview_bounds", {
+      x: bounds.x,
+      y: bounds.y,
+      width: bounds.width,
+      height: bounds.height,
     });
-  }, [addOpen]);
+  }, []);
 
-  if (!project) {
-    return (
-      <main className="loading">
-        <h1>Hooviestar</h1>
-        <p role="status">{status}</p>
-      </main>
-    );
-  }
+  // Ref-Callback statt Effect: das Element wird beim Einhängen beobachtet,
+  // der Beobachter entsteht höchstens einmal und hängt nicht an `project`.
+  const attachPreviewBounds = useCallback((node: HTMLDivElement | null) => {
+    const previous = previewNodeRef.current;
+    if (previous === node) return;
+    if (previous) previewObserverRef.current?.unobserve(previous);
+    previewNodeRef.current = node;
+    if (!node || !navigator.platform.toLowerCase().includes("win")) return;
+    if (!previewObserverRef.current) {
+      previewObserverRef.current = new ResizeObserver(() => reportPreviewBounds());
+    }
+    previewObserverRef.current.observe(node);
+    reportPreviewBounds();
+  }, [reportPreviewBounds]);
 
-  const activeScene =
-    project.scenes.find((scene) => scene.id === project.activeSceneId) ?? project.scenes[0];
-  const selectedSource =
-    project.sources.find((source) => source.id === selectedSourceId) ?? null;
-  const selectedItem = selectedSource
-    ? activeScene.items.find((item) => item.sourceId === selectedSource.id) ?? null
-    : null;
-  const selectedMediaState =
-    selectedSource?.type === "media" ? (mediaStates[selectedSource.id] ?? null) : null;
-
-  async function addScene() {
+  const addScene = useCallback(async () => {
+    // Szenenzahl bewusst zum Aufrufzeitpunkt statt der Render-Closure.
+    const scenes = engineStore.getSnapshot().project!.scenes;
     const sceneId = crypto.randomUUID();
     await engineStore.dispatch({
       type: "add_scene",
       sceneId,
-      name: `Szene ${project!.scenes.length + 1}`,
+      name: `Szene ${scenes.length + 1}`,
     });
     await engineStore.dispatch({ type: "set_active_scene", sceneId });
-  }
+  }, []);
 
-  async function switchScene(scene: Scene) {
-    await engineStore.dispatch({ type: "set_active_scene", sceneId: scene.id });
-  }
+  const handleAddScene = useCallback(() => void runGuarded(addScene, setSceneError), [addScene]);
 
-  async function saveSceneHotkey(event: React.FormEvent<HTMLFormElement>) {
+  const handleSwitchScene = useCallback((scene: Scene) => {
+    void runGuarded(() => engineStore.dispatch({ type: "set_active_scene", sceneId: scene.id }), setSceneError);
+  }, []);
+
+  // Aktive Szene bewusst zum Aufrufzeitpunkt, damit der Callback stabil bleibt.
+  const handleSaveHotkey = useCallback((event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const value = new FormData(event.currentTarget).get("hotkey");
     const hotkey = typeof value === "string" && value.trim() ? value.trim() : null;
-    try {
-      await engineStore.dispatch({
-        type: "set_scene_hotkey",
-        sceneId: activeScene.id,
-        hotkey,
-      });
-      setHotkeyMessage(null);
-    } catch (error) {
-      setHotkeyMessage(String(error));
-    }
-  }
+    const snapshot = engineStore.getSnapshot().project!;
+    const activeScene =
+      snapshot.scenes.find((scene) => scene.id === snapshot.activeSceneId) ?? snapshot.scenes[0];
+    void runGuarded(
+      () => engineStore.dispatch({ type: "set_scene_hotkey", sceneId: activeScene.id, hotkey }),
+      setHotkeyMessage,
+    );
+  }, []);
 
-  async function addSource(source: Source, targets: Array<{ scene: Scene; transform: Transform; bottom?: boolean }>) {
+  const addSource = useCallback(async (source: Source, targets: SceneTarget[]) => {
     await engineStore.dispatch({ type: "add_source", source });
     try {
       for (const target of targets) {
@@ -166,41 +188,19 @@ export default function App() {
     }
     setSelectedSourceId(source.id);
     setAddOpen(false);
-  }
+  }, []);
 
-  function scenesFor(role: "game" | "video") {
-    const game = project!.scenes.find((scene) => scene.name === "Spiel") ?? project!.scenes[0];
-    const video =
-      project!.scenes.find((scene) => scene.name === "Video") ?? project!.scenes[1] ?? game;
-    const both =
-      project!.scenes.find((scene) => scene.name === "Beides") ?? project!.scenes[2] ?? game;
-    const full = fullTransform(project!.output.width, project!.output.height);
-    if (role === "game") {
-      return game.id === both.id
-        ? [{ scene: game, transform: full }]
-        : [
-            { scene: game, transform: full },
-            { scene: both, transform: full, bottom: true },
-          ];
-    }
-    return video.id === both.id
-      ? [{ scene: video, transform: full }]
-      : [
-          { scene: video, transform: full },
-          { scene: both, transform: pipTransform(project!.output) },
-        ];
-  }
 
-  async function addCandidate(candidate: SourceCandidate) {
+  const addCandidate = useCallback(async (candidate: SourceCandidate) => {
     if (candidate.type === "window") {
       await addSource(
         { type: "window", id: crypto.randomUUID(), name: candidate.name, binding: candidate.binding },
-        scenesFor("game"),
+        requireSceneTargets("game"),
       );
     } else if (candidate.type === "display") {
       await addSource(
         { type: "display", id: crypto.randomUUID(), name: candidate.name, binding: candidate.binding },
-        scenesFor("game"),
+        requireSceneTargets("game"),
       );
     } else {
       const source: Source = {
@@ -213,9 +213,12 @@ export default function App() {
       };
       await addSource(source, []);
     }
-  }
+  }, []);
 
-  async function addTextSource() {
+  const addTextSource = useCallback(async () => {
+    const snapshot = engineStore.getSnapshot().project!;
+    const scene =
+      snapshot.scenes.find((entry) => entry.id === snapshot.activeSceneId) ?? snapshot.scenes[0];
     const source: Source = {
       type: "text",
       id: crypto.randomUUID(),
@@ -230,23 +233,26 @@ export default function App() {
     };
     await addSource(source, [
       {
-        scene: activeScene,
+        scene,
         transform: {
-          ...fullTransform(project!.output.width / 2, 160),
-          x: project!.output.width / 4,
-          y: project!.output.height / 2 - 80,
+          ...fullTransform(snapshot.output.width / 2, 160),
+          x: snapshot.output.width / 4,
+          y: snapshot.output.height / 2 - 80,
         },
       },
     ]);
-  }
+  }, []);
 
-  async function addImageSource() {
+  const addImageSource = useCallback(async () => {
     const path = await open({
       multiple: false,
       filters: [{ name: "Bild", extensions: ["png", "jpg", "jpeg", "bmp"] }],
     });
     if (typeof path !== "string") return;
     const canonicalPath = await invoke<string>("canonicalize_file", { path });
+    const snapshot = engineStore.getSnapshot().project!;
+    const scene =
+      snapshot.scenes.find((entry) => entry.id === snapshot.activeSceneId) ?? snapshot.scenes[0];
     const source: Source = {
       type: "image",
       id: crypto.randomUUID(),
@@ -255,17 +261,17 @@ export default function App() {
     };
     await addSource(source, [
       {
-        scene: activeScene,
+        scene,
         transform: {
-          ...fullTransform(project!.output.width / 2, project!.output.height / 2),
-          x: project!.output.width / 4,
-          y: project!.output.height / 4,
+          ...fullTransform(snapshot.output.width / 2, snapshot.output.height / 2),
+          x: snapshot.output.width / 4,
+          y: snapshot.output.height / 4,
         },
       },
     ]);
-  }
+  }, []);
 
-  async function addMediaSource() {
+  const addMediaSource = useCallback(async () => {
     const path = await open({
       multiple: false,
       filters: [
@@ -286,58 +292,238 @@ export default function App() {
       muted: false,
     };
     const visual = canonicalPath.toLowerCase().endsWith(".mp4");
-    await addSource(source, visual ? scenesFor("video") : []);
-  }
+    await addSource(source, visual ? requireSceneTargets("video") : []);
+  }, []);
 
-  async function updateSource(sourceId: string, changes: Partial<Source>) {
-    const latestSource = engineStore
+  const updateSource = useCallback(async (sourceId: string, changes: Partial<Source>) => {
+    const snapshotSource = engineStore
       .getSnapshot()
       .project?.sources.find((source) => source.id === sourceId);
-    if (!latestSource) return;
-    await engineStore.dispatch({
-      type: "update_source",
-      source: { ...latestSource, ...changes } as Source,
-    });
-  }
-
-  async function selectPortalSources() {
-    setSourceLoading(true);
-    try {
-      const result = await engineStore.selectPortalSources();
-      setCandidates(result.candidates);
-      setSourceMessage(result.message);
-      setPortalRequired(result.portalSelectionRequired);
-    } catch (error) {
-      setSourceMessage(String(error));
-    } finally {
-      setSourceLoading(false);
-    }
-  }
-
-  function closeDialog() {
-    setAddOpen(false);
-    requestAnimationFrame(() => addButton.current?.focus());
-  }
-
-  function trapDialogKeys(event: React.KeyboardEvent<HTMLElement>) {
-    if (event.key === "Escape") {
-      event.preventDefault();
-      closeDialog();
+    if (!snapshotSource) {
+      pendingSourceFieldsRef.current.delete(sourceId);
       return;
     }
-    if (event.key !== "Tab") return;
-    const controls = Array.from(
-      event.currentTarget.querySelectorAll<HTMLElement>("button:not(:disabled), input:not(:disabled)"),
+    // Optimistik je Feld: die Basis bleibt stets der autoritative Snapshot; nur
+    // noch nicht bestätigte Felder überlagern ihn – auch Lautstärke/Stumm, die
+    // über eigene Engine-Befehle laufen (setAudioField).
+    const pending: Record<string, unknown> = {
+      ...pendingSourceFieldsRef.current.get(sourceId),
+      ...changes,
+    };
+    for (const key of Object.keys(pending)) {
+      if (pending[key] === (snapshotSource as unknown as Record<string, unknown>)[key]) delete pending[key];
+    }
+    if (Object.keys(pending).length === 0) {
+      pendingSourceFieldsRef.current.delete(sourceId);
+    } else {
+      pendingSourceFieldsRef.current.set(sourceId, pending);
+    }
+    const next = { ...snapshotSource, ...pending } as Source;
+    try {
+      await engineStore.dispatch({ type: "update_source", source: next });
+    } catch (error) {
+      if (pendingSourceFieldsRef.current.get(sourceId) === pending) pendingSourceFieldsRef.current.delete(sourceId);
+      throw error;
+    }
+  }, []);
+
+  const seekMedia = useCallback(
+    (sourceId: string, positionSeconds: number) =>
+      engineStore.dispatch({ type: "media_seek", sourceId, positionSeconds }),
+    [],
+  );
+
+  const setMediaPlaying = useCallback(
+    (sourceId: string, playing: boolean) =>
+      engineStore.dispatch({ type: "set_media_playing", sourceId, playing }),
+    [],
+  );
+
+
+  const flushAudioFields = useCallback(() => {
+    audioFlushFrameRef.current = null;
+    const batch = audioPendingDispatchRef.current;
+    if (batch.size === 0) return;
+    audioPendingDispatchRef.current = new Map();
+    dispatchAudioBatch(batch);
+  }, []);
+
+  const setAudioField = useCallback((sourceId: string, field: "volume" | "muted", value: number | boolean) => {
+    const pending = pendingSourceFieldsRef.current.get(sourceId);
+    pendingSourceFieldsRef.current.set(sourceId, { ...pending, [field]: value });
+    // Overlay sofort setzen; der IPC wird pro Animation-Frame koalesziert,
+    // damit Slider-Ticks sich gegenseitig im Pending-Map überschreiben.
+    audioPendingDispatchRef.current.set(
+      `${sourceId}:${field}`,
+      field === "volume"
+        ? { type: "set_audio_volume", sourceId, volume: value as number }
+        : { type: "set_audio_muted", sourceId, muted: value as boolean },
     );
-    if (controls.length === 0) return;
-    const first = controls[0];
-    const last = controls[controls.length - 1];
-    if (event.shiftKey && document.activeElement === first) {
-      event.preventDefault();
-      last.focus();
-    } else if (!event.shiftKey && document.activeElement === last) {
-      event.preventDefault();
-      first.focus();
+    if (audioFlushFrameRef.current === null) {
+      audioFlushFrameRef.current = requestAnimationFrame(flushAudioFields);
+    }
+  }, []);
+
+  const closeDialog = useCallback(() => {
+    setAddOpen(false);
+    requestAnimationFrame(() => addButton.current?.focus());
+  }, []);
+
+  const dismissOnboarding = useCallback(() => {
+    onboardingDismissedRef.current = true;
+    setOnboarding(false);
+  }, []);
+
+  const startOnboarding = useCallback(() => {
+    dismissOnboarding();
+    setAddOpen(true);
+  }, [dismissOnboarding]);
+
+  const openAddDialog = useCallback(() => setAddOpen(true), []);
+
+  // Auswahl wechselt die Quelle und verwirft alte Fehlermeldungen der
+  // vorherigen Auswahl, damit sie nicht dem neuen Kontext zugeordnet werden.
+  const selectSource = useCallback((sourceId: string) => {
+    setSelectedSourceId(sourceId);
+    setItemError(null);
+    setTextError(null);
+  }, []);
+
+  const pendingField = useCallback(<T,>(sourceId: string, field: string, fallback: T): T => {
+    const pending = pendingSourceFieldsRef.current.get(sourceId)?.[field];
+    return pending == null ? fallback : pending as T;
+  }, []);
+
+  const handleTextChange = useCallback((source: TextSource, event: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const textarea = event.currentTarget;
+    const attempted = textarea.value;
+    setTextError(null);
+    void updateSource(source.id, { text: attempted }).catch((error: unknown) => {
+      setTextError(String(error));
+      // Nur zurücksetzen, wenn keine neuere lokale Eingabe dazwischen liegt.
+      if (textarea.value !== attempted) return;
+      const authoritative = engineStore.getSnapshot().project?.sources.find((entry) => entry.id === source.id);
+      textarea.value = authoritative && authoritative.type === "text" ? authoritative.text : "";
+    });
+  }, [updateSource]);
+
+  const toggleMixerMute = useCallback((source: Source) => {
+    const muted = pendingField(source.id, "muted", "muted" in source ? source.muted : false);
+    setAudioField(source.id, "muted", !muted);
+  }, [pendingField, setAudioField]);
+
+  // Item-Aktionen lesen den Snapshot zum Aufrufzeitpunkt; Randklicks der
+  // relativen Neuanordnung (±1) sind clientseitig stumme No-Ops, sodass die
+  // Beschriftungen „Nach oben“/„Nach unten“ dem Verhalten entsprechen.
+  const runItemAction = useCallback((itemId: string, action: ItemAction) => {
+    const snapshot = engineStore.getSnapshot().project!;
+    const activeScene =
+      snapshot.scenes.find((scene) => scene.id === snapshot.activeSceneId) ?? snapshot.scenes[0];
+    const item = activeScene.items.find((entry) => entry.id === itemId);
+    if (!item) return;
+    let command: EngineCommand;
+    if (action === "toggleVisible") {
+      command = { type: "set_item_visible", sceneId: activeScene.id, itemId, visible: !item.visible };
+    } else if (action === "toggleLocked") {
+      command = { type: "set_item_locked", sceneId: activeScene.id, itemId, locked: !item.locked };
+    } else {
+      const index = activeScene.items.findIndex((entry) => entry.id === itemId);
+      const last = activeScene.items.length - 1;
+      // Bereits am Zielrand: bewusst kein Befehl und keine Fehlermeldung.
+      if ((action === "moveDown" && index <= 0) || (action === "moveUp" && index >= last)) return;
+      command = {
+        type: "reorder_scene_item",
+        sceneId: activeScene.id,
+        itemId,
+        index: action === "moveUp" ? index + 1 : Math.max(0, index - 1),
+      };
+    }
+    void runGuarded(() => engineStore.dispatch(command), setItemError);
+  }, []);
+
+  if (!project) {
+    return (
+      <main className="loading">
+        <h1>Hooviestar</h1>
+        <p role="status">{status}</p>
+      </main>
+    );
+  }
+
+  const activeScene =
+    project.scenes.find((scene) => scene.id === project.activeSceneId) ?? project.scenes[0];
+  const selectedSource =
+    project.sources.find((source) => source.id === selectedSourceId) ?? null;
+  const selectedItem = selectedSource
+    ? activeScene.items.find((item) => item.sourceId === selectedSource.id) ?? null
+    : null;
+  const selectedMediaState =
+    selectedSource?.type === "media" ? (mediaStates[selectedSource.id] ?? null) : null;
+
+
+  /**
+   * Rollenzuordnung ausschließlich über die Seed-Hotkeys (umbenennungsfest);
+   * fehlt eine Standardszene, wird explizit `null` gemeldet, statt still
+   * auf Positionen zurückzufallen.
+   */
+  function scenesFor(role: "game" | "video"): SceneTarget[] | null {
+    // Bewusst den Snapshot zum Aufrufzeitpunkt statt der Render-Closure:
+    // so bleiben die Hinzufügen-Callbacks stabil und der Dialog-Memo wirksam.
+    const snapshot = engineStore.getSnapshot().project!;
+    const scenes = snapshot.scenes;
+    const game = scenes.find((scene) => scene.hotkey === GAME_SCENE_HOTKEY);
+    const video = scenes.find((scene) => scene.hotkey === VIDEO_SCENE_HOTKEY);
+    const both = scenes.find((scene) => scene.hotkey === BOTH_SCENE_HOTKEY);
+    if (!game || !video || !both) return null;
+    const full = fullTransform(snapshot.output.width, snapshot.output.height);
+    if (role === "game") {
+      return game.id === both.id
+        ? [{ scene: game, transform: full }]
+        : [
+            { scene: game, transform: full },
+            { scene: both, transform: full, bottom: true },
+          ];
+    }
+    return video.id === both.id
+      ? [{ scene: video, transform: full }]
+      : [
+          { scene: video, transform: full },
+          { scene: both, transform: pipTransform(snapshot.output) },
+        ];
+  }
+
+  function requireSceneTargets(role: "game" | "video"): SceneTarget[] {
+    const targets = scenesFor(role);
+    if (!targets) {
+      throw new Error(
+        "Standard-Szenen fehlen: „Spiel“ (Ctrl+Alt+1), „Video“ (Ctrl+Alt+2) und „Beides“ (Ctrl+Alt+3) müssen vorhanden sein.",
+      );
+    }
+    return targets;
+  }
+
+  // Lautstärke/Stumm laufen über eigene Engine-Befehle statt update_source; damit
+  // ein gleichzeitiges update_source sie nicht mit dem letzten veröffentlichten
+  // Snapshot zurücküberschreibt, durchlaufen sie denselben Overlay-Pfad und
+  // werden vom Feldabgleich in updateSource bestätigt und verworfen.
+  function dispatchAudioBatch(batch: Map<string, EngineCommand>) {
+    for (const [key, command] of batch) {
+      if (command.type !== "set_audio_volume" && command.type !== "set_audio_muted") continue;
+      const value = command.type === "set_audio_volume" ? command.volume : command.muted;
+      void engineStore.dispatch(command).catch((error: unknown) => {
+        // Fehlschlag sichtbar machen und das Overlay selbst heilen lassen:
+        // der Pending-Eintrag fällt weg, sofern nicht inzwischen ein neuerer
+        // Wert geschrieben wurde (dann bleibt dessen Optimistik erhalten).
+        const separator = key.lastIndexOf(":");
+        const sourceId = key.slice(0, separator);
+        const field = key.slice(separator + 1);
+        const pending = pendingSourceFieldsRef.current.get(sourceId);
+        if (pending && Object.is(pending[field], value)) {
+          delete pending[field];
+          if (Object.keys(pending).length === 0) pendingSourceFieldsRef.current.delete(sourceId);
+        }
+        setAudioError(String(error));
+      });
     }
   }
 
@@ -353,154 +539,64 @@ export default function App() {
         </div>
       </header>
 
-      <nav className="panel scenes" aria-label="Szenen">
-        <div className="panel-title">
-          <h2>Szenen</h2>
-          <button aria-label="Szene hinzufügen" onClick={() => void addScene()}>+</button>
-        </div>
-        <ol>
-          {project.scenes.map((scene) => (
-            <li key={scene.id}>
-              <button
-                className={scene.id === activeScene.id ? "selected" : ""}
-                onClick={() => void switchScene(scene)}
-              >
-                <span>{scene.name}</span><kbd>{scene.hotkey ?? "–"}</kbd>
-              </button>
-            </li>
-          ))}
-        </ol>
-        <form className="hotkey-editor" onSubmit={(event) => void saveSceneHotkey(event)}>
-          <label htmlFor="scene-hotkey">Hotkey für {activeScene.name}</label>
-          <div>
-            <input
-              id="scene-hotkey"
-              name="hotkey"
-              key={`${activeScene.id}:${activeScene.hotkey ?? ""}`}
-              defaultValue={activeScene.hotkey ?? ""}
-              placeholder="Ctrl+Alt+1"
-              autoComplete="off"
-            />
-            <button type="submit">Setzen</button>
-          </div>
-          {hotkeyMessage && <p role="alert">{hotkeyMessage}</p>}
-        </form>
-      </nav>
+      <ScenesPanel
+        scenes={project.scenes}
+        activeScene={activeScene}
+        sceneError={sceneError}
+        hotkeyMessage={hotkeyMessage}
+        onAddScene={handleAddScene}
+        onSwitchScene={handleSwitchScene}
+        onSaveHotkey={handleSaveHotkey}
+      />
 
-      <section className="center">
-        <div className="panel preview-panel">
-          <div className="panel-title">
-            <h2>Vorschau</h2>
-            <span>{project.output.width}×{project.output.height} · {project.output.fps} fps</span>
-          </div>
-          <div id="native-preview-bounds" className="preview" tabIndex={0} aria-label="Native Szenenvorschau">
-            <div className="preview-placeholder">
-              <strong>{activeScene.name}</strong>
-              <span>{navigator.platform.toLowerCase().includes("win") ? "Native D3D11-Vorschau" : "Separates Vulkan-Preview-Fenster"}</span>
-            </div>
-          </div>
-          <p className="hint">Auswahl ziehen · Alt + Rand beschneidet · Strg deaktiviert Einrasten</p>
-        </div>
-        <div className="share-callout">
-          <strong>In Discord teilen:</strong>
-          <span>Fenster „Hooviestar – Program“ auswählen. Nicht das Studio teilen.</span>
-        </div>
-      </section>
+      <PreviewPanel
+        output={project.output}
+        activeSceneName={activeScene.name}
+        onAttachBounds={attachPreviewBounds}
+      />
 
-      <aside className="panel inspector">
-        <div className="panel-title">
-          <h2>Quellen</h2>
-          <button ref={addButton} onClick={() => setAddOpen(true)}>Hinzufügen</button>
-        </div>
-        <ul className="source-list">
-          {project.sources.map((source) => (
-            <li key={source.id}>
-              <button
-                className={source.id === selectedSourceId ? "selected" : ""}
-                onClick={() => setSelectedSourceId(source.id)}
-              >
-                <span className="source-type">{sourceLabel(source)}</span>
-                <strong>{source.name}</strong>
-              </button>
-            </li>
-          ))}
-        </ul>
-        {selectedSource ? (
-          <div className="properties">
-            <h3>Eigenschaften</h3>
-            <label>Name<input value={selectedSource.name} readOnly /></label>
-            {selectedItem && (
-              <div className="property-actions">
-                <button onClick={() => void engineStore.dispatch({ type: "set_item_visible", sceneId: activeScene.id, itemId: selectedItem.id, visible: !selectedItem.visible })}>{selectedItem.visible ? "Ausblenden" : "Einblenden"}</button>
-                <button onClick={() => void engineStore.dispatch({ type: "set_item_locked", sceneId: activeScene.id, itemId: selectedItem.id, locked: !selectedItem.locked })}>{selectedItem.locked ? "Entsperren" : "Sperren"}</button>
-                <button onClick={() => void engineStore.dispatch({ type: "reorder_scene_item", sceneId: activeScene.id, itemId: selectedItem.id, index: activeScene.items.length - 1 })}>Nach oben</button>
-                <button onClick={() => void engineStore.dispatch({ type: "reorder_scene_item", sceneId: activeScene.id, itemId: selectedItem.id, index: 0 })}>Nach unten</button>
-              </div>
-            )}
-            {selectedSource.type === "text" && (
-              <label>Text<textarea value={selectedSource.text} onChange={(event) => void updateSource(selectedSource.id, { text: event.currentTarget.value })} /></label>
-            )}
-            {"volume" in selectedSource && (
-              <>
-                <label>Lautstärke <output>{Math.round(selectedSource.volume * 100)} %</output><input type="range" min="0" max="1" step="0.01" value={selectedSource.volume} onChange={(event) => void engineStore.dispatch({ type: "set_audio_volume", sourceId: selectedSource.id, volume: Number(event.currentTarget.value) })} /></label>
-                <label className="check"><input type="checkbox" checked={selectedSource.muted} onChange={(event) => void engineStore.dispatch({ type: "set_audio_muted", sourceId: selectedSource.id, muted: event.currentTarget.checked })} /> Stumm</label>
-              </>
-            )}
-            {selectedSource.type === "media" && (
-              <div className="media-controls">
-                <button onClick={() => void engineStore.dispatch({ type: "set_media_playing", sourceId: selectedSource.id, playing: !(selectedMediaState?.playing ?? true) })}>{selectedMediaState?.playing === false ? "Wiedergabe" : "Pause"}</button>
-                <label>Position (Sekunden)<input type="number" min="0" step="1" value={Math.round(selectedMediaState?.positionSeconds ?? 0)} onChange={(event) => void engineStore.dispatch({ type: "media_seek", sourceId: selectedSource.id, positionSeconds: Number(event.currentTarget.value) })} /></label>
-                <label className="check"><input type="checkbox" checked={selectedSource.loop} onChange={(event) => void updateSource(selectedSource.id, { loop: event.currentTarget.checked })} /> Wiederholen</label>
-                <label className="check"><input type="checkbox" checked={selectedSource.continueWhenHidden} onChange={(event) => void updateSource(selectedSource.id, { continueWhenHidden: event.currentTarget.checked })} /> Versteckt weiterlaufen</label>
-                <label className="check"><input type="checkbox" checked={selectedSource.restartOnShow} onChange={(event) => void updateSource(selectedSource.id, { restartOnShow: event.currentTarget.checked })} /> Beim Einblenden neu starten</label>
-              </div>
-            )}
-          </div>
-        ) : <p className="empty">Quelle auswählen, um Eigenschaften zu bearbeiten.</p>}
-      </aside>
+      <SourceInspectorPanel
+        sources={project.sources}
+        selectedSourceId={selectedSourceId}
+        selectedSource={selectedSource}
+        selectedItem={selectedItem}
+        mediaState={selectedMediaState}
+        itemError={itemError}
+        textError={textError}
+        addButtonRef={addButton}
+        onSelectSource={selectSource}
+        onAddClick={openAddDialog}
+        onItemAction={runItemAction}
+        onTextChange={handleTextChange}
+        onAudioField={setAudioField}
+        getPendingField={pendingField}
+        onUpdateSource={updateSource}
+        onSeek={seekMedia}
+        onSetPlaying={setMediaPlaying}
+      />
 
-      <section className="panel mixer" aria-label="Audiomixer">
-        <div className="panel-title"><h2>Audiomixer</h2><span>48 kHz · Stereo</span></div>
-        <div className="mixer-grid">
-          {project.sources.filter((source) => "volume" in source).map((source) => (
-            <div className="channel" key={source.id}>
-              <strong>{source.name}</strong>
-              <div className="meter" aria-label={`Pegel ${source.name}`}><i style={{ width: `${Math.min(100, Math.round((levels.find((entry) => entry.sourceId === source.id)?.peak ?? 0) * 100))}%` }} /></div>
-              <button onClick={() => void engineStore.dispatch({ type: "set_audio_muted", sourceId: source.id, muted: !source.muted })}>{source.muted ? "Ton an" : "Stumm"}</button>
-            </div>
-          ))}
-          {!project.sources.some((source) => "volume" in source) && <p className="empty">Noch keine Audioquelle.</p>}
-        </div>
-      </section>
+      <AudioMixerPanel
+        sources={project.sources}
+        levels={levels}
+        audioError={audioError}
+        getPendingField={pendingField}
+        onToggleMute={toggleMixerMute}
+      />
 
       {onboarding && project.sources.length === 0 && (
-        <div className="onboarding-banner" role="region" aria-label="Ersteinrichtung">
-          <div><strong>Spiel, Video und Beides sind vorbereitet.</strong><span>Füge zuerst ein Fenster oder einen Monitor und danach ein Medium hinzu.</span></div>
-          <button onClick={() => { setOnboarding(false); setAddOpen(true); }}>Einrichtung starten</button>
-          <button onClick={() => setOnboarding(false)}>Später</button>
-        </div>
+        <OnboardingBanner onStart={startOnboarding} onDismiss={dismissOnboarding} />
       )}
 
       {addOpen && (
-        <div className="dialog-backdrop" role="presentation">
-          <section ref={dialog} className="dialog" role="dialog" aria-modal="true" aria-labelledby="add-title" onKeyDown={trapDialogKeys}>
-            <div className="panel-title"><h2 id="add-title">Quelle hinzufügen</h2><button aria-label="Schließen" onClick={closeDialog}>×</button></div>
-            <div className="source-options">
-              <button onClick={() => void addTextSource()}><strong>Text</strong><span>GPU-gerenderte Beschriftung</span></button>
-              <button onClick={() => void addImageSource()}><strong>Bild</strong><span>PNG, JPEG oder BMP</span></button>
-              <button onClick={() => void addMediaSource()}><strong>Medium</strong><span>MP4, MP3 oder WAV</span></button>
-              {sourceLoading && <p role="status">Quellen werden gesucht…</p>}
-              {portalRequired && <button onClick={() => void selectPortalSources()}><strong>Fenster oder Monitor auswählen</strong><span>Desktop-Portal öffnen</span></button>}
-              {candidates.map((candidate) => (
-                <button key={`${candidate.type}:${candidate.runtimeId}`} onClick={() => void addCandidate(candidate)}>
-                  <strong>{candidate.name}</strong>
-                  <span>{candidate.type === "window" ? "Fenster" : candidate.type === "display" ? "Monitor" : "Anwendungs-Audio"}</span>
-                </button>
-              ))}
-              {sourceMessage && <p className="source-message">{sourceMessage}</p>}
-            </div>
-          </section>
-        </div>
+        <AddSourceDialog
+          onAddText={addTextSource}
+          onAddImage={addImageSource}
+          onAddMedia={addMediaSource}
+          onAddCandidate={addCandidate}
+          onEnumerate={engineStore.enumerateSources}
+          onSelectPortal={engineStore.selectPortalSources}
+          onClose={closeDialog}
+        />
       )}
     </main>
   );

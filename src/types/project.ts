@@ -151,21 +151,6 @@ export interface ProjectV1 {
   activeSceneId: Uuid;
 }
 
-/** Erlaubte Ausgabe-Presets. */
-export const OUTPUT_PRESETS = [
-  { label: "1280 × 720 · 30 fps", width: 1280, height: 720, fps: 30 },
-  { label: "1920 × 1080 · 60 fps", width: 1920, height: 1080, fps: 60 },
-] as const;
-
-export function matchesOutputPreset(output: OutputConfig): string | null {
-  for (const p of OUTPUT_PRESETS) {
-    if (p.width === output.width && p.height === output.height && p.fps === output.fps) {
-      return `${p.width}x${p.height}@${p.fps}`;
-    }
-  }
-  return null;
-}
-
 /* ------------------------------------------------------------------ */
 /* Laufzeit-Wächter (Validierung externer Daten, u. a. Fixtures)       */
 /* ------------------------------------------------------------------ */
@@ -396,24 +381,6 @@ export function parseProjectV1(value: unknown): ProjectV1 | null {
   const activeSceneId = value.activeSceneId as string;
   if (!scenes.some((s) => s.id === activeSceneId)) return null;
   return { version: 1, output, sources, scenes, activeSceneId };
-}
-
-/** Standard-Transform zentriert in der gegebenen Ausgabe. */
-export function defaultTransform(output: OutputConfig, aspect = 16 / 9, fillRatio = 0.5): Transform {
-  const width = Math.round(output.width * fillRatio);
-  const height = Math.round(width / aspect);
-  return {
-    x: Math.round((output.width - width) / 2),
-    y: Math.round((output.height - height) / 2),
-    width,
-    height,
-    rotationDegrees: 0,
-    cropTop: 0,
-    cropRight: 0,
-    cropBottom: 0,
-    cropLeft: 0,
-    opacity: 1,
-  };
 }
 
 /** Bild-PiP rechts unten, wie vom Einrichtungsassistenten verwendet. */

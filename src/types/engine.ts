@@ -86,9 +86,7 @@ export const ENGINE_COMMAND_TYPES = [
   "media_seek",
   "set_audio_volume",
   "set_audio_muted",
-] as const;
-
-export type EngineCommandType = (typeof ENGINE_COMMAND_TYPES)[number];
+] as const satisfies readonly EngineCommand["type"][];
 
 /* ------------------------------------------------------------------ */
 /* EngineEvent                                                         */
@@ -193,9 +191,7 @@ export const ENGINE_EVENT_TYPES = [
   "unsupported_media",
   "audio_warning",
   "engine_error",
-] as const;
-
-export type EngineEventType = (typeof ENGINE_EVENT_TYPES)[number];
+] as const satisfies readonly EngineEvent["type"][];
 
 /* ------------------------------------------------------------------ */
 /* Ereignis-Wächter                                                    */
@@ -209,10 +205,12 @@ import {
 export function parseEngineEvent(value: unknown): EngineEvent | null {
   if (!isRecord(value)) return null;
   switch (value.type) {
-    case "snapshot":
-      return parseProjectV1(value.project)
-        ? ({ type: "snapshot", project: parseProjectV1(value.project) as ProjectV1 })
-        : null;
+    case "snapshot": {
+      // Einmal parsen und wiederverwenden – der Doppelaufruf durchlief und
+      // allokierte das komplette Projekt zweimal pro Event.
+      const project = parseProjectV1(value.project);
+      return project ? { type: "snapshot", project } : null;
+    }
     case "source_available":
       return typeof value.sourceId === "string"
         ? { type: "source_available", sourceId: value.sourceId }
