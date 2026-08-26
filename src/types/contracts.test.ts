@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import fixture from "../../contracts/project-v1.json";
 import { parseProjectV1 } from "./project";
 import { ENGINE_COMMAND_TYPES, ENGINE_EVENT_TYPES, parseEngineEvent } from "./engine";
+import commandSamples from "../../contracts/commands-v1.json";
+import eventSamples from "../../contracts/events-v1.json";
 
 describe("shared engine contract", () => {
   it("accepts every persisted source variant from Rust fixture", () => {
@@ -56,5 +58,18 @@ describe("shared engine contract", () => {
     const project = structuredClone(fixture);
     project.scenes[0].items[0].sourceId = "00000000-0000-4000-8000-0000000000ff";
     expect(parseProjectV1(project)).toBeNull();
+  });
+  it("positively parses every pinned event sample from the shared Rust fixture", () => {
+    const samples = eventSamples as unknown as { type: string }[];
+    expect(samples.map((sample) => sample.type)).toEqual([...ENGINE_EVENT_TYPES]);
+    for (const sample of samples) {
+      const event = parseEngineEvent(sample);
+      expect(event).not.toBeNull();
+      expect(event?.type).toBe(sample.type);
+    }
+  });
+  it("pins every command tag in the shared Rust fixture exactly once", () => {
+    const tags = (commandSamples as unknown as { type: string }[]).map((sample) => sample.type);
+    expect(tags).toEqual([...ENGINE_COMMAND_TYPES]);
   });
 });

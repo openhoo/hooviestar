@@ -162,7 +162,21 @@ impl LinuxMedia {
         let uri = gst::glib::filename_to_uri(Path::new(path), None)
             .map_err(|e| format!("media URI: {e}"))?;
         let (tx, rx) = mpsc::channel();
-        let ring = Arc::new(Mutex::new(PcmRing::new(SAMPLE_RATE as usize)));
+        // Windows-Paritaet: existiert fuer die Quelle bereits ein
+        // Bus-Ring (Sitzung ohne remove() neu eroeffnet), wird er
+        // wiederverwendet statt einen neuen zu praegen; der Mixer
+        // behaelt seine Ring-Identitaet. Stale PCM wird beim Binden
+        // verworfen, der Ring startet stumm.
+        let ring = audio
+            .lock()
+            .get(&source_id)
+            .cloned()
+            .unwrap_or_else(|| Arc::new(Mutex::new(PcmRing::new(SAMPLE_RATE as usize))));
+        {
+            let mut bound = ring.lock();
+            bound.clear();
+            bound.set_active(false);
+        }
         let worker_ring = ring.clone();
         let audio_bus = audio.clone();
         let notice_tx = self.notice_tx.clone();
@@ -220,6 +234,14 @@ impl LinuxMedia {
             }
             let _ = worker.commands.send(command);
         }
+    }
+    /// Ring-Identitaet des aktiven Workers fuer Paritaetspruefungen:
+    /// die Audio-Seite kann so pruefen, ob ihr zwischengespeicherter
+    /// Ring noch der aktuelle ist (Linux praegt pro Sitzung neu,
+    /// remove() loescht den Bus-Eintrag).
+    pub fn audio_ring_handle(&self, source_id: Uuid) -> Option<Arc<Mutex<PcmRing>>> {
+        let commands = self.commands.lock().ok()?;
+        commands.get(&source_id).map(|worker| worker.ring.clone())
     }
     pub fn remove(&self, source_id: Uuid, audio: &MediaAudioBus) {
         // Join the worker AFTER releasing the map lock: MediaWorker::drop
@@ -724,6 +746,30 @@ fn run_pipeline_once(
                                 eprintln!("play media: set_state(Playing) fehlgeschlagen");
                             }
                         }
+                    }
+                    if !playing {
+                        // Fehlgeschlagener Neustart/Resume ehrlich melden:
+                        // der Renderer schreibt den Bus auf playing=false
+                        // zurueck und retryt nicht pro Frame (Windows-
+                        // Paritaet). Der naechste Nutzer-Play startet neu.
+                        let position = pipeline
+                            .query_position::<gst::ClockTime>()
+                            .map(|t| t.seconds() as f64)
+                            .unwrap_or(0.0);
+                        let duration = pipeline
+                            .query_duration::<gst::ClockTime>()
+                            .map(|t| t.seconds() as f64);
+                        send_control(
+                            notices,
+                            MediaNotice::State {
+                                source_id,
+                                state: MediaRuntimeState {
+                                    playing: false,
+                                    position_seconds: position,
+                                    duration_seconds: duration,
+                                },
+                            },
+                        );
                     }
                 }
                 MediaCommand::Pause => {

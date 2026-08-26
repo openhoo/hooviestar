@@ -207,6 +207,29 @@ export function parseTransform(value: unknown): Transform | null {
   }
   const opacity = value.opacity as number;
   if (opacity < 0 || opacity > 1) return null;
+  // project.rs:310-320 – zusätzlich zu den endlichen Feldern (num oben):
+  // Breite/Höhe größer 0 und höchstens 8192, Crops nicht negativ,
+  // Cropsummen bleiben unterhalb der Abmessungen.
+  const width = value.width as number;
+  const height = value.height as number;
+  const cropTop = value.cropTop as number;
+  const cropRight = value.cropRight as number;
+  const cropBottom = value.cropBottom as number;
+  const cropLeft = value.cropLeft as number;
+  if (
+    width <= 0 ||
+    height <= 0 ||
+    width > 8192 ||
+    height > 8192 ||
+    cropTop < 0 ||
+    cropRight < 0 ||
+    cropBottom < 0 ||
+    cropLeft < 0 ||
+    cropLeft + cropRight >= width ||
+    cropTop + cropBottom >= height
+  ) {
+    return null;
+  }
   return {
     x: value.x as number,
     y: value.y as number,
@@ -228,6 +251,8 @@ export function parseSource(value: unknown): Source | null {
   if (!uuid(value.id) || !str(value.name)) return null;
   const id = value.id as string;
   const name = value.name as string;
+  // project.rs:238-240 – leere Quellnamen (nach Trimmen) sind ungültig.
+  if (name.trim().length === 0) return null;
   switch (type) {
     case "window": {
       const b = value.binding;
@@ -254,6 +279,9 @@ export function parseSource(value: unknown): Source | null {
       }
       const align = value.align;
       if (align !== "left" && align !== "center" && align !== "right") return null;
+      // project.rs:254-256 – Schriftgröße endlich (num oben), > 0, <= 4096.
+      const fontSizePx = value.fontSizePx as number;
+      if (fontSizePx <= 0 || fontSizePx > 4096) return null;
       return {
         type,
         id,
@@ -324,8 +352,16 @@ export function parseSceneItem(value: unknown): SceneItem | null {
 
 export function parseScene(value: unknown): Scene | null {
   if (!isRecord(value) || !uuid(value.id) || !str(value.name)) return null;
-  if (value.hotkey !== null && !str(value.hotkey)) return null;
+  // project.rs:271-273 – leere Szenennamen (nach Trimmen) sind ungültig.
+  if ((value.name as string).trim().length === 0) return null;
+  // project.rs:141/serde – abwesender Schlüssel zählt wie null als kein
+  // Hotkey; project.rs:277-280 – leerer Hotkey (nach Trimmen) ungültig.
+  if (value.hotkey !== null && value.hotkey !== undefined) {
+    if (!str(value.hotkey) || (value.hotkey as string).trim().length === 0) return null;
+  }
   if (!Array.isArray(value.items)) return null;
+  // project.rs:285-287 – höchstens 128 Items pro Szene.
+  if (value.items.length > 128) return null;
   const items: SceneItem[] = [];
   for (const raw of value.items) {
     const item = parseSceneItem(raw);
@@ -342,6 +378,17 @@ export function parseScene(value: unknown): Scene | null {
 
 export function parseOutputConfig(value: unknown): OutputConfig | null {
   if (!isRecord(value) || !num(value.width) || !num(value.height) || !num(value.fps) || !color(value.background)) {
+    return null;
+  }
+  // project.rs:220-225 – nur die freigegebenen Presets (1280,720,30)
+  // und (1920,1080,60) sind gültig.
+  const outWidth = value.width as number;
+  const outHeight = value.height as number;
+  const outFps = value.fps as number;
+  if (
+    !(outWidth === 1280 && outHeight === 720 && outFps === 30) &&
+    !(outWidth === 1920 && outHeight === 1080 && outFps === 60)
+  ) {
     return null;
   }
   return {
@@ -362,17 +409,38 @@ export function parseProjectV1(value: unknown): ProjectV1 | null {
   if (!uuid(value.activeSceneId)) return null;
   const sources: Source[] = [];
   const sourceIds = new Set<string>();
+  // project.rs:232/267-269 – ein ID-Namespace über Quellen, Szenen und Items.
+  const allIds = new Set<string>();
   for (const raw of value.sources) {
     const source = parseSource(raw);
     if (!source || sourceIds.has(source.id)) return null;
     sources.push(source);
     sourceIds.add(source.id);
+    allIds.add(source.id);
   }
   const scenes: Scene[] = [];
+  const sceneIds = new Set<string>();
+  const hotkeys = new Set<string>();
+  const itemIds = new Set<string>();
   for (const raw of value.scenes) {
     const scene = parseScene(raw);
     if (!scene) return null;
+    // project.rs:274-276 – doppelte Szenen-ID oder Kollision über Arten.
+    if (sceneIds.has(scene.id) || allIds.has(scene.id)) return null;
+    sceneIds.add(scene.id);
+    allIds.add(scene.id);
+    if (scene.hotkey !== null) {
+      // project.rs:281-283 – Hotkeys case-insensitive projektweit eindeutig.
+      const normalized = scene.hotkey.toLowerCase();
+      if (hotkeys.has(normalized)) return null;
+      hotkeys.add(normalized);
+    }
     for (const item of scene.items) {
+      // project.rs:289-291 – doppelte Item-ID oder Kollision über Arten.
+      if (itemIds.has(item.id) || allIds.has(item.id)) return null;
+      itemIds.add(item.id);
+      allIds.add(item.id);
+      // project.rs:292-294 – referenzierte Quelle muss existieren.
       if (!sourceIds.has(item.sourceId)) return null;
     }
     scenes.push(scene);

@@ -754,6 +754,7 @@ fn run_pipewire(
     let mut retry_cooldown: HashMap<Uuid, u32> = HashMap::new();
     let mut last_counters: HashMap<Uuid, (u64, u64, bool)> = HashMap::new();
     let mut last_tick = Instant::now();
+    let mut notice_channel_lost = false;
 
     while !stop.load(Ordering::Acquire) {
         match notice_receiver.recv_timeout(CONTROL_TICK) {
@@ -794,7 +795,24 @@ fn run_pipewire(
                 }
             },
             Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // Alle Notice-Sender sind verschwunden, ohne dass gestoppt
+                // wurde: Der Steuerthread liefe als stiller Zombie weiter
+                // und der Supervisor-Neustart bliebe toter Code. Nach dem
+                // kontrollierten Teardown unten mit Fehler zurückkehren;
+                // beim sauberen Stopp bleibt es bei Ok(()).
+                //
+                // Restlücke für den Orchestrator: Stirbt der PipeWire-Daemon
+                // selbst, schließt das diesen Kanal nicht zwangsläufig —
+                // eine vollständige Daemon-Todeserkennung bräuchte einen
+                // state_changed/Error-Hook am Programmstream (bewusst nicht
+                // implementiert, invasive pipewire-rs-Chirurgie).
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                notice_channel_lost = true;
+                break;
+            }
         }
 
         if !stop.load(Ordering::Acquire) && last_tick.elapsed() >= CONTROL_TICK {
@@ -998,11 +1016,38 @@ fn run_pipewire(
 
             // 4) Medienquellen mit Bus-Ringen verbinden.
             for (source_id, name, volume, muted) in &desired_media {
-                if let Some(input) = mixers.get(source_id) {
-                    input.set_level(*volume, *muted);
-                    // Name wird beim Erzeugen für RT-freie Warntexte übernommen.
-                    emit_availability(&events, &mut availability, *source_id, true, "");
-                    continue;
+                // Ring-Identität je Tick prüfen: LinuxMedia::open kann je
+                // Öffnung einen neuen Ring erzeugen, dessen Worker den Bus-
+                // Eintrag ersetzt; zudem löscht LinuxMedia::remove() den
+                // Bus-Eintrag und jeder Reopen-Pfad ruft remove() zuerst auf
+                // (Abstimmung: VulkanLinuxMediaFix18). Nach einem Reopen
+                // (Pfadwechsel, Unsupported-Cooldown) würde die Mischung
+                // sonst dauerhaft den verwaisten alten Ring leeren — Stille
+                // ohne Telemetrie. Verwaiste Einträge werden verworfen; der
+                // Anhang-Zweig darunter baut Eintrag und Zähler-Baselines
+                // neu auf. Die Prüfung bleibt daher auch bei Ring-
+                // Wiedernutzung im Medienpfad tragend und ist dort nur im
+                // Surviving-Entry-Fall eine billige Invariante.
+                let orphaned = match mixers.get(source_id) {
+                    Some(input) => {
+                        let ring_matches_bus = media_audio
+                            .lock()
+                            .get(source_id)
+                            .is_some_and(|current| Arc::ptr_eq(&input.ring, current));
+                        if ring_matches_bus {
+                            input.set_level(*volume, *muted);
+                            // Name wird beim Erzeugen für RT-freie Warntexte übernommen.
+                            emit_availability(&events, &mut availability, *source_id, true, "");
+                            continue;
+                        }
+                        true
+                    }
+                    None => false,
+                };
+                if orphaned {
+                    mixers.remove(source_id);
+                    last_counters.remove(source_id);
+                    rebuild_snapshot(&mixers, &mix_inputs);
                 }
                 let bus_ring = media_audio.lock().get(source_id).cloned();
                 match bus_ring {
@@ -1083,6 +1128,9 @@ fn run_pipewire(
         drop(program_stream);
     }
     thread_loop.stop();
+    if notice_channel_lost {
+        return Err("PipeWire-Meldungskanal wurde unerwartet geschlossen".into());
+    }
     Ok(())
 }
 

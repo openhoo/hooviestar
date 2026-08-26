@@ -1,0 +1,134 @@
+[
+  {
+    "type": "add_source",
+    "source": {
+      "type": "image",
+      "id": "00000000-0000-4000-8000-000000000001",
+      "name": "Bild",
+      "path": "C:\\image.png"
+    }
+  },
+  {
+    "type": "remove_source",
+    "sourceId": "00000000-0000-4000-8000-000000000001"
+  },
+  {
+    "type": "update_source",
+    "source": {
+      "type": "image",
+      "id": "00000000-0000-4000-8000-000000000001",
+      "name": "Bild",
+      "path": "C:\\image.png"
+    }
+  },
+  {
+    "type": "add_scene",
+    "sceneId": "00000000-0000-4000-8000-000000000001",
+    "name": "Szene"
+  },
+  {
+    "type": "remove_scene",
+    "sceneId": "00000000-0000-4000-8000-000000000001"
+  },
+  {
+    "type": "rename_scene",
+    "sceneId": "00000000-0000-4000-8000-000000000001",
+    "name": "Neu"
+  },
+  {
+    "type": "set_active_scene",
+    "sceneId": "00000000-0000-4000-8000-000000000001"
+  },
+  {
+    "type": "set_scene_hotkey",
+    "sceneId": "00000000-0000-4000-8000-000000000001",
+    "hotkey": "Ctrl+Alt+1"
+  },
+  {
+    "type": "add_scene_item",
+    "sceneId": "00000000-0000-4000-8000-000000000001",
+    "itemId": "00000000-0000-4000-8000-000000000001",
+    "sourceId": "00000000-0000-4000-8000-000000000001",
+    "transform": {
+      "x": 0,
+      "y": 0,
+      "width": 1280,
+      "height": 720,
+      "rotationDegrees": 0,
+      "cropTop": 0,
+      "cropRight": 0,
+      "cropBottom": 0,
+      "cropLeft": 0,
+      "opacity": 1
+    }
+  },
+  {
+    "type": "remove_scene_item",
+    "sceneId": "00000000-0000-4000-8000-000000000001",
+    "itemId": "00000000-0000-4000-8000-000000000001"
+  },
+  {
+    "type": "set_item_visible",
+    "sceneId": "00000000-0000-4000-8000-000000000001",
+    "itemId": "00000000-0000-4000-8000-000000000001",
+    "visible": true
+  },
+  {
+    "type": "set_item_locked",
+    "sceneId": "00000000-0000-4000-8000-000000000001",
+    "itemId": "00000000-0000-4000-8000-000000000001",
+    "locked": true
+  },
+  {
+    "type": "reorder_scene_item",
+    "sceneId": "00000000-0000-4000-8000-000000000001",
+    "itemId": "00000000-0000-4000-8000-000000000001",
+    "index": 0
+  },
+  {
+    "type": "set_transform",
+    "sceneId": "00000000-0000-4000-8000-000000000001",
+    "itemId": "00000000-0000-4000-8000-000000000001",
+    "transform": {
+      "x": 0,
+      "y": 0,
+      "width": 1280,
+      "height": 720,
+      "rotationDegrees": 0,
+      "cropTop": 0,
+      "cropRight": 0,
+      "cropBottom": 0,
+      "cropLeft": 0,
+      "opacity": 1
+    }
+  },
+  {
+    "type": "set_output_config",
+    "output": {
+      "width": 1280,
+      "height": 720,
+      "fps": 30,
+      "background": "#101418"
+    }
+  },
+  {
+    "type": "set_media_playing",
+    "sourceId": "00000000-0000-4000-8000-000000000001",
+    "playing": true
+  },
+  {
+    "type": "media_seek",
+    "sourceId": "00000000-0000-4000-8000-000000000001",
+    "positionSeconds": 1.25
+  },
+  {
+    "type": "set_audio_volume",
+    "sourceId": "00000000-0000-4000-8000-000000000001",
+    "volume": 0.5
+  },
+  {
+    "type": "set_audio_muted",
+    "sourceId": "00000000-0000-4000-8000-000000000001",
+    "muted": true
+  }
+]

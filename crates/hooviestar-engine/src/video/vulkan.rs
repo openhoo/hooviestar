@@ -1634,6 +1634,7 @@ struct MediaRuntimeBinding {
     playing: bool,
     opened: bool,
     retry_after: Option<Instant>,
+    control_epoch: u64,
 }
 
 #[derive(Debug)]
@@ -1845,6 +1846,7 @@ impl RenderRuntime {
                                     } else {
                                         Some(Instant::now() + MEDIA_RETRY_COOLDOWN)
                                     },
+                                    control_epoch: 0,
                                 },
                             );
                         }
@@ -1860,6 +1862,7 @@ impl RenderRuntime {
                             media.command(*id, MediaCommand::Seek(0.0));
                         }
                         let control = media_control.read().get(id).copied().unwrap_or_default();
+                        runtime.control_epoch = control.epoch;
                         let should_play =
                             control.playing && (visible || *continue_when_hidden);
                         if runtime.playing != should_play {
@@ -1874,13 +1877,17 @@ impl RenderRuntime {
                             runtime.playing = should_play;
                         }
                         runtime.visible = visible;
-                        if let Some(position) = control.seek_seconds {
+                        // Atomar entnehmen: ein zwischen Snapshot und
+                        // Loeschen ankommender Seek darf nicht verloren
+                        // gehen (Windows-Paritaet: take unter einem Lock).
+                        let seek = media_control
+                            .write()
+                            .entry(*id)
+                            .or_default()
+                            .seek_seconds
+                            .take();
+                        if let Some(position) = seek {
                             media.command(*id, MediaCommand::Seek(position));
-                            media_control
-                                .write()
-                                .entry(*id)
-                                .or_default()
-                                .seek_seconds = None;
                         }
                     }
                     for id in media_sources.keys().copied().collect::<Vec<_>>() {
@@ -1895,6 +1902,22 @@ impl RenderRuntime {
                     for notice in media.drain_notices() {
                         match notice {
                             MediaNotice::State { source_id, state } => {
+                                if let Some(runtime) = media_sources.get_mut(&source_id) {
+                                    runtime.playing = state.playing;
+                                    // Windows-Paritaet: das vom Worker selbst
+                                    // ausgeloeste Pausieren am Dateiende muss
+                                    // den Bus zurueckschreiben, sonst bleibt
+                                    // playing=true haengen und Play erzeugt
+                                    // keine Kante mehr. Der Epoch-Vergleich
+                                    // schuetzt ein gleichzeitiges Nutzer-Play.
+                                    if !state.playing {
+                                        let mut bus = media_control.write();
+                                        let entry = bus.entry(source_id).or_default();
+                                        if entry.epoch == runtime.control_epoch {
+                                            entry.playing = false;
+                                        }
+                                    }
+                                }
                                 let _ = events.send(EngineEvent::MediaState { source_id, state });
                             }
                             MediaNotice::Unsupported { source_id, reason } => {

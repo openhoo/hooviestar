@@ -929,7 +929,7 @@ impl RenderRuntime {
                         .find(|scene| scene.id == snapshot.active_scene_id);
                     pump_window_frames(
                         active_scene,
-                        &captures,
+                        &mut captures,
                         &mut frames,
                         &mut stale_windows,
                         &events,
@@ -1297,14 +1297,17 @@ fn try_resize_compositor(
 }
 
 /// Neueste WGC-Frames der sichtbaren Fensterquellen in den
-/// Render-Cache uebernehmen.
+/// Render-Cache uebernehmen. Geschlossene Captives gibt der Lauf
+/// frei; der naechste synchronize_window_captures-Lauf baut sie
+/// neu auf, sobald wieder ein passendes Fenster existiert.
 fn pump_window_frames(
     active_scene: Option<&Scene>,
-    captures: &HashMap<Uuid, WindowCapture>,
+    captures: &mut HashMap<Uuid, WindowCapture>,
     frames: &mut HashMap<Uuid, D3d11CapturedFrame>,
     stale_windows: &mut HashSet<Uuid>,
     events: &mpsc::Sender<EngineEvent>,
 ) {
+    let mut closed_windows: Vec<Uuid> = Vec::new();
     if let Some(scene) = active_scene {
         for item in scene.items.iter().filter(|item| item.visible) {
             if let Some(capture) = captures.get(&item.source_id) {
@@ -1336,10 +1339,26 @@ fn pump_window_frames(
                                 reason: reason.into(),
                             });
                         }
+                        if capture.is_closed() {
+                            // Geschlossene Captive entsorgen; der
+                            // naechste synchronize_window_captures-Lauf
+                            // baut sie neu auf, sobald wieder ein
+                            // passendes Fenster existiert.
+                            closed_windows.push(item.source_id);
+                            // Die Verfuegbarkeits-Vormerkung gehoert zur
+                            // alten Captive; der Neuaufbau meldet den
+                            // Uebergang zurueck zu verfuegbar selbst.
+                            stale_windows.remove(&item.source_id);
+                        }
                     }
                 }
             }
         }
+    }
+    // Geschlossene Captive wegwerfen; der naechste Sync-Lauf baut
+    // sie neu auf (wie pump_displays bei toten Duplikationen).
+    for source_id in closed_windows {
+        captures.remove(&source_id);
     }
 }
 

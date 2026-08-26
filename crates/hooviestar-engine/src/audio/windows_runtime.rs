@@ -70,6 +70,12 @@ const MIXER_HEALTHY_RUNTIME: Duration = Duration::from_secs(30);
 /// Ticks (je 500 ms) mit durchgehend leerem Ring, bevor ein gebundener,
 /// lebender Capture einmalig Stagnation meldet.
 const STALE_RING_TICKS: u32 = 30;
+
+/// Begrenzt aufeinanderfolgende Warte-Timeouts des Render-Events (je 100 ms):
+/// Rund 5 s ohne WASAPI-Ereignis bedeuten ein ungültig gewordenes Endgerät;
+/// danach kehrt ein Fehler zum Supervisor-Neustart zurück statt stiller
+/// Dauerschleife.
+const WASAPI_MAX_WAIT_TIMEOUTS: u32 = 50;
 #[implement(IActivateAudioInterfaceCompletionHandler)]
 struct ActivationHandler {
     sender: StdMutex<Option<mpsc::Sender<Result<IAudioClient, String>>>>,
@@ -195,9 +201,14 @@ impl Drop for ProcessAudioCapture {
     }
 }
 
+/// Übergabetresor für Quell-Handles zwischen Mischer-Inkarnationen: Ein
+/// interner Neustart darf die Stummschaltung gebundener Sitzungen nicht
+/// kurzzeitig aufheben (hörbares Leck während der Backoff-Zeit). Erst das
+/// echte Herunterfahren (Supervisor-Stopp bzw. Runtime-Drop) stellt wieder her.
 pub struct AudioRuntime {
     stop: Arc<AtomicBool>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    handle_vault: HandleVault,
 }
 
 impl AudioRuntime {
@@ -225,6 +236,8 @@ impl AudioRuntime {
         let last_failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let thread_last_failure = last_failure.clone();
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let handle_vault: HandleVault = Arc::new(Mutex::new(HashMap::new()));
+        let thread_vault = handle_vault.clone();
         let thread = thread::Builder::new()
             .name("wasapi-mixer".into())
             .spawn(move || {
@@ -241,6 +254,7 @@ impl AudioRuntime {
                         journal_path.clone(),
                         thread_stop.clone(),
                         ready_sender.clone(),
+                        thread_vault.clone(),
                     );
                     match result {
                         Ok(()) => return, // Sauberer Stopp ueber das Stop-Flag.
@@ -282,6 +296,7 @@ impl AudioRuntime {
             Ok(Ok(())) => Ok(Self {
                 stop,
                 thread: Mutex::new(Some(thread)),
+                handle_vault,
             }),
             Ok(Err(error)) => {
                 // Der Thread wiederholt Fehler intern mit Backoff; hier
@@ -310,6 +325,9 @@ impl AudioRuntime {
         if let Some(thread) = self.thread.lock().take() {
             let _ = thread.join();
         }
+        // Tresor leeren: Ohne Nachfolge-Inkarnation stellen die Drops
+        // der Handles die Sitzungen wieder her.
+        self.handle_vault.lock().clear();
     }
 }
 
@@ -319,6 +337,7 @@ impl Drop for AudioRuntime {
         if let Some(thread) = self.thread.get_mut().take() {
             let _ = thread.join();
         }
+        self.handle_vault.lock().clear();
     }
 }
 /// Schläft die Dauer ab, bricht aber früh bei gesetztem Stopp-Flag aus.
@@ -353,11 +372,20 @@ fn mixer_thread(
     journal_path: PathBuf,
     stop: Arc<AtomicBool>,
     ready: mpsc::SyncSender<Result<(), String>>,
+    handle_vault: HandleVault,
 ) -> Result<(), String> {
     unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
         .ok()
         .map_err(|error| error.to_string())?;
-    let result = mixer_thread_initialized(project, events, media_audio, journal_path, stop, ready);
+    let result = mixer_thread_initialized(
+        project,
+        events,
+        media_audio,
+        journal_path,
+        stop,
+        ready,
+        handle_vault,
+    );
     unsafe { CoUninitialize() };
     result
 }
@@ -369,6 +397,7 @@ fn mixer_thread_initialized(
     journal_path: PathBuf,
     stop: Arc<AtomicBool>,
     ready: mpsc::SyncSender<Result<(), String>>,
+    handle_vault: HandleVault,
 ) -> Result<(), String> {
     let enumerator: IMMDeviceEnumerator =
         unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
@@ -421,6 +450,7 @@ fn mixer_thread_initialized(
                 .spawn({
                     let live = live.clone();
                     let stop = stop.clone();
+                    let vault = handle_vault;
                     move || {
                         management_loop(
                             project,
@@ -430,6 +460,7 @@ fn mixer_thread_initialized(
                             live,
                             stop,
                             thread_mgmt_stop,
+                            vault,
                         )
                     }
                 })
@@ -439,10 +470,23 @@ fn mixer_thread_initialized(
     let _ = ready.send(Ok(()));
 
     let mut last_levels = Instant::now();
+    // Aufeinanderfolgende Warte-Timeouts zählen: Ein gesundes Endgerät
+    // meldet sich spätestens nach 100 ms.
+    let mut wait_timeouts: u32 = 0;
     while !stop.load(Ordering::Acquire) {
         if unsafe { WaitForSingleObject(stream.event, 100) } != WAIT_OBJECT_0 {
+            // Auch im Timeout die Gerätegesundheit prüfen: GetCurrentPadding
+            // scheitert am invalidierten Gerät, `?` wandelt das in den
+            // vorhandenen Supervisor-Neustart um.
+            let _padding =
+                unsafe { stream.client.GetCurrentPadding() }.map_err(|error| error.to_string())?;
+            wait_timeouts += 1;
+            if wait_timeouts >= WASAPI_MAX_WAIT_TIMEOUTS {
+                return Err("WASAPI meldet keine Ereignisse mehr".into());
+            }
             continue;
         }
+        wait_timeouts = 0;
         let padding =
             unsafe { stream.client.GetCurrentPadding() }.map_err(|error| error.to_string())?;
         let frames = buffer_size.saturating_sub(padding);
@@ -565,6 +609,10 @@ impl Drop for SourceHandle {
         self.restore();
     }
 }
+
+/// Tresor-Typ für die Übergabe lebender Quell-Handles an die nächste
+/// Mischer-Inkarnation (siehe `AudioRuntime.handle_vault`).
+type HandleVault = Arc<Mutex<HashMap<Uuid, SourceHandle>>>;
 
 /// Mischseitige Sicht einer Quelle ohne blockierende Besitztümer.
 struct LiveSource {
@@ -868,8 +916,11 @@ fn management_loop(
     live: Arc<Mutex<HashMap<Uuid, Arc<LiveSource>>>>,
     stop: Arc<AtomicBool>,
     mgmt_stop: Arc<AtomicBool>,
+    handle_vault: HandleVault,
 ) {
-    let mut handles: HashMap<Uuid, SourceHandle> = HashMap::new();
+    // Noch lebende Handles der Vorgänger-Inkarnation übernehmen: Die
+    // Capture-Threads laufen weiter, die Stummschaltung bleibt bestehen.
+    let mut handles: HashMap<Uuid, SourceHandle> = std::mem::take(&mut *handle_vault.lock());
     let mut availability: HashMap<Uuid, bool> = HashMap::new();
     let mut retry_cooldown: HashMap<Uuid, CooldownEntry> = HashMap::new();
     let mut last_overruns: HashMap<Uuid, u64> = HashMap::new();
@@ -923,9 +974,17 @@ fn management_loop(
         );
         sleep_stoppable_either(&stop, &mgmt_stop, MANAGEMENT_SYNC_INTERVAL);
     }
-    // Herunterfahren: Drops stoppen die Capture-Threads und stellen die
-    // Sitzungen wieder her.
-    handles.clear();
+    // Echtes Herunterfahren (Supervisor-Stopp): Drops stoppen die Capture-
+    // Threads und stellen die Sitzungen wieder her. Notstopp nach internem
+    // Render-Fehler dagegen: Handles in den Tresor legen, damit die nächste
+    // Inkarnation sie übernimmt, ohne die Stummschaltung kurzzeitig
+    // aufzuheben. Übernimmt keine Inkarnation mehr (ausgeschöpfte Neustarts),
+    // räumt AudioRuntime beim Stopp/Drop den Tresor aus.
+    if stop.load(Ordering::Acquire) {
+        handles.clear();
+    } else {
+        *handle_vault.lock() = handles;
+    }
 }
 
 fn capture_thread(

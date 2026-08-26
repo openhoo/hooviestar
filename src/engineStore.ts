@@ -72,7 +72,10 @@ export const engineStore = {
       publish({ ...state, project: initial, status: "Program bereit" });
       await listen<unknown>("engine-event", ({ payload }) => {
         const event = parseEngineEvent(payload);
-        if (!event) return;
+        if (!event) {
+          console.warn("[hooviestar] unverständliches Engine-Event verworfen:", payload);
+          return;
+        }
         let status = state.status;
         if (event.type === "device_recovery") {
           status = event.phase === "started"
@@ -127,7 +130,14 @@ export const engineStore = {
       });
       // Bereitschaftssignal: der Listener ist angehängt – vom Start verpasste
       // Hotkey-Fehler des Backends jetzt nachliefern (drainiert den Puffer).
-      await invoke("engine_status").catch(() => {});
+      await invoke("engine_status").catch((error: unknown) => {
+        // Wie der Snapshot-Pfad behandeln: Ein nicht bestätigter Status darf
+        // nicht hinter grünem Programm-Status versickern. Startflag lösen,
+        // sichtbaren Status melden – der nächste Mount versucht den
+        // vollständigen Attach samt Nachlieferung erneut.
+        started = false;
+        publish({ ...state, status: `Engine-Status nicht bestätigt: ${String(error)}` });
+      });
     } catch (error) {
       // Fehlgeschlagenen Start nicht dauerhaft festschreiben: Der nächste
       // start()-Aufruf (z. B. nach Remount) darf es erneut versuchen.
