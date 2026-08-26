@@ -1,0 +1,28 @@
+import { memo } from "react";
+import type { OutputConfig } from "../types";
+
+interface StatusBarProps {
+  status: string;
+  output: OutputConfig;
+  sceneCount: number;
+  sourceCount: number;
+}
+
+function StatusBarImpl({ status, output, sceneCount, sourceCount }: StatusBarProps) {
+  return (
+    <footer className="status-bar">
+      <span className="status-item">
+        <span className="status-dot" />
+        <span role="status">{status}</span>
+      </span>
+      <span className="status-item">
+        {sceneCount} {sceneCount === 1 ? "Szene" : "Szenen"} · {sourceCount} {sourceCount === 1 ? "Quelle" : "Quellen"}
+      </span>
+      <span className="status-item">
+        {output.width}×{output.height} · {output.fps} fps
+      </span>
+    </footer>
+  );
+}
+
+export const StatusBar = memo(StatusBarImpl);

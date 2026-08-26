@@ -1,5 +1,6 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { engineStore } from "./engineStore";
 import { pipTransform } from "./types";
@@ -12,6 +13,10 @@ import { SourceInspectorPanel } from "./components/SourceInspectorPanel";
 import type { ItemAction } from "./components/SourceInspectorPanel";
 import { AudioMixerPanel } from "./components/AudioMixerPanel";
 import { OnboardingBanner } from "./components/OnboardingBanner";
+import { SourcesPanel } from "./components/SourcesPanel";
+import type { SourceRow } from "./components/SourcesPanel";
+import { ControlsDock } from "./components/ControlsDock";
+import { StatusBar } from "./components/StatusBar";
 
 
 function fullTransform(width: number, height: number): Transform {
@@ -407,10 +412,17 @@ export default function App() {
     });
   }, [updateSource]);
 
-  const toggleMixerMute = useCallback((source: Source) => {
-    const muted = pendingField(source.id, "muted", "muted" in source ? source.muted : false);
-    setAudioField(source.id, "muted", !muted);
+  const toggleMixerMute = useCallback((sourceId: string) => {
+    // Snapshot statt Render-Closure: der Kanal kann zwischen Renders verschwunden sein.
+    const source = engineStore.getSnapshot().project?.sources.find((entry) => entry.id === sourceId);
+    if (!source || !("muted" in source)) return;
+    const muted = pendingField(sourceId, "muted", source.muted);
+    setAudioField(sourceId, "muted", !muted);
   }, [pendingField, setAudioField]);
+
+  const setMixerVolume = useCallback((sourceId: string, volume: number) => {
+    setAudioField(sourceId, "volume", volume);
+  }, [setAudioField]);
 
   // Item-Aktionen lesen den Snapshot zum Aufrufzeitpunkt; Randklicks der
   // relativen Neuanordnung (±1) sind clientseitig stumme No-Ops, sodass die
@@ -441,6 +453,27 @@ export default function App() {
     void runGuarded(() => engineStore.dispatch(command), setItemError);
   }, []);
 
+  const removeScene = useCallback((sceneId: string) => {
+    void runGuarded(() => engineStore.dispatch({ type: "remove_scene", sceneId }), setSceneError);
+  }, []);
+
+  const renameScene = useCallback((sceneId: string, name: string) => {
+    void runGuarded(() => engineStore.dispatch({ type: "rename_scene", sceneId, name }), setSceneError);
+  }, []);
+
+  // Kaskadierendes Entfernen: die Engine räumt referenzierende Items ab;
+  // hier nur die Auswahl und ihre Fehlermeldungen zurücksetzen.
+  const removeSource = useCallback((sourceId: string) => {
+    setSelectedSourceId((current) => (current === sourceId ? null : current));
+    setItemError(null);
+    setTextError(null);
+    void runGuarded(() => engineStore.dispatch({ type: "remove_source", sourceId }), setItemError);
+  }, []);
+
+  const quitStudio = useCallback(() => {
+    void getCurrentWindow().close();
+  }, []);
+
   if (!project) {
     return (
       <main className="loading">
@@ -459,6 +492,25 @@ export default function App() {
     : null;
   const selectedMediaState =
     selectedSource?.type === "media" ? (mediaStates[selectedSource.id] ?? null) : null;
+
+  // Zeilen für das Quellen-Dock: Items der aktiven Szene mit Sichtbarkeits-
+  // und Sperrzustand; übrige Quellen erscheinen als „außerhalb der Szene“.
+  const sourceRows: SourceRow[] = project.sources.map((source) => {
+    const item = activeScene.items.find((entry) => entry.sourceId === source.id);
+    return item
+      ? { key: item.id, source, itemId: item.id, visible: item.visible, locked: item.locked }
+      : { key: source.id, source };
+  });
+
+  // Audiokanäle mit Pending-Overlay, damit Slider-Optimistik im Mixer ankommt.
+  const mixerChannels = project.sources
+    .filter((source): source is Source & { volume: number; muted: boolean } => "volume" in source)
+    .map((source) => ({
+      sourceId: source.id,
+      name: source.name,
+      volume: pendingField(source.id, "volume", source.volume),
+      muted: pendingField(source.id, "muted", source.muted),
+    }));
 
 
   /**
@@ -530,57 +582,82 @@ export default function App() {
   return (
     <main className="studio">
       <header className="topbar">
-        <div>
+        <div className="brand">
           <h1>Hooviestar</h1>
           <p>Discord-Szenenstudio für Windows und Linux</p>
         </div>
-        <div className="program-state">
-          <span className="status-dot" /> <span role="status">{status}</span>
-        </div>
       </header>
 
-      <ScenesPanel
-        scenes={project.scenes}
-        activeScene={activeScene}
-        sceneError={sceneError}
-        hotkeyMessage={hotkeyMessage}
-        onAddScene={handleAddScene}
-        onSwitchScene={handleSwitchScene}
-        onSaveHotkey={handleSaveHotkey}
-      />
+      <section className="center-band">
+        <PreviewPanel
+          output={project.output}
+          activeSceneName={activeScene.name}
+          onAttachBounds={attachPreviewBounds}
+        />
+        <div className="preview-strip">
+          <span className="strip-label">
+            {selectedSource ? selectedSource.name : "Keine Quelle ausgewählt"}
+          </span>
+          <span className="strip-hint">In Discord teilen: Fenster „Hooviestar – Program“, nicht das Studio</span>
+        </div>
+      </section>
 
-      <PreviewPanel
+      <div className="dock-row">
+        <ScenesPanel
+          scenes={project.scenes}
+          activeScene={activeScene}
+          sceneError={sceneError}
+          hotkeyMessage={hotkeyMessage}
+          onAddScene={handleAddScene}
+          onSwitchScene={handleSwitchScene}
+          onSaveHotkey={handleSaveHotkey}
+          onRemoveScene={removeScene}
+          onRenameScene={renameScene}
+        />
+        <SourcesPanel
+          rows={sourceRows}
+          selectedSourceId={selectedSourceId}
+          addButtonRef={addButton}
+          onSelectSource={selectSource}
+          onAddClick={openAddDialog}
+          onRemoveSource={removeSource}
+          onItemAction={runItemAction}
+        />
+        <AudioMixerPanel
+          channels={mixerChannels}
+          levels={levels}
+          audioError={audioError}
+          onVolume={setMixerVolume}
+          onToggleMute={toggleMixerMute}
+        />
+        <SourceInspectorPanel
+          selectedSourceId={selectedSourceId}
+          selectedSource={selectedSource}
+          selectedItem={selectedItem}
+          mediaState={selectedMediaState}
+          itemError={itemError}
+          textError={textError}
+          onSelectSource={selectSource}
+          onItemAction={runItemAction}
+          onTextChange={handleTextChange}
+          onAudioField={setAudioField}
+          getPendingField={pendingField}
+          onUpdateSource={updateSource}
+          onSeek={seekMedia}
+          onSetPlaying={setMediaPlaying}
+        />
+        <ControlsDock
+          onAddSource={openAddDialog}
+          onStartOnboarding={startOnboarding}
+          onQuit={quitStudio}
+        />
+      </div>
+
+      <StatusBar
+        status={status}
         output={project.output}
-        activeSceneName={activeScene.name}
-        onAttachBounds={attachPreviewBounds}
-      />
-
-      <SourceInspectorPanel
-        sources={project.sources}
-        selectedSourceId={selectedSourceId}
-        selectedSource={selectedSource}
-        selectedItem={selectedItem}
-        mediaState={selectedMediaState}
-        itemError={itemError}
-        textError={textError}
-        addButtonRef={addButton}
-        onSelectSource={selectSource}
-        onAddClick={openAddDialog}
-        onItemAction={runItemAction}
-        onTextChange={handleTextChange}
-        onAudioField={setAudioField}
-        getPendingField={pendingField}
-        onUpdateSource={updateSource}
-        onSeek={seekMedia}
-        onSetPlaying={setMediaPlaying}
-      />
-
-      <AudioMixerPanel
-        sources={project.sources}
-        levels={levels}
-        audioError={audioError}
-        getPendingField={pendingField}
-        onToggleMute={toggleMixerMute}
+        sceneCount={project.scenes.length}
+        sourceCount={project.sources.length}
       />
 
       {onboarding && project.sources.length === 0 && (

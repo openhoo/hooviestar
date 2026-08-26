@@ -1,40 +1,75 @@
 import { memo } from "react";
-import type { Source } from "../types";
+import { SpeakerIcon } from "./icons";
 
 type LevelEntry = { sourceId: string; peak: number; rms: number };
 
 interface AudioMixerPanelProps {
-  sources: Source[];
+  channels: Array<{ sourceId: string; name: string; volume: number; muted: boolean }>;
   levels: LevelEntry[];
   audioError: string | null;
-  getPendingField: <T>(sourceId: string, field: string, fallback: T) => T;
-  onToggleMute: (source: Source) => void;
+  onVolume: (sourceId: string, volume: number) => void;
+  onToggleMute: (sourceId: string) => void;
 }
 
-function AudioMixerPanelImpl({ sources, levels, audioError, getPendingField, onToggleMute }: AudioMixerPanelProps) {
-  function levelWidth(sourceId: string): number {
-    const peak = levels.find((entry) => entry.sourceId === sourceId)?.peak ?? 0;
-    return Math.min(100, Math.round(peak * 100));
-  }
+function levelWidth(levels: LevelEntry[], sourceId: string): number {
+  const peak = levels.find((entry) => entry.sourceId === sourceId)?.peak ?? 0;
+  return Math.min(100, Math.max(0, Math.round(peak * 100)));
+}
 
-  function mixerMuted(source: Source): boolean {
-    return getPendingField(source.id, "muted", "muted" in source ? source.muted : false);
-  }
+function toDb(volume: number): string {
+  return volume <= 0 ? "−∞ dB" : `${(20 * Math.log10(volume)).toFixed(1)} dB`;
+}
 
-  const audioSources = sources.filter((source) => "volume" in source);
+function AudioMixerPanelImpl({ channels, levels, audioError, onVolume, onToggleMute }: AudioMixerPanelProps) {
   return (
-    <section className="panel mixer" aria-label="Audiomixer">
-      <div className="panel-title"><h2>Audiomixer</h2><span>48 kHz · Stereo</span></div>
-      <div className="mixer-grid">
-        {audioSources.map((source) => (
-          <div className="channel" key={source.id}>
-            <strong>{source.name}</strong>
-            <div className="meter" aria-label={`Pegel ${source.name}`}><i style={{ width: `${levelWidth(source.id)}%` }} /></div>
-            <button onClick={() => onToggleMute(source)}>{mixerMuted(source) ? "Ton an" : "Stumm"}</button>
+    <section className="dock mixer-dock" aria-label="Audio-Mixer">
+      <div className="dock-title">
+        <h2>Audio-Mixer</h2>
+        <span>48 kHz · Stereo</span>
+      </div>
+      <div className="mixer-channels">
+        {channels.map((channel) => (
+          <div className="mixer-channel" key={channel.sourceId}>
+            <div className="channel-head">
+              <span className="channel-name" title={channel.name}>{channel.name}</span>
+              <output className="db-readout">{toDb(channel.volume)}</output>
+            </div>
+            <div className="meter horizontal" aria-label={`Pegel ${channel.name}`}>
+              <i style={{ width: `${levelWidth(levels, channel.sourceId)}%` }} />
+            </div>
+            <div className="db-scale" aria-hidden="true">
+              <span>-60</span>
+              <span>-40</span>
+              <span>-20</span>
+              <span>-12</span>
+              <span>-6</span>
+              <span>0</span>
+            </div>
+            <div className="fader-row">
+              <input
+                className="fader"
+                type="range"
+                min={0}
+                max={1}
+                step={0.01}
+                value={channel.volume}
+                aria-label={`Lautstärke ${channel.name}`}
+                onChange={(event) => onVolume(channel.sourceId, Number(event.currentTarget.value))}
+              />
+              <button
+                type="button"
+                className={channel.muted ? "mute-button muted" : "mute-button"}
+                aria-label={channel.muted ? "Ton einschalten" : "Stumm schalten"}
+                title={channel.muted ? "Ton einschalten" : "Stumm schalten"}
+                onClick={() => onToggleMute(channel.sourceId)}
+              >
+                <SpeakerIcon size={14} />
+              </button>
+            </div>
           </div>
         ))}
-        {audioSources.length === 0 && <p className="empty">Noch keine Audioquelle.</p>}
       </div>
+      {channels.length === 0 && <p className="empty">Noch keine Audioquelle.</p>}
       {audioError && <p role="alert">{audioError}</p>}
     </section>
   );

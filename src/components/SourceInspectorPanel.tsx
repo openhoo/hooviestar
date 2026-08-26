@@ -2,28 +2,17 @@ import { memo } from "react";
 import type { MediaRuntimeState, SceneItem, Source, TextSource } from "../types";
 import { MediaInspector } from "./MediaInspector";
 
-function sourceLabel(source: Source) {
-  if (source.type === "application_audio") return "Anwendungs-Audio";
-  if (source.type === "window") return "Fenster";
-  if (source.type === "display") return "Monitor";
-  if (source.type === "image") return "Bild";
-  if (source.type === "text") return "Text";
-  return "Medium";
-}
 
 export type ItemAction = "toggleVisible" | "toggleLocked" | "moveUp" | "moveDown";
 
 interface SourceInspectorPanelProps {
-  sources: Source[];
   selectedSourceId: string | null;
   selectedSource: Source | null;
   selectedItem: SceneItem | null;
   mediaState: MediaRuntimeState | null;
   itemError: string | null;
   textError: string | null;
-  addButtonRef: React.RefObject<HTMLButtonElement | null>;
   onSelectSource: (sourceId: string) => void;
-  onAddClick: () => void;
   onItemAction: (itemId: string, action: ItemAction) => void;
   onTextChange: (source: TextSource, event: React.ChangeEvent<HTMLTextAreaElement>) => void;
   onAudioField: (sourceId: string, field: "volume" | "muted", value: number | boolean) => void;
@@ -34,16 +23,11 @@ interface SourceInspectorPanelProps {
 }
 
 function SourceInspectorPanelImpl({
-  sources,
-  selectedSourceId,
   selectedSource,
   selectedItem,
   mediaState,
   itemError,
   textError,
-  addButtonRef,
-  onSelectSource,
-  onAddClick,
   onItemAction,
   onTextChange,
   onAudioField,
@@ -53,24 +37,11 @@ function SourceInspectorPanelImpl({
   onSetPlaying,
 }: SourceInspectorPanelProps) {
   return (
-    <aside className="panel inspector">
-      <div className="panel-title">
-        <h2>Quellen</h2>
-        <button ref={addButtonRef} onClick={onAddClick}>Hinzufügen</button>
+    <aside className="dock inspector-dock" aria-label="Eigenschaften">
+      <div className="dock-title">
+        <h2>Eigenschaften</h2>
+        <span className="inspected-name">{selectedSource?.name ?? "—"}</span>
       </div>
-      <ul className="source-list">
-        {sources.map((source) => (
-          <li key={source.id}>
-            <button
-              className={source.id === selectedSourceId ? "selected" : ""}
-              onClick={() => onSelectSource(source.id)}
-            >
-              <span className="source-type">{sourceLabel(source)}</span>
-              <strong>{source.name}</strong>
-            </button>
-          </li>
-        ))}
-      </ul>
       {selectedSource ? (
         <div className="properties">
           <h3>Eigenschaften</h3>
