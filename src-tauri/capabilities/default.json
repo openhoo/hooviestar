@@ -5,8 +5,6 @@
   "windows": ["studio"],
   "permissions": [
     "core:default",
-    "core:event:allow-listen",
-    "core:event:allow-unlisten",
     "dialog:allow-open"
   ]
 }

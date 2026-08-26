@@ -68,18 +68,23 @@ impl NativePreview {
     }
 }
 
-pub fn enumerate_sources(surfaces: NativeSurfaces) -> Result<SourceEnumeration, String> {
+pub async fn enumerate_sources(surfaces: NativeSurfaces) -> Result<SourceEnumeration, String> {
     let excluded = [surfaces.studio, surfaces.program, surfaces.preview];
-    let mut candidates =
-        hooviestar_engine::discovery::windows::enumerate_visible_windows(&excluded)?;
-    candidates.extend(hooviestar_engine::discovery::windows::enumerate_displays()?);
-    let message = match hooviestar_engine::discovery::windows::enumerate_audio_sessions() {
-        Ok(audio) => {
-            candidates.extend(audio);
-            None
-        }
-        Err(error) => Some(format!("Anwendungs-Audio nicht verfügbar: {error}")),
-    };
+    let (candidates, message) = tauri::async_runtime::spawn_blocking(move || {
+        let mut candidates =
+            hooviestar_engine::discovery::windows::enumerate_visible_windows(&excluded)?;
+        candidates.extend(hooviestar_engine::discovery::windows::enumerate_displays()?);
+        let message = match hooviestar_engine::discovery::windows::enumerate_audio_sessions() {
+            Ok(audio) => {
+                candidates.extend(audio);
+                None
+            }
+            Err(error) => Some(format!("Anwendungs-Audio nicht verfügbar: {error}")),
+        };
+        Ok::<_, String>((candidates, message))
+    })
+    .await
+    .map_err(|error| format!("enumerate_sources task failed: {error}"))??;
     Ok(SourceEnumeration {
         candidates,
         portal_selection_required: false,

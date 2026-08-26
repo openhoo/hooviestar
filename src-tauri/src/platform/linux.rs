@@ -101,8 +101,13 @@ impl NativePreview {
     }
 }
 
-pub fn enumerate_sources(_surfaces: NativeSurfaces) -> Result<SourceEnumeration, String> {
-    let (candidates, message) = match hooviestar_engine::discovery::linux::enumerate_audio_nodes() {
+pub async fn enumerate_sources(_surfaces: NativeSurfaces) -> Result<SourceEnumeration, String> {
+    let result = tauri::async_runtime::spawn_blocking(|| {
+        hooviestar_engine::discovery::linux::enumerate_audio_nodes()
+    })
+    .await
+    .map_err(|error| format!("enumerate_sources task failed: {error}"))?;
+    let (candidates, message) = match result {
         Ok(candidates) => (
             candidates,
             Some("Fenster und Monitore werden über das Desktop-Portal ausgewählt.".into()),

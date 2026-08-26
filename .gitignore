@@ -12,3 +12,4 @@ src-tauri/gen/
 .env.*
 !.env.example
 Thumbs.db
+VP_VULKANINFO_*.json

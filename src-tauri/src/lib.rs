@@ -25,6 +25,20 @@ struct AppState {
     preview: usize,
     surfaces: NativeSurfaces,
     hotkey_mutations: Mutex<()>,
+    // Beim Start verpasste Hotkey-Fehler; das Webview hängt seinen Listener erst
+    // nach get_snapshot an, darum emittiert engine_status sie beim Be-
+    // reitschaftssignal direkt über den normalen Event-Pfad.
+    initial_hotkey_failures: Mutex<Vec<(Uuid, String)>>,
+    // Beim Start bereits in den Event-Kanal gestellte Engine-Ereignisse
+    // (DeviceRecovery::Failed, EngineError); der Forwarder-Thread und der
+    // Webview-Listener existieren noch nicht, darum emittiert engine_status
+    // sie beim Bereitschaftssignal über den normalen Event-Pfad.
+    initial_events: Mutex<Vec<EngineEvent>>,
+    // Bereitschaftssignal des Webviews: Läuft engine_status noch nicht,
+    // puffert der Forwarder-Thread Ereignisse hier (Cap 512, älteste werden
+    // verworfen), statt sie an noch nicht registrierte Listener zu verlieren.
+    events_ready: AtomicBool,
+    pending_events: Mutex<Vec<EngineEvent>>,
 }
 
 struct RuntimeResources {
@@ -54,8 +68,10 @@ impl RuntimeResources {
         }
         let _ = app.global_shortcut().unregister_all();
         self.stop_events.store(true, Ordering::Release);
-        if let Some(engine) = self.engine.lock().expect("engine mutex poisoned").take() {
-            let _ = engine.shutdown();
+        if let Some(engine) = self.engine.lock().expect("engine mutex poisoned").take()
+            && let Err(error) = engine.shutdown()
+        {
+            eprintln!("[hooviestar] engine shutdown persistence error: {error}");
         }
         if let Some(thread) = self
             .event_thread
@@ -112,9 +128,14 @@ fn dispatch(
             .command(command)
             .map_err(|error| error.to_string())?;
         if let Some(shortcut) = shortcut {
-            app.global_shortcut()
-                .unregister(shortcut.as_str())
-                .map_err(|error| error.to_string())?;
+            // Best effort: Eine Alt-Registrierung, die beim Start einen
+            // Konflikt verlor und nie registriert wurde, darf Löschen nicht
+            // scheitern lassen.
+            if app.global_shortcut().is_registered(shortcut.as_str())
+                && let Err(error) = app.global_shortcut().unregister(shortcut.as_str())
+            {
+                eprintln!("[hooviestar] failed to unregister scene hotkey {shortcut}: {error}");
+            }
         }
         return Ok(());
     }
@@ -126,13 +147,49 @@ fn dispatch(
 }
 
 #[tauri::command]
-fn engine_status() -> &'static str {
+fn engine_status(app: tauri::AppHandle, state: State<'_, AppState>) -> &'static str {
+    let mut events: Vec<EngineEvent> = state
+        .inner()
+        .initial_events
+        .lock()
+        .expect("startup event mutex poisoned")
+        .drain(..)
+        .collect();
+    let pending: Vec<(Uuid, String)> = state
+        .inner()
+        .initial_hotkey_failures
+        .lock()
+        .expect("hotkey mutex poisoned")
+        .drain(..)
+        .collect();
+    for (scene_id, message) in pending {
+        events.push(EngineEvent::HotkeyError { scene_id, message });
+    }
+    // Erst bereit signalisieren, dann entleeren: Ereignisse, die dazwischen
+    // ankommen, umgehen den Puffer und gehen direkt an den Emit-Pfad.
+    state.events_ready.store(true, Ordering::Release);
+    events.extend(
+        state
+            .inner()
+            .pending_events
+            .lock()
+            .expect("pending event mutex poisoned")
+            .drain(..),
+    );
+    // Der Webview haengt seinen Listener vor diesem Aufruf an (engineStore
+    // start(): listen() vor engine_status), darum gehen hier verpasste
+    // Ereignisse direkt an den selben Emit-Pfad wie der Forwarder-Thread.
+    for event in &events {
+        if let Err(error) = app.emit("engine-event", event) {
+            eprintln!("[hooviestar] failed to emit replayed engine event: {error}");
+        }
+    }
     "running"
 }
 
 #[tauri::command]
-fn enumerate_sources(state: State<'_, AppState>) -> Result<SourceEnumeration, String> {
-    platform::enumerate_sources(state.inner().surfaces)
+async fn enumerate_sources(state: State<'_, AppState>) -> Result<SourceEnumeration, String> {
+    platform::enumerate_sources(state.inner().surfaces).await
 }
 
 #[tauri::command]
@@ -143,15 +200,19 @@ async fn select_portal_sources(
 }
 
 #[tauri::command]
-fn canonicalize_file(path: String) -> Result<String, String> {
-    let canonical = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
-    if !canonical.is_file() {
-        return Err("selected path is not a regular file".into());
-    }
-    canonical
-        .into_os_string()
-        .into_string()
-        .map_err(|_| "selected path is not valid Unicode".to_string())
+async fn canonicalize_file(path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let canonical = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
+        if !canonical.is_file() {
+            return Err("selected path is not a regular file".into());
+        }
+        canonical
+            .into_os_string()
+            .into_string()
+            .map_err(|_| "selected path is not valid Unicode".to_string())
+    })
+    .await
+    .map_err(|error| format!("canonicalize_file task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -213,11 +274,25 @@ pub fn run() {
             #[cfg(target_os = "linux")]
             setup_resources.portal.set_link(engine.portal_link());
             let events = engine.take_events().map_err(|error| error.to_string())?;
+            // Startzeit-Ereignisse stecken bereits im Kanal, bevor der
+            // Forwarder-Thread und der Webview-Listener existieren; sie werden
+            // gepuffert und von engine_status nachgeliefert.
+            let initial_events = Mutex::new({
+                let mut buffered = Vec::new();
+                while let Ok(event) = events.try_recv() {
+                    buffered.push(event);
+                }
+                buffered
+            });
             app.manage(AppState {
                 engine: engine.clone(),
                 preview: preview_handle,
                 surfaces,
                 hotkey_mutations: Mutex::new(()),
+                initial_hotkey_failures: Mutex::new(Vec::new()),
+                initial_events,
+                events_ready: AtomicBool::new(false),
+                pending_events: Mutex::new(Vec::new()),
             });
             register_initial_hotkeys(app.handle(), engine.clone());
 
@@ -226,11 +301,50 @@ pub fn run() {
             let event_thread = thread::Builder::new()
                 .name("engine-events".into())
                 .spawn(move || {
+                    let mut printed_once = false;
                     while !stop_events.load(Ordering::Acquire) {
                         match events.recv_timeout(Duration::from_millis(100)) {
                             Ok(event) => {
-                                if handle.emit("engine-event", event).is_err() {
-                                    break;
+                                let state = handle.state::<AppState>();
+                                let mut pending = state
+                                    .pending_events
+                                    .lock()
+                                    .expect("pending event mutex poisoned");
+                                // Sperr-Reihenfolge gegen Stranding: Der Forwarder
+                                // sperrt pending_events ZUERST und liest events_ready
+                                // erst unter dieser Sperre neu. false: Der Push er-
+                                // folgt unter derselben Sperre; engine_status sig-
+                                // nalisiert Bereitschaft (Store) vor dem Entleeren
+                                // und entleert unter eben dieser Sperre, sieht je-
+                                // den zuvor gepushten Eintrag also sicher. true:
+                                // Der Store liegt zurueck, das Ereignis umgeht den
+                                // Puffer und geht direkt an den Emit-Pfad. Jedes
+                                // Ereignis wird damit entweder entleert oder
+                                // emittiert und kann nie im Puffer stranden.
+                                if !state.events_ready.load(Ordering::Acquire) {
+                                    let overflowed = pending.len() >= 512;
+                                    if overflowed {
+                                        pending.remove(0);
+                                    }
+                                    pending.push(event);
+                                    drop(pending);
+                                    if overflowed {
+                                        // Nur beim Uebergang in den Ueberlauf loggen,
+                                        // nicht Zeile fuer Zeile pro Verwurf.
+                                        if !printed_once {
+                                            eprintln!(
+                                                "[hooviestar] pending event buffer full; dropped oldest"
+                                            );
+                                        }
+                                        printed_once = true;
+                                    } else {
+                                        printed_once = false;
+                                    }
+                                } else {
+                                    drop(pending);
+                                    if let Err(error) = handle.emit("engine-event", event) {
+                                        eprintln!("[hooviestar] failed to emit engine event: {error}");
+                                    }
                                 }
                             }
                             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -314,19 +428,27 @@ pub fn run_audio_watchdog(parent_process_id: u32, journal: &std::path::Path) {
 pub fn run_audio_watchdog(_parent_process_id: u32, _journal: &std::path::Path) {}
 
 fn register_initial_hotkeys(app: &AppHandle, engine: Arc<EngineHandle>) {
+    let app_state = app.state::<AppState>();
+    let initial_hotkey_failures = &app_state.inner().initial_hotkey_failures;
+    let mut failures: Vec<String> = Vec::new();
     for scene in engine.snapshot().scenes {
         let Some(shortcut) = scene.hotkey else {
             continue;
         };
         if let Err(error) = register_hotkey(app, engine.clone(), scene.id, &shortcut) {
-            let _ = app.emit(
-                "engine-event",
-                EngineEvent::HotkeyError {
-                    scene_id: scene.id,
-                    message: format!("{shortcut}: {error}"),
-                },
-            );
+            failures.push(format!("scene {} [{shortcut}]: {error}", scene.id));
+            initial_hotkey_failures
+                .lock()
+                .expect("hotkey mutex poisoned")
+                .push((scene.id, format!("{shortcut}: {error}")));
         }
+    }
+    if !failures.is_empty() {
+        eprintln!(
+            "[hooviestar] failed to register {} initial scene hotkey(s): {}",
+            failures.len(),
+            failures.join("; ")
+        );
     }
 }
 
@@ -346,6 +468,23 @@ fn update_scene_hotkey(
         .ok_or_else(|| "scene not found".to_string())?
         .hotkey;
     if old_shortcut == new_shortcut {
+        // Identisches Neu-Speichern ist nur dann ein No-op, wenn die
+        // Registrierung noch lebt; nach einem verlorenen Startkonflikt wird
+        // sie hier erneuert, statt stumm Ok zu melden.
+        if let Some(shortcut) = &new_shortcut
+            && !app.global_shortcut().is_registered(shortcut.as_str())
+            && let Err(error) = register_hotkey(app, engine.clone(), scene_id, shortcut)
+        {
+            let message = format!("{shortcut}: {error}");
+            let _ = app.emit(
+                "engine-event",
+                EngineEvent::HotkeyError {
+                    scene_id,
+                    message: message.clone(),
+                },
+            );
+            return Err(message);
+        }
         return Ok(());
     }
 
@@ -362,13 +501,15 @@ fn update_scene_hotkey(
         );
         return Err(message);
     }
-    if let Some(shortcut) = &old_shortcut
-        && let Err(error) = app.global_shortcut().unregister(shortcut.as_str())
-    {
-        if let Some(new_shortcut) = &new_shortcut {
-            let _ = app.global_shortcut().unregister(new_shortcut.as_str());
+    if let Some(shortcut) = &old_shortcut {
+        // Best effort: Eine Alt-Registrierung, die beim Start einen Konflikt
+        // verlor und nie registriert wurde, darf Neusetzen oder Löschen nicht
+        // scheitern lassen.
+        if app.global_shortcut().is_registered(shortcut.as_str())
+            && let Err(error) = app.global_shortcut().unregister(shortcut.as_str())
+        {
+            eprintln!("[hooviestar] failed to unregister old scene hotkey {shortcut}: {error}");
         }
-        return Err(error.to_string());
     }
 
     let command = EngineCommand::SetSceneHotkey {

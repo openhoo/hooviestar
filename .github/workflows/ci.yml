@@ -39,7 +39,22 @@ jobs:
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libpipewire-0.3-dev libvulkan-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libclang-dev
+      - name: Check formatting
+        if: runner.os == 'Linux'
+        run: cargo fmt --all --check
+      - name: Clippy
+        if: runner.os == 'Linux'
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --target ${{ matrix.target }}
+
+  msrv:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - name: Install Linux dependencies
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libpipewire-0.3-dev libvulkan-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libclang-dev
+      - run: cargo check --workspace --all-targets
 
   bundle:
     strategy:
