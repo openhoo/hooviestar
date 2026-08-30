@@ -19,11 +19,16 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": ["nsis", "deb", "appimage"],
     "shortDescription": "Native GPU scene compositor for Discord",
     "longDescription": "Compose windows, displays, text, images and local media into a clean Program window for Discord screen sharing.",
     "icon": ["icons/icon.png", "icons/icon.ico"],
-    "windows": { "nsis": { "installMode": "currentUser" } },
+    "windows": {
+      "digestAlgorithm": "sha256",
+      "timestampUrl": "http://timestamp.digicert.com",
+      "nsis": { "installMode": "currentUser" }
+    },
     "linux": {
       "appimage": {
         "bundleMediaFramework": true
@@ -38,6 +43,14 @@
           "gstreamer1.0-plugins-bad"
         ]
       }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEI3MjJDQ0Q2N0FGQjI4QjMKUldTektQdDYxc3dpdHc5ZC9IeGFyZ2UxY3RWVmxCZi8yTU0vMHpCa00vNnpHNHFkZHdrNlk1cEoK",
+      "endpoints": [
+        "https://github.com/openhoo/hooviestar/releases/latest/download/latest.json"
+      ]
     }
   }
 }

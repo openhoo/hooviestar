@@ -16,6 +16,31 @@ fn main() {
         },
     };
 
+    let arguments: Vec<String> = std::env::args().collect();
+    let value = |name: &str| {
+        arguments
+            .windows(2)
+            .find(|pair| pair[0] == name)
+            .map(|pair| pair[1].as_str())
+    };
+    let frequency_hz: f32 = value("--frequency")
+        .unwrap_or("440")
+        .parse()
+        .expect("--frequency must be a number");
+    let amplitude: f32 = value("--amplitude")
+        .unwrap_or("0.2")
+        .parse()
+        .expect("--amplitude must be a number");
+    let duration_seconds: u64 = value("--duration")
+        .unwrap_or("300")
+        .parse()
+        .expect("--duration must be an integer");
+    let grouping = value("--grouping")
+        .map(parse_guid)
+        .unwrap_or_else(|| windows::core::GUID::from_u128(0x48564f4f_5649_4553_5441_52544f4e4501));
+    assert!(frequency_hz.is_finite() && frequency_hz > 0.0);
+    assert!(amplitude.is_finite() && (0.0..=1.0).contains(&amplitude));
+
     unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
         .ok()
         .expect("COM initialization failed");
@@ -35,7 +60,6 @@ fn main() {
         wBitsPerSample: 32,
         cbSize: 0,
     };
-    let grouping = windows::core::GUID::from_u128(0x48564f4f_5649_4553_5441_52544f4e4501);
     unsafe {
         client.Initialize(
             AUDCLNT_SHAREMODE_SHARED,
@@ -50,9 +74,12 @@ fn main() {
     let buffer_size = unsafe { client.GetBufferSize() }.expect("buffer size failed");
     let render: IAudioRenderClient = unsafe { client.GetService() }.expect("render service failed");
     unsafe { client.Start() }.expect("audio start failed");
-    println!("pid={} grouping={grouping:?}", std::process::id());
+    println!(
+        "pid={} grouping={grouping:?} frequency_hz={frequency_hz} amplitude={amplitude}",
+        std::process::id()
+    );
     let mut phase = 0.0f32;
-    let deadline = Instant::now() + Duration::from_secs(300);
+    let deadline = Instant::now() + Duration::from_secs(duration_seconds);
     while Instant::now() < deadline {
         let padding = unsafe { client.GetCurrentPadding() }.expect("padding failed");
         let frames = buffer_size.saturating_sub(padding);
@@ -62,10 +89,10 @@ fn main() {
                 std::slice::from_raw_parts_mut(buffer.cast::<f32>(), frames as usize * 2)
             };
             for frame in samples.as_chunks_mut::<2>().0 {
-                let sample = phase.sin() * 0.2;
+                let sample = phase.sin() * amplitude;
                 frame[0] = sample;
                 frame[1] = sample;
-                phase += TAU * 440.0 / 48_000.0;
+                phase += TAU * frequency_hz / 48_000.0;
                 if phase >= TAU {
                     phase -= TAU;
                 }
@@ -76,6 +103,14 @@ fn main() {
     }
     let _ = unsafe { client.Stop() };
     unsafe { CoUninitialize() };
+}
+
+#[cfg(target_os = "windows")]
+fn parse_guid(value: &str) -> windows::core::GUID {
+    let compact = value.replace(['-', '{', '}'], "");
+    let raw = u128::from_str_radix(&compact, 16)
+        .expect("--grouping must be a GUID such as 48564f4f-5649-4553-5441-52544f4e4501");
+    windows::core::GUID::from_u128(raw)
 }
 
 #[cfg(not(target_os = "windows"))]

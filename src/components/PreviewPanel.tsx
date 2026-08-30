@@ -23,7 +23,7 @@ function PreviewPanelImpl({ output, activeSceneName, onAttachBounds }: PreviewPa
         >
           <div className="preview-placeholder">
             <strong>{activeSceneName}</strong>
-            <span>{isWindowsPlatform() ? "Native D3D11-Vorschau" : "Separates Vulkan-Preview-Fenster"}</span>
+            <span>{isWindowsPlatform() ? "Native D3D11-Vorschau" : "Vulkan-Ausgabe läuft im Hintergrund"}</span>
           </div>
         </div>
       </section>

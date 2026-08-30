@@ -1,0 +1,460 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  preflight:
+    name: Release preflight
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.20.0
+          cache: npm
+      - name: Validate tag, source, and required secrets
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_CERTIFICATE_TRUST_MODE: ${{ vars.WINDOWS_CERTIFICATE_TRUST_MODE || 'trusted' }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+          node scripts/release/check-config.mjs
+          test "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" = tag
+          tag_commit=$(git rev-list -n 1 "$GITHUB_REF_NAME")
+          test "$tag_commit" = "$GITHUB_SHA"
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$tag_commit" origin/main
+          test -n "$TAURI_SIGNING_PRIVATE_KEY"
+          test -n "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
+          test -n "$WINDOWS_CERTIFICATE"
+          test -n "$WINDOWS_CERTIFICATE_PASSWORD"
+          [[ "$WINDOWS_CERTIFICATE_TRUST_MODE" == trusted || "$WINDOWS_CERTIFICATE_TRUST_MODE" == self-signed ]]
+      - name: Require successful CI for tagged commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release verify --help >/dev/null
+          gh release verify-asset --help >/dev/null
+          gh attestation verify --help | grep -- '--signer-workflow' >/dev/null
+          gh attestation verify --help | grep -- '--source-digest' >/dev/null
+          test "$(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled)" = true
+          if [[ "$GITHUB_REF_NAME" != *-* ]]; then
+            if latest_tag=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null); then
+              node scripts/release/assert-newer-version.mjs \
+                "${GITHUB_REF_NAME#v}" "${latest_tag#v}"
+            else
+              stable_release_count=$(gh api --paginate \
+                "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+                --jq '.[] | select(.draft == false and .prerelease == false) | .id' | wc -l)
+              test "$stable_release_count" -eq 0
+            fi
+          fi
+          for attempt in $(seq 1 40); do
+            run=$(gh api \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&event=push&per_page=10" \
+              --jq '.workflow_runs | sort_by(.created_at) | last // {}')
+            status=$(jq -r '.status // "missing"' <<<"$run")
+            conclusion=$(jq -r '.conclusion // ""' <<<"$run")
+            if [[ "$status" == completed ]]; then
+              [[ "$conclusion" == success ]]
+              exit 0
+            fi
+            echo "Waiting for CI on $GITHUB_SHA ($attempt/40): $status"
+            sleep 15
+          done
+          echo "No successful completed CI run found for $GITHUB_SHA" >&2
+          exit 1
+      - name: Install updater signature verifier
+        run: sudo apt-get update && sudo apt-get install -y minisign
+      - name: Validate release config and updater key pair
+        run: |
+          set -euo pipefail
+          npm ci
+          npm audit --audit-level=high
+          npm run release:check
+          npm run release:test
+          npm run release:verify-updater-key
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+  build:
+    name: ${{ matrix.name }} installers
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            args: --target x86_64-unknown-linux-gnu --bundles appimage,deb
+          - name: Windows x86_64
+            os: windows-2025
+            target: x86_64-pc-windows-msvc
+            args: --target x86_64-pc-windows-msvc --bundles nsis --config src-tauri/tauri.windows-signing.conf.json
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.20.0
+          cache: npm
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # Rust 1.98.0
+        with:
+          toolchain: 1.98.0
+          targets: ${{ matrix.target }}
+      - uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: . -> target
+          cache-on-failure: false
+      - name: Install Linux bundle dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils libpipewire-0.3-dev libvulkan-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad libclang-dev
+      - run: npm ci
+      - name: Import and validate Windows code-signing certificate
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_CERTIFICATE_TRUST_MODE: ${{ vars.WINDOWS_CERTIFICATE_TRUST_MODE || 'trusted' }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pfxPath = Join-Path $env:RUNNER_TEMP "hooviestar-codesign.pfx"
+          try {
+            [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+            $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+            $imported = @(Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $password -Exportable:$false)
+          } finally {
+            if (Test-Path $pfxPath) { Remove-Item $pfxPath -Force }
+          }
+          $leafCertificates = @($imported | Where-Object { $_.HasPrivateKey })
+          if ($leafCertificates.Count -ne 1) { throw "PFX must contain exactly one certificate with a private key" }
+          $cert = $leafCertificates[0]
+          if ($cert.NotBefore -gt (Get-Date)) { throw "Code-signing certificate is not valid yet" }
+          if ($cert.NotAfter -le (Get-Date).AddDays(7)) { throw "Code-signing certificate expires within seven days" }
+          $codeSigningEku = $cert.EnhancedKeyUsageList | Where-Object { $_.ObjectId.Value -eq "1.3.6.1.5.5.7.3.3" }
+          if (-not $codeSigningEku) { throw "Certificate is not valid for code signing" }
+          $isSelfSigned = $cert.Subject -eq $cert.Issuer
+          if ($env:WINDOWS_CERTIFICATE_TRUST_MODE -eq "self-signed") {
+            if (-not $isSelfSigned) { throw "Self-signed trust mode requires a self-signed certificate" }
+            $cerPath = Join-Path $env:RUNNER_TEMP "hooviestar-codesign.cer"
+            try {
+              Export-Certificate -Cert $cert -FilePath $cerPath -Type CERT | Out-Null
+              Import-Certificate -FilePath $cerPath -CertStoreLocation Cert:\CurrentUser\Root | Out-Null
+              Import-Certificate -FilePath $cerPath -CertStoreLocation Cert:\CurrentUser\TrustedPublisher | Out-Null
+            } finally {
+              if (Test-Path $cerPath) { Remove-Item $cerPath -Force }
+            }
+          } elseif ($isSelfSigned) {
+            throw "Self-signed certificate rejected while WINDOWS_CERTIFICATE_TRUST_MODE is trusted"
+          }
+          $override = @{
+            bundle = @{
+              windows = @{
+                certificateThumbprint = $cert.Thumbprint
+                digestAlgorithm = "sha256"
+                timestampUrl = "http://timestamp.digicert.com"
+              }
+            }
+          }
+          $override | ConvertTo-Json -Depth 5 | Set-Content src-tauri/tauri.windows-signing.conf.json
+          "WINDOWS_CERTIFICATE_THUMBPRINT=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "WINDOWS_CERTIFICATE_SELF_SIGNED=$($isSelfSigned.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Build signed installers and stage draft release
+        id: tauri
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          NO_STRIP: "1"
+          GSTREAMER_INCLUDE_BAD_PLUGINS: "1"
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: Hooviestar ${{ github.ref_name }}
+          releaseBody: |
+            Signed Windows NSIS, Linux AppImage, and Debian installers. Automatic updates use the matching signed installer asset in `latest.json`.
+          generateReleaseNotes: true
+          releaseDraft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          uploadUpdaterJson: false
+          uploadUpdaterSignatures: true
+          args: ${{ matrix.args }}
+      - name: Verify Windows installer signature and archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installers = @(Get-ChildItem "target/$env:TARGET/release/bundle/nsis" -Filter *.exe)
+          if ($installers.Count -ne 1) { throw "Expected exactly one NSIS installer, found $($installers.Count)" }
+          $signature = Get-AuthenticodeSignature $installers[0].FullName
+          if ($signature.Status -ne "Valid") { throw "Invalid Authenticode signature: $($signature.Status)" }
+          if (-not $signature.TimeStamperCertificate) { throw "Authenticode timestamp is missing" }
+          if ($signature.SignerCertificate.Thumbprint -ne $env:WINDOWS_CERTIFICATE_THUMBPRINT) {
+            throw "Installer was signed by an unexpected certificate"
+          }
+          $signatureIsSelfSigned = $signature.SignerCertificate.Subject -eq $signature.SignerCertificate.Issuer
+          if ($signatureIsSelfSigned.ToString().ToLowerInvariant() -ne $env:WINDOWS_CERTIFICATE_SELF_SIGNED) {
+            throw "Installer certificate trust mode changed during the build"
+          }
+          & 7z t $installers[0].FullName
+          if ($LASTEXITCODE -ne 0) { throw "NSIS installer archive integrity check failed" }
+        env:
+          TARGET: ${{ matrix.target }}
+      - name: Verify Linux installer set
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          appimage_dir=target/${{ matrix.target }}/release/bundle/appimage
+          deb_dir=target/${{ matrix.target }}/release/bundle/deb
+          test "$(find "$appimage_dir" -maxdepth 1 -name '*.AppImage' | wc -l)" -eq 1
+          test "$(find "$appimage_dir" -maxdepth 1 -name '*.AppImage.sig' | wc -l)" -eq 1
+          test "$(find "$deb_dir" -maxdepth 1 -name '*.deb' | wc -l)" -eq 1
+          appimage=$(find "$appimage_dir" -maxdepth 1 -name '*.AppImage' -print -quit)
+          deb=$(find "$deb_dir" -maxdepth 1 -name '*.deb' -print -quit)
+          test "$(dpkg-deb --field "$deb" Package)" = hooviestar
+          test "$(dpkg-deb --field "$deb" Version)" = "${GITHUB_REF_NAME#v}"
+          test "$(dpkg-deb --field "$deb" Architecture)" = amd64
+          dpkg-deb --contents "$deb" | grep 'usr/bin/hooviestar$' >/dev/null
+          dpkg-deb --contents "$deb" | grep 'usr/share/applications/Hooviestar.desktop$' >/dev/null
+          extract_dir=$(mktemp -d)
+          trap 'find "$extract_dir" -depth -delete' EXIT
+          (
+            cd "$extract_dir"
+            "$GITHUB_WORKSPACE/$appimage" --appimage-extract >/dev/null
+          )
+          test -x "$extract_dir/squashfs-root/AppRun"
+          test -x "$extract_dir/squashfs-root/usr/bin/hooviestar"
+      - name: Sign and upload Debian updater artifact
+        if: runner.os == 'Linux'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          deb_dir=target/${{ matrix.target }}/release/bundle/deb
+          deb=$(find "$deb_dir" -maxdepth 1 -name '*.deb' -print -quit)
+          npm run tauri -- signer sign "$deb"
+          test -s "$deb.sig"
+          gh release upload "$GITHUB_REF_NAME" "$deb.sig" \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+  publish:
+    name: Verify and publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.0.6
+      - name: Install updater signature verifier
+        run: sudo apt-get update && sudo apt-get install -y minisign
+      - name: Download and verify staged installer assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir release-assets
+          gh release download "$VERSION" --repo "$GITHUB_REPOSITORY" --dir release-assets
+          test "$(find release-assets -maxdepth 1 -name '*.exe' | wc -l)" -eq 1
+          test "$(find release-assets -maxdepth 1 -name '*.AppImage' | wc -l)" -eq 1
+          test "$(find release-assets -maxdepth 1 -name '*.deb' | wc -l)" -eq 1
+          test "$(find release-assets -maxdepth 1 -name '*.exe.sig' | wc -l)" -eq 1
+          test "$(find release-assets -maxdepth 1 -name '*.AppImage.sig' | wc -l)" -eq 1
+          test "$(find release-assets -maxdepth 1 -name '*.deb.sig' | wc -l)" -eq 1
+      - name: Cryptographically verify updater assets
+        run: |
+          set -euo pipefail
+          verification_dir=$(mktemp -d)
+          trap 'rm -rf "$verification_dir"' EXIT
+          jq -r '.plugins.updater.pubkey' src-tauri/tauri.conf.json \
+            | base64 --decode > "$verification_dir/public.key"
+          for installer in release-assets/*.exe release-assets/*.AppImage release-assets/*.deb; do
+            base64 --decode "$installer.sig" > "$verification_dir/signature.minisig"
+            minisign -Vm "$installer" \
+              -p "$verification_dir/public.key" \
+              -x "$verification_dir/signature.minisig"
+          done
+      - name: Build and upload authoritative updater manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          node scripts/release/build-updater-manifest.mjs release-assets
+          gh release upload "$GITHUB_REF_NAME" release-assets/latest.json \
+            --repo "$GITHUB_REPOSITORY" --clobber
+      - name: Verify updater manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          jq -e --arg version "${VERSION#v}" '
+            .version == $version and
+            (.platforms | keys | sort) == ([
+              "linux-x86_64",
+              "linux-x86_64-appimage",
+              "linux-x86_64-deb",
+              "windows-x86_64",
+              "windows-x86_64-nsis"
+            ] | sort) and
+            (.platforms["windows-x86_64"].signature | length > 80) and
+            (.platforms["windows-x86_64"].url | test("^https://api\\.github\\.com/repos/openhoo/hooviestar/releases/assets/[0-9]+$")) and
+            (.platforms["linux-x86_64"].signature | length > 80) and
+            (.platforms["linux-x86_64"].url | test("^https://api\\.github\\.com/repos/openhoo/hooviestar/releases/assets/[0-9]+$")) and
+            (.platforms["linux-x86_64-deb"].signature | length > 80) and
+            (.platforms["linux-x86_64-deb"].url | test("^https://api\\.github\\.com/repos/openhoo/hooviestar/releases/assets/[0-9]+$"))
+          ' release-assets/latest.json >/dev/null
+          windows_url=$(jq -r '.platforms["windows-x86_64"].url' release-assets/latest.json)
+          linux_url=$(jq -r '.platforms["linux-x86_64"].url' release-assets/latest.json)
+          debian_url=$(jq -r '.platforms["linux-x86_64-deb"].url' release-assets/latest.json)
+          windows_name=$(gh api "${windows_url#https://api.github.com/}" --jq .name)
+          linux_name=$(gh api "${linux_url#https://api.github.com/}" --jq .name)
+          debian_name=$(gh api "${debian_url#https://api.github.com/}" --jq .name)
+          [[ "$windows_name" == *.exe ]]
+          [[ "$linux_name" == *.AppImage ]]
+          [[ "$debian_name" == *.deb ]]
+          test -f "release-assets/$windows_name"
+          test -f "release-assets/$linux_name"
+          test -f "release-assets/$debian_name"
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2, Syft v1.51.1
+        env:
+          SYFT_SOURCE_NAME: Hooviestar
+          SYFT_SOURCE_VERSION: ${{ github.ref_name }}
+          SYFT_SOURCE_SUPPLIER: "Organization: OpenHoo"
+        with:
+          path: .
+          format: spdx-json
+          output-file: release-assets/Hooviestar_${{ github.ref_name }}_sbom.spdx.json
+          config: scripts/release/syft.yaml
+          syft-version: v1.51.1
+          dependency-snapshot: false
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Checksum and sign complete asset set
+        run: |
+          set -euo pipefail
+          sbom=$(find release-assets -maxdepth 1 -name '*.spdx.json' -print -quit)
+          test -s "$sbom"
+          jq -e '
+            .spdxVersion == "SPDX-2.3" and
+            .name == "Hooviestar" and
+            (.packages | length > 0)
+          ' "$sbom" >/dev/null
+          (
+            cd release-assets
+            sha256sum -- * | LC_ALL=C sort -k2 > SHA256SUMS
+          )
+          cosign sign-blob --yes --bundle release-assets/SHA256SUMS.sigstore.json release-assets/SHA256SUMS
+          cosign verify-blob \
+            --bundle release-assets/SHA256SUMS.sigstore.json \
+            --certificate-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@$GITHUB_REF" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-github-workflow-name "$GITHUB_WORKFLOW" \
+            --certificate-github-workflow-repository "$GITHUB_REPOSITORY" \
+            --certificate-github-workflow-ref "$GITHUB_REF" \
+            --certificate-github-workflow-sha "$GITHUB_SHA" \
+            --certificate-github-workflow-trigger "$GITHUB_EVENT_NAME" \
+            release-assets/SHA256SUMS
+      - name: Attest release provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: release-assets/*
+      - name: Attest installer SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            release-assets/*.exe
+            release-assets/*.AppImage
+            release-assets/*.deb
+          sbom-path: release-assets/Hooviestar_${{ github.ref_name }}_sbom.spdx.json
+      - name: Verify attestations and publish draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          attestation_policy=(
+            --repo "$GITHUB_REPOSITORY"
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"
+            --source-ref "$GITHUB_REF"
+            --source-digest "$GITHUB_SHA"
+            --deny-self-hosted-runners
+          )
+          for asset in release-assets/*; do
+            gh attestation verify "$asset" "${attestation_policy[@]}" >/dev/null
+          done
+          for installer in release-assets/*.exe release-assets/*.AppImage release-assets/*.deb; do
+            gh attestation verify "$installer" \
+              "${attestation_policy[@]}" \
+              --predicate-type https://spdx.dev/Document/v2.3 >/dev/null
+          done
+          sbom=$(find release-assets -maxdepth 1 -name '*.spdx.json' -print -quit)
+          gh release upload "$GITHUB_REF_NAME" \
+            "$sbom" \
+            release-assets/SHA256SUMS \
+            release-assets/SHA256SUMS.sigstore.json \
+            --repo "$GITHUB_REPOSITORY" --clobber
+          remote_commit=$(git ls-remote origin "refs/tags/$GITHUB_REF_NAME^{}" | awk '{print $1}')
+          test "$remote_commit" = "$GITHUB_SHA"
+          release_flags=(--verify-tag --draft=false)
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            release_flags+=(--prerelease)
+          else
+            release_flags+=(--latest)
+          fi
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" "${release_flags[@]}"
+          release=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease)
+          test "$(jq -r .isDraft <<<"$release")" = false
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            test "$(jq -r .isPrerelease <<<"$release")" = true
+          else
+            test "$(jq -r .isPrerelease <<<"$release")" = false
+          fi
+          verified=false
+          for attempt in $(seq 1 30); do
+            if gh release verify "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --format json >"$RUNNER_TEMP/release-attestation.json"; then
+              verified=true
+              break
+            fi
+            echo "Waiting for immutable release attestation ($attempt/30)"
+            sleep 10
+          done
+          test "$verified" = true
+          locked_commit=$(git ls-remote origin "refs/tags/$GITHUB_REF_NAME^{}" | awk '{print $1}')
+          test "$locked_commit" = "$GITHUB_SHA"
+          for asset in release-assets/*; do
+            gh release verify-asset "$GITHUB_REF_NAME" "$asset" \
+              --repo "$GITHUB_REPOSITORY" >/dev/null
+          done

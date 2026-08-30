@@ -47,9 +47,7 @@ use windows::{
 use super::{GainRamp, LIMITER_CEILING, MediaAudioBus, PcmRing, SAMPLE_RATE, emit_availability};
 use crate::{
     audio::journal::{RestoreJournal, SessionRestoreEntry, default_journal_path},
-    discovery::windows::{
-        mute_audio_session, repair_audio_journal, resolve_audio_process, restore_audio_session,
-    },
+    discovery::windows::{repair_audio_journal, resolve_audio_process, restore_audio_session},
     engine::{AudioWarningKind, EngineEvent, LevelEntry},
     project::{AudioSessionBinding, ProjectV1, Source},
 };
@@ -525,28 +523,18 @@ fn mixer_thread_initialized(
             let mut mixed = [0.0f32; 2];
             for (slot, (_, shared)) in snapshot.iter().enumerate() {
                 let input = rings[slot].as_mut().map_or([0.0, 0.0], |ring| ring.pop());
-                let gain = if shared.muted.load(Ordering::Relaxed) {
-                    0.0
-                } else {
-                    ramps[slot].as_mut().map_or(0.0, |ramp| ramp.next_gain())
-                };
-                let left = input[0] * gain;
-                let right = input[1] * gain;
-                mixed[0] += left;
-                mixed[1] += right;
+                let [left, right] = accumulate_source(
+                    &mut mixed,
+                    input,
+                    ramps[slot].as_deref_mut(),
+                    shared.muted.load(Ordering::Relaxed),
+                );
                 let level = &mut levels[slot];
                 level.0 = level.0.max(left.abs().max(right.abs()));
                 level.1 += f64::from(left * left + right * right) * 0.5;
                 level.2 += 1;
             }
-            let peak = mixed[0].abs().max(mixed[1].abs());
-            let limiter = if peak > LIMITER_CEILING {
-                LIMITER_CEILING / peak
-            } else {
-                1.0
-            };
-            frame[0] = mixed[0] * limiter;
-            frame[1] = mixed[1] * limiter;
+            *frame = limit_stereo(mixed);
         }
         // Guards vor jeglichem blockierenden Aufruf ablegen.
         drop(rings);
@@ -572,6 +560,35 @@ fn mixer_thread_initialized(
     }
     drop(management); // Verwaltungs-Thread stoppen und joinen, bevor COM endet.
     Ok(())
+}
+
+fn accumulate_source(
+    mixed: &mut [f32; 2],
+    input: [f32; 2],
+    ramp: Option<&mut GainRamp>,
+    muted: bool,
+) -> [f32; 2] {
+    // Preserve the runtime contract: volume ramps freeze while muted, then
+    // resume click-free on unmute instead of progressing invisibly.
+    let gain = if muted {
+        0.0
+    } else {
+        ramp.map_or(0.0, |ramp| ramp.next_gain())
+    };
+    let contribution = [input[0] * gain, input[1] * gain];
+    mixed[0] += contribution[0];
+    mixed[1] += contribution[1];
+    contribution
+}
+
+fn limit_stereo(mixed: [f32; 2]) -> [f32; 2] {
+    let peak = mixed[0].abs().max(mixed[1].abs());
+    let gain = if peak > LIMITER_CEILING {
+        LIMITER_CEILING / peak
+    } else {
+        1.0
+    };
+    [mixed[0] * gain, mixed[1] * gain]
 }
 
 enum DesiredInput {
@@ -791,8 +808,12 @@ fn synchronize_sources(
                 }
                 let capture = ProcessAudioCapture::start(pid)?;
                 let ring = capture.ring.clone();
-                let restore = mute_audio_session(binding, journal_path)?;
-                Ok((Some(capture), ring, Some(restore), Some(pid)))
+                // Windows process-loopback samples are post-session-mute on
+                // current Windows 11. Muting the source session here makes
+                // this ring silent and defeats the mixer. Leave the original
+                // session audible; Discord application sharing captures this
+                // process's separately rendered mixed session.
+                Ok((Some(capture), ring, None, Some(pid)))
             })(),
             DesiredInput::Media => media_audio
                 .lock()
@@ -1196,4 +1217,51 @@ fn activate_process_loopback(process_id: u32) -> Result<IAudioClient, String> {
     receiver
         .recv_timeout(Duration::from_secs(10))
         .map_err(|error| error.to_string())?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LIMITER_CEILING, accumulate_source, limit_stereo};
+
+    #[test]
+    fn mixer_sums_independent_stereo_sources_with_gain() {
+        let mut mixed = [0.0, 0.0];
+        let mut first = super::GainRamp::new(0.5);
+        assert_eq!(
+            accumulate_source(&mut mixed, [0.8, -0.4], Some(&mut first), false),
+            [0.4, -0.2]
+        );
+        let mut second = super::GainRamp::new(0.25);
+        assert_eq!(
+            accumulate_source(&mut mixed, [0.2, 0.6], Some(&mut second), false),
+            [0.05, 0.15]
+        );
+        assert!((mixed[0] - 0.45).abs() < 1.0e-6);
+        assert!((mixed[1] + 0.05).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn muted_source_contributes_neither_audio_nor_meter_level() {
+        let mut mixed = [0.25, -0.25];
+        let mut ramp = super::GainRamp::new(0.0);
+        ramp.set(0.75, 10);
+        let contribution = accumulate_source(&mut mixed, [1.0, 1.0], Some(&mut ramp), true);
+        assert_eq!(contribution, [0.0, 0.0]);
+        assert_eq!(mixed, [0.25, -0.25]);
+        let resumed = accumulate_source(&mut mixed, [1.0, 1.0], Some(&mut ramp), false);
+        assert!((resumed[0] - 0.075).abs() < 1.0e-6);
+        assert!((resumed[1] - 0.075).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn limiter_preserves_stereo_ratio_and_caps_peak() {
+        let limited = limit_stereo([2.0, -1.0]);
+        assert!((limited[0] - LIMITER_CEILING).abs() < 1.0e-6);
+        assert!((limited[1] + LIMITER_CEILING * 0.5).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn limiter_leaves_safe_mix_bit_exact() {
+        assert_eq!(limit_stereo([0.25, -0.5]), [0.25, -0.5]);
+    }
 }

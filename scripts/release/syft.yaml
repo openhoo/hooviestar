@@ -1,0 +1,11 @@
+exclude:
+  - "./.git/**"
+  - "./dist/**"
+  - "./node_modules/**"
+  - "./target/**"
+
+parallelism: 1
+
+source:
+  name: Hooviestar
+  supplier: "Organization: OpenHoo"

@@ -2839,3 +2839,89 @@ pub enum WindowsVideoError {
     #[error("unsupported media: {0}")]
     UnsupportedMedia(String),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn color_parser_accepts_mixed_case_rgb() {
+        assert_eq!(
+            parse_hex_color("#10aBfF"),
+            [16.0 / 255.0, 171.0 / 255.0, 1.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn color_parser_fails_closed_to_opaque_black() {
+        for invalid in ["10abff", "#123", "#12345678", "#gg0000"] {
+            assert_eq!(parse_hex_color(invalid), [0.0, 0.0, 0.0, 1.0]);
+        }
+    }
+
+    #[test]
+    fn recovery_backoff_is_bounded() {
+        assert_eq!(backoff_duration(1), Duration::from_millis(200));
+        assert_eq!(backoff_duration(5), Duration::from_secs(1));
+        assert_eq!(backoff_duration(u32::MAX), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn failure_reporting_deduplicates_only_same_source_kind_and_reason() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let mut failures = HashMap::new();
+        assert!(should_report_failure(
+            &mut failures,
+            first,
+            FailureKind::Window,
+            "offline"
+        ));
+        assert!(!should_report_failure(
+            &mut failures,
+            first,
+            FailureKind::Window,
+            "offline"
+        ));
+        assert!(should_report_failure(
+            &mut failures,
+            first,
+            FailureKind::Display,
+            "offline"
+        ));
+        assert!(should_report_failure(
+            &mut failures,
+            second,
+            FailureKind::Window,
+            "offline"
+        ));
+        assert!(should_report_failure(
+            &mut failures,
+            first,
+            FailureKind::Window,
+            "closed"
+        ));
+    }
+
+    #[test]
+    fn float16_scene_descriptor_matches_compositor_contract() {
+        let descriptor = SceneTextureDescriptor::float16(1920, 1080);
+        assert_eq!(descriptor.width, 1920);
+        assert_eq!(descriptor.height, 1080);
+        assert_eq!(descriptor.format, FLOAT16_FORMAT.0 as u32);
+        assert!(descriptor.render_target);
+        assert!(descriptor.shader_resource);
+    }
+
+    #[test]
+    fn media_state_events_are_rate_limited_but_transitions_are_immediate() {
+        let source_id = Uuid::new_v4();
+        let (sender, receiver) = mpsc::channel();
+        let mut state = HashMap::new();
+        send_media_state(&sender, &mut state, source_id, true, 1.0);
+        send_media_state(&sender, &mut state, source_id, true, 1.1);
+        send_media_state(&sender, &mut state, source_id, true, 1.3);
+        send_media_state(&sender, &mut state, source_id, false, 1.31);
+        assert_eq!(receiver.try_iter().count(), 3);
+    }
+}

@@ -1,5 +1,6 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { engineStore } from "./engineStore";
@@ -20,6 +21,8 @@ import { SourcesPanel } from "./components/SourcesPanel";
 import type { SourceRow } from "./components/SourcesPanel";
 import { ControlsDock } from "./components/ControlsDock";
 import { StatusBar } from "./components/StatusBar";
+import { updateStatusMessage } from "./updateStatus";
+import type { UpdateStatusEvent } from "./updateStatus";
 
 
 function fullTransform(width: number, height: number): Transform {
@@ -69,6 +72,7 @@ export default function App() {
   const [itemError, setItemError] = useState<string | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [windowError, setWindowError] = useState<string | null>(null);
+  const [updateStatus, setUpdateStatus] = useState<string | null>(null);
   const onboardingDismissedRef = useRef(false);
   // Optimistische Feld-Deltas je Quelle: überbrückt das Snapshot-Event-Lag, damit
   // aufeinanderfolgende update_source-Aufrufe nicht gegenseitig Felder zurücksetzen.
@@ -100,6 +104,42 @@ export default function App() {
 
   useEffect(() => {
     void engineStore.start();
+  }, []);
+  useEffect(() => {
+    let active = true;
+    let clearTimer: ReturnType<typeof setTimeout> | null = null;
+    let detachListener: (() => void) | null = null;
+    const showStatus = (payload: UpdateStatusEvent) => {
+      if (!active) return;
+      if (clearTimer) clearTimeout(clearTimer);
+      setUpdateStatus(updateStatusMessage(payload));
+      if (payload.status === "up_to_date") {
+        clearTimer = setTimeout(() => {
+          if (active) setUpdateStatus(null);
+        }, 5_000);
+      }
+    };
+    const unlisten = listen<UpdateStatusEvent>("updater-status", ({ payload }) => {
+      showStatus(payload);
+    });
+    void unlisten.then(async (detach) => {
+      if (!active) {
+        detach();
+        return;
+      }
+      detachListener = detach;
+      try {
+        const current = await invoke<UpdateStatusEvent | null>("updater_status");
+        if (current) showStatus(current);
+      } catch (error) {
+        if (active) setUpdateStatus(`Aktualisierungsstatus nicht verfügbar: ${String(error)}`);
+      }
+    });
+    return () => {
+      active = false;
+      if (clearTimer) clearTimeout(clearTimer);
+      detachListener?.();
+    };
   }, []);
   useEffect(() => {
     if (!project) return;
@@ -562,7 +602,7 @@ export default function App() {
           <span className="strip-label">
             {selectedSource ? selectedSource.name : "Keine Quelle ausgewählt"}
           </span>
-          <span className="strip-hint">In Discord teilen: Fenster „Hooviestar – Program“, nicht das Studio</span>
+          <span className="strip-hint">Discord: App „Hooviestar – Program“ wählen · Ausgabe bleibt unsichtbar</span>
         </div>
       </section>
 
@@ -616,7 +656,7 @@ export default function App() {
       </div>
 
       <StatusBar
-        status={windowError ?? previewError ?? status}
+        status={windowError ?? previewError ?? updateStatus ?? status}
         output={project.output}
         sceneCount={project.scenes.length}
         sourceCount={project.sources.length}

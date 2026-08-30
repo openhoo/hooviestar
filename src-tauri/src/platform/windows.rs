@@ -4,12 +4,72 @@ use windows::{
     Win32::{
         Foundation::HWND,
         UI::WindowsAndMessaging::{
-            CreateWindowExW, DestroyWindow, HWND_TOP, SWP_NOACTIVATE, SetWindowPos,
-            WINDOW_EX_STYLE, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
+            CreateWindowExW, DestroyWindow, GetSystemMetrics, HWND_BOTTOM, HWND_TOP,
+            SM_CXVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE,
+            SWP_SHOWWINDOW, SetWindowPos, WINDOW_EX_STYLE, WS_CHILD, WS_CLIPCHILDREN,
+            WS_CLIPSIBLINGS, WS_VISIBLE,
         },
     },
     core::w,
 };
+
+pub struct OutputVisibility;
+
+pub fn configure_graphics_backend() {}
+
+impl OutputVisibility {
+    pub fn prepare() -> Result<Self, String> {
+        Ok(Self)
+    }
+
+    pub fn show_program(&self, window: &Window) -> Result<(), String> {
+        let hwnd = window.hwnd().map_err(|error| error.to_string())?;
+        let size = window.outer_size().map_err(|error| error.to_string())?;
+        let virtual_left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+        let virtual_top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+        let virtual_width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+        if virtual_width <= 0 {
+            return Err("Windows meldet keinen virtuellen Desktop".into());
+        }
+        let width = i32::try_from(size.width).map_err(|_| "Programmbreite ist zu groß")?;
+        let height = i32::try_from(size.height).map_err(|_| "Programmhöhe ist zu groß")?;
+        let (x, y) = offscreen_program_position(virtual_left, virtual_top, width);
+        // Sichtbar und nicht minimiert lassen: Nur so bietet Discord das
+        // Fenster als App an und Windows Graphics Capture liefert weiter
+        // Frames. HWND_BOTTOM plus Offscreen-Position verhindert Aktivierung
+        // und sichtbares Aufblitzen.
+        unsafe {
+            SetWindowPos(
+                hwnd,
+                Some(HWND_BOTTOM),
+                x,
+                y,
+                width,
+                height,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            )
+        }
+        .map_err(|error| {
+            format!("Program-Ausgabe konnte nicht offscreen platziert werden: {error}")
+        })
+    }
+
+    pub fn initially_visible(&self) -> bool {
+        false
+    }
+
+    pub fn cleanup(self) {}
+}
+
+/// Places the mapped Program window wholly left of every virtual-desktop
+/// monitor. Saturating arithmetic keeps exotic multi-monitor coordinates from
+/// wrapping back onto a visible display.
+fn offscreen_program_position(virtual_left: i32, virtual_top: i32, width: i32) -> (i32, i32) {
+    (
+        virtual_left.saturating_sub(width).saturating_sub(128),
+        virtual_top,
+    )
+}
 
 pub struct NativePreview {
     hwnd: usize,
@@ -19,6 +79,7 @@ impl NativePreview {
     pub fn create(
         studio: &WebviewWindow,
         program: &Window,
+        _output_visibility: &OutputVisibility,
     ) -> Result<(Self, NativeSurfaces), String> {
         let studio_hwnd = studio.hwnd().map_err(|error| error.to_string())?;
         let program_hwnd = program.hwnd().map_err(|error| error.to_string())?;
@@ -128,4 +189,27 @@ pub fn set_preview_bounds(
         )
     }
     .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::offscreen_program_position;
+
+    #[test]
+    fn program_is_placed_left_of_single_monitor_desktop() {
+        assert_eq!(offscreen_program_position(0, 0, 1280), (-1408, 0));
+    }
+
+    #[test]
+    fn program_is_placed_left_of_negative_origin_multi_monitor_desktop() {
+        assert_eq!(offscreen_program_position(-1920, -120, 1920), (-3968, -120));
+    }
+
+    #[test]
+    fn extreme_virtual_desktop_coordinates_never_wrap_visible() {
+        assert_eq!(
+            offscreen_program_position(i32::MIN + 64, 42, 1920),
+            (i32::MIN, 42)
+        );
+    }
 }

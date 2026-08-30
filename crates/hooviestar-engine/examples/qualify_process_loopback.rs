@@ -52,8 +52,14 @@ fn main() {
         before_crossings > 600,
         "unmuted tone crossings too low: {before_crossings}"
     );
+    assert!(
+        muted_rms < before_rms * 0.05,
+        "session mute did not silence process loopback: before={before_rms}, muted={muted_rms}"
+    );
+    // Near-zero endpoint noise can cross zero far more often than a clean
+    // sine wave, so crossings are meaningful only for the active stage.
     println!(
-        "process loopback ready: unmuted_rms={before_rms:.4} unmuted_crossings={before_crossings} muted_rms={muted_rms:.4} muted_crossings={muted_crossings}"
+        "process loopback semantics confirmed: unmuted_rms={before_rms:.4} unmuted_crossings={before_crossings} muted_rms={muted_rms:.6} muted_crossings={muted_crossings}"
     );
 }
 
@@ -62,13 +68,23 @@ fn measure(capture: &hooviestar_engine::audio::windows_runtime::ProcessAudioCapt
     let mut squares = 0.0f64;
     let mut crossings = 0u32;
     let mut previous = 0.0f32;
-    for _ in 0..48_000 {
-        let sample = capture.pop()[0];
-        squares += f64::from(sample * sample);
-        if (previous <= 0.0 && sample > 0.0) || (previous >= 0.0 && sample < 0.0) {
-            crossings += 1;
+    // ProcessAudioCapture intentionally keeps only 100 ms. Drain that
+    // bounded history, then consume at the producer's real-time rate; a tight
+    // 48k-pop loop would measure 100 ms of tone plus 900 ms of synthetic
+    // underrun silence and make the crossing oracle impossible.
+    for _ in 0..4_800 {
+        let _ = capture.pop();
+    }
+    for _ in 0..100 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        for _ in 0..480 {
+            let sample = capture.pop()[0];
+            squares += f64::from(sample * sample);
+            if (previous <= 0.0 && sample > 0.0) || (previous >= 0.0 && sample < 0.0) {
+                crossings += 1;
+            }
+            previous = sample;
         }
-        previous = sample;
     }
     ((squares / 48_000.0).sqrt(), crossings)
 }

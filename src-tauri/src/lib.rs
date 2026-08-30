@@ -1,4 +1,5 @@
 mod platform;
+mod updater;
 
 use std::{
     sync::{
@@ -44,6 +45,7 @@ struct AppState {
 struct RuntimeResources {
     engine: Mutex<Option<Arc<EngineHandle>>>,
     preview: Mutex<Option<NativePreview>>,
+    output_visibility: Mutex<Option<platform::OutputVisibility>>,
     event_thread: Mutex<Option<JoinHandle<()>>>,
     stop_events: Arc<AtomicBool>,
     cleaned: AtomicBool,
@@ -55,6 +57,7 @@ impl RuntimeResources {
         Self {
             engine: Mutex::new(None),
             preview: Mutex::new(None),
+            output_visibility: Mutex::new(None),
             event_thread: Mutex::new(None),
             stop_events: Arc::new(AtomicBool::new(false)),
             cleaned: AtomicBool::new(false),
@@ -85,6 +88,14 @@ impl RuntimeResources {
         let preview = self.preview.lock().expect("preview mutex poisoned").take();
         if let Some(preview) = preview {
             let _ = preview.destroy();
+        }
+        let visibility = self
+            .output_visibility
+            .lock()
+            .expect("output visibility mutex poisoned")
+            .take();
+        if let Some(visibility) = visibility {
+            visibility.cleanup();
         }
         self.portal.clear();
     }
@@ -290,12 +301,15 @@ fn set_preview_bounds(
 }
 
 pub fn run() {
+    platform::configure_graphics_backend();
     let resources = Arc::new(RuntimeResources::new());
     let setup_resources = resources.clone();
     let app = tauri::Builder::default()
         .manage(resources.clone())
+        .manage(updater::UpdateState::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
             dispatch,
@@ -303,20 +317,32 @@ pub fn run() {
             enumerate_sources,
             select_portal_sources,
             canonicalize_file,
-            set_preview_bounds
+            set_preview_bounds,
+            updater::updater_status
         ])
         .setup(move |app| {
             let studio = app
                 .get_webview_window("studio")
                 .ok_or_else(|| "Studio window unavailable".to_string())?;
+            // Die Program-Oberflaeche muss gemappt bleiben, damit Discord sie
+            // als App-Fenster anbietet und kontinuierlich capturen kann. Die
+            // Plattformintegration platziert sie vor dem ersten sichtbaren
+            // Frame ausserhalb des physischen Desktops. Ein blosses
+            // `visible(false)` wuerde das Fenster aus Discord entfernen.
+            let output_visibility = platform::OutputVisibility::prepare()?;
             let program = WindowBuilder::new(app, "program")
                 .title("Hooviestar – Program")
                 .inner_size(1280.0, 720.0)
-                .visible(true)
+                .decorations(false)
+                .focused(false)
+                .focusable(false)
+                .visible(output_visibility.initially_visible())
                 .build()
                 .map_err(|error| error.to_string())?;
+            output_visibility.show_program(&program)?;
             spawn_audio_watchdog()?;
-            let (preview, surfaces) = NativePreview::create(&studio, &program)?;
+            let (preview, surfaces) =
+                NativePreview::create(&studio, &program, &output_visibility)?;
             let preview_handle = preview.native_handle();
             let engine = Arc::new(
                 EngineHandle::start(surfaces, OutputConfig::default())
@@ -421,9 +447,14 @@ pub fn run() {
                 .lock()
                 .expect("preview mutex poisoned") = Some(preview);
             *setup_resources
+                .output_visibility
+                .lock()
+                .expect("output visibility mutex poisoned") = Some(output_visibility);
+            *setup_resources
                 .event_thread
                 .lock()
                 .expect("event thread mutex poisoned") = Some(event_thread);
+            updater::spawn(app.handle().clone());
             Ok(())
         })
         .build(tauri::generate_context!())

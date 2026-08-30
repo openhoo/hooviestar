@@ -11,6 +11,10 @@
     "build": "tsc -b && vite build",
     "test": "vitest run",
     "test:watch": "vitest",
+    "release:check": "node scripts/release/check-config.mjs",
+    "release:prepare": "node scripts/release/set-version.mjs",
+    "release:test": "node --test scripts/release/*.test-node.mjs",
+    "release:verify-updater-key": "node scripts/release/verify-updater-key.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

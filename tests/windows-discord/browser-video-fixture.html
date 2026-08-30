@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Hooviestar Browser Video Fixture</title>
+    <style>
+      :root { color-scheme: dark; font-family: "Segoe UI", sans-serif; }
+      * { box-sizing: border-box; }
+      html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #08111d; }
+      main { width: 100%; height: 100%; display: grid; grid-template-rows: 1fr auto; gap: 10px; padding: 12px; }
+      video { width: 100%; height: 100%; min-height: 0; object-fit: contain; background: #000; }
+      footer { display: flex; justify-content: space-between; font-size: 18px; color: #dce9ff; }
+      canvas { display: none; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <video id="video" autoplay playsinline></video>
+      <footer><strong>LIVE BROWSER &lt;video&gt; FIXTURE</strong><span id="status">starting</span></footer>
+    </main>
+    <canvas id="source" width="1280" height="720"></canvas>
+    <script>
+      const canvas = document.querySelector("#source");
+      const context = canvas.getContext("2d", { alpha: false });
+      const video = document.querySelector("#video");
+      const status = document.querySelector("#status");
+      let frame = 0;
+
+      function draw() {
+        const width = canvas.width;
+        const height = canvas.height;
+        context.fillStyle = "#112244";
+        context.fillRect(0, 0, width / 2, height / 2);
+        context.fillStyle = "#cc3344";
+        context.fillRect(width / 2, 0, width / 2, height / 2);
+        context.fillStyle = "#33aa55";
+        context.fillRect(0, height / 2, width / 2, height / 2);
+        // Keep fixture palette outside qualification marker thresholds even
+        // after the D3D compositor's linear/sRGB conversion. The previous
+        // orange became yellow enough to impersonate the mixed-stage marker.
+        context.fillStyle = "#7b431f";
+        context.fillRect(width / 2, height / 2, width / 2, height / 2);
+
+        const x = (frame * 13) % (width + 180) - 180;
+        context.fillStyle = "#f4f7ff";
+        context.fillRect(x, 0, 180, height);
+        context.fillStyle = "#07101c";
+        context.fillRect(x + 24, 0, 32, height);
+        context.fillRect(x + 116, 0, 32, height);
+
+        context.fillStyle = "#ffffff";
+        context.font = "700 64px Segoe UI";
+        context.textAlign = "center";
+        context.fillText("RUNNING BROWSER VIDEO", width / 2, height / 2 - 12);
+        context.font = "500 34px Consolas";
+        context.fillText(`frame ${String(frame).padStart(8, "0")}`, width / 2, height / 2 + 52);
+        frame += 1;
+        requestAnimationFrame(draw);
+      }
+
+      async function start() {
+        draw();
+        const audio = new AudioContext({ sampleRate: 48000 });
+        const oscillator = new OscillatorNode(audio, { type: "sine", frequency: 660 });
+        const gain = new GainNode(audio, { gain: 0.12 });
+        const audioStream = new MediaStreamAudioDestinationNode(audio);
+        oscillator.connect(gain).connect(audioStream);
+        oscillator.start();
+
+        const stream = canvas.captureStream(30);
+        stream.addTrack(audioStream.stream.getAudioTracks()[0]);
+        video.srcObject = stream;
+        await audio.resume();
+        await video.play();
+        status.textContent = "30 fps · 660 Hz audio · playing";
+      }
+
+      start().catch((error) => {
+        status.textContent = `click to start: ${error.message}`;
+        document.body.addEventListener("click", () => start(), { once: true });
+      });
+    </script>
+  </body>
+</html>
