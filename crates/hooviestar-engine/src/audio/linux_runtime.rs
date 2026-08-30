@@ -107,7 +107,8 @@ impl AudioRuntime {
                         Err(error) => {
                             *thread_last_failure.lock() = Some(error.clone());
                             eprintln!("PipeWire mixer stopped: {error}");
-                            let _ = events.send(EngineEvent::EngineError {
+                            let _ = events.send(EngineEvent::AudioWarning {
+                                kind: AudioWarningKind::DeviceInvalidated,
                                 message: format!(
                                     "PipeWire-Ausgabe wurde unerwartet beendet: {error}"
                                 ),
@@ -123,7 +124,8 @@ impl AudioRuntime {
                                 && !exhausted_reported
                             {
                                 exhausted_reported = true;
-                                let _ = events.send(EngineEvent::EngineError {
+                                let _ = events.send(EngineEvent::AudioWarning {
+                                    kind: AudioWarningKind::DeviceInvalidated,
                                     message: "PipeWire-Ausgabe konnte nach wiederholten \
                                         Fehlern vorübergehend nicht neu gestartet werden; \
                                         weitere Versuche laufen im Hintergrund."
@@ -169,7 +171,8 @@ impl AudioRuntime {
 
     pub fn shutdown(&self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.lock().take() {
+        let thread = self.thread.lock().take();
+        if let Some(thread) = thread {
             let _ = thread.join();
         }
     }
@@ -510,6 +513,74 @@ impl MixInput {
 /// `Arc` geklont, nie ein Heap-Objekt erzeugt.
 type MixSnapshot = Arc<[Arc<MixInput>]>;
 
+/// Mischt genau einen PipeWire-Ausgabeblock und gibt dessen belegte Bytezahl
+/// zurück. Die Obergrenze hält `spa_chunk.size` verlustfrei in `u32`.
+fn mix_program_block(bytes: &mut [u8], snapshot: &MixSnapshot) -> u32 {
+    let max_frames = usize::try_from(u32::MAX / 8).unwrap_or(usize::MAX);
+    let frame_count = (bytes.len() / 8).min(max_frames);
+    let frame_count_u32 = u32::try_from(frame_count).expect("Frame-Obergrenze");
+
+    // Pro Block jede Quelle höchstens einmal sperren; nie pro Sample.
+    let mut rings: [Option<parking_lot::MutexGuard<'_, PcmRing>>; MAX_MIX_INPUTS] =
+        std::array::from_fn(|_| None);
+    let mut ramps: [Option<parking_lot::MutexGuard<'_, GainRamp>>; MAX_MIX_INPUTS] =
+        std::array::from_fn(|_| None);
+    for slot in 0..snapshot.len().min(MAX_MIX_INPUTS) {
+        let input = &snapshot[slot];
+        let target = f32::from_bits(input.volume_bits.load(Ordering::Relaxed));
+        let mut ramp = input.ramp.lock();
+        ramp.set(target, MAX_RAMP_FRAMES.min(frame_count_u32));
+        ramps[slot] = Some(ramp);
+        rings[slot] = Some(input.ring.lock());
+    }
+
+    let mut block_peaks = [0.0f32; MAX_MIX_INPUTS];
+    let mut block_squares = [0.0f64; MAX_MIX_INPUTS];
+    for frame_index in 0..frame_count {
+        let mut mixed = [0.0f32; 2];
+        for (slot, input) in snapshot.iter().enumerate().take(MAX_MIX_INPUTS) {
+            let sample = rings[slot].as_mut().map_or([0.0, 0.0], |ring| ring.pop());
+            let gain = if input.muted.load(Ordering::Relaxed) {
+                0.0
+            } else if let Some(ramp) = ramps[slot].as_mut() {
+                ramp.next_gain()
+            } else {
+                continue;
+            };
+            let left = sample[0] * gain;
+            let right = sample[1] * gain;
+            mixed[0] += left;
+            mixed[1] += right;
+            block_peaks[slot] = block_peaks[slot].max(left.abs()).max(right.abs());
+            block_squares[slot] += f64::from(left * left + right * right) * 0.5;
+        }
+        let peak = mixed[0].abs().max(mixed[1].abs());
+        let limiter = if peak > LIMITER_CEILING {
+            LIMITER_CEILING / peak
+        } else {
+            1.0
+        };
+        let offset = frame_index * 8;
+        bytes[offset..offset + 4].copy_from_slice(&(mixed[0] * limiter).to_le_bytes());
+        bytes[offset + 4..offset + 8].copy_from_slice(&(mixed[1] * limiter).to_le_bytes());
+    }
+
+    // Pegel einmal je Block je Eingang veröffentlichen; nur für tatsächlich
+    // gemischte Eingänge (Ramp-Guard), damit übersprungene Quellen keine
+    // Frames erhalten.
+    for slot in 0..snapshot.len().min(MAX_MIX_INPUTS) {
+        if ramps[slot].is_some() {
+            snapshot[slot].publish_block(
+                block_peaks[slot],
+                block_squares[slot],
+                u64::from(frame_count_u32),
+            );
+        }
+    }
+
+    frame_count_u32 * 8
+}
+
 /// Nutzerdaten des Capture-Realtime-Callbacks.
 struct CaptureUserData {
     negotiated: AtomicBool,
@@ -667,68 +738,12 @@ fn run_pipewire(
                 let Some(bytes) = data.data() else {
                     return;
                 };
-                let frame_count = bytes.len() / 8;
                 let snapshot = mix_inputs.read().clone();
-                // Pro Block jede Quelle höchstens einmal sperren; nie pro Sample.
-                let mut rings: [Option<parking_lot::MutexGuard<'_, PcmRing>>; MAX_MIX_INPUTS] =
-                    std::array::from_fn(|_| None);
-                let mut ramps: [Option<parking_lot::MutexGuard<'_, GainRamp>>; MAX_MIX_INPUTS] =
-                    std::array::from_fn(|_| None);
-                for slot in 0..snapshot.len().min(MAX_MIX_INPUTS) {
-                    let input = &snapshot[slot];
-                    let target = f32::from_bits(input.volume_bits.load(Ordering::Relaxed));
-                    let mut ramp = input.ramp.lock();
-                    ramp.set(target, MAX_RAMP_FRAMES.min(frame_count as u32));
-                    ramps[slot] = Some(ramp);
-                    rings[slot] = Some(input.ring.lock());
-                }
-                let mut block_peaks = [0.0f32; MAX_MIX_INPUTS];
-                let mut block_squares = [0.0f64; MAX_MIX_INPUTS];
-                for frame_index in 0..frame_count {
-                    let mut mixed = [0.0f32; 2];
-                    for (slot, input) in snapshot.iter().enumerate().take(MAX_MIX_INPUTS) {
-                        let sample = rings[slot].as_mut().map_or([0.0, 0.0], |ring| ring.pop());
-                        let gain = if input.muted.load(Ordering::Relaxed) {
-                            0.0
-                        } else if let Some(ramp) = ramps[slot].as_mut() {
-                            ramp.next_gain()
-                        } else {
-                            continue;
-                        };
-                        let left = sample[0] * gain;
-                        let right = sample[1] * gain;
-                        mixed[0] += left;
-                        mixed[1] += right;
-                        block_peaks[slot] = block_peaks[slot].max(left.abs()).max(right.abs());
-                        block_squares[slot] += f64::from(left * left + right * right) * 0.5;
-                    }
-                    let peak = mixed[0].abs().max(mixed[1].abs());
-                    let limiter = if peak > LIMITER_CEILING {
-                        LIMITER_CEILING / peak
-                    } else {
-                        1.0
-                    };
-                    let offset = frame_index * 8;
-                    bytes[offset..offset + 4].copy_from_slice(&(mixed[0] * limiter).to_le_bytes());
-                    bytes[offset + 4..offset + 8]
-                        .copy_from_slice(&(mixed[1] * limiter).to_le_bytes());
-                }
-                // Pegel einmal je Block je Eingang veröffentlichen; nur für
-                // tatsächlich gemischte Eingänge (Ramp-Guard), damit Frames
-                // nicht für übersprungene Quellen gezählt werden.
-                for slot in 0..snapshot.len().min(MAX_MIX_INPUTS) {
-                    if ramps[slot].is_some() {
-                        snapshot[slot].publish_block(
-                            block_peaks[slot],
-                            block_squares[slot],
-                            frame_count as u64,
-                        );
-                    }
-                }
+                let rendered_bytes = mix_program_block(bytes, &snapshot);
                 let chunk = data.chunk_mut();
                 *chunk.offset_mut() = 0;
                 *chunk.stride_mut() = 8;
-                *chunk.size_mut() = (frame_count * 8) as u32;
+                *chunk.size_mut() = rendered_bytes;
             }
         })
         .register()
@@ -747,6 +762,7 @@ fn run_pipewire(
     drop(setup_lock);
 
     let _ = ready.send(Ok(()));
+    let _ = events.send(EngineEvent::AudioRecovered);
 
     // Steuerthread-Zustand.
     let mut nodes: HashMap<u32, TrackedNode> = HashMap::new();
@@ -1393,6 +1409,33 @@ mod tests {
         let drained = input.drain_level();
         assert_eq!(drained.peak, 0.0);
         assert_eq!(drained.rms, 0.0);
+    }
+
+    #[test]
+    fn mix_program_block_limits_output_and_ignores_partial_frame() {
+        let ring = Arc::new(Mutex::new(PcmRing::new(2)));
+        ring.lock().push([2.0, -2.0]);
+        let input = Arc::new(MixInput::new(
+            Uuid::new_v4(),
+            "Test".into(),
+            ring,
+            1.0,
+            false,
+            false,
+        ));
+        let snapshot: MixSnapshot = Arc::from([input.clone()]);
+        let mut bytes = [0x7f; 11];
+
+        assert_eq!(mix_program_block(&mut bytes, &snapshot), 8);
+        let left = f32::from_le_bytes(bytes[0..4].try_into().expect("linker Kanal"));
+        let right = f32::from_le_bytes(bytes[4..8].try_into().expect("rechter Kanal"));
+        assert!((left - LIMITER_CEILING).abs() < 1e-6);
+        assert!((right + LIMITER_CEILING).abs() < 1e-6);
+        assert_eq!(&bytes[8..], &[0x7f; 3]);
+
+        let level = input.drain_level();
+        assert_eq!(level.peak, 2.0);
+        assert_eq!(level.rms, 2.0);
     }
 
     #[test]

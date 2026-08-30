@@ -50,9 +50,12 @@ impl NativePreview {
                     RawWindowHandle::Xlib(program),
                     RawWindowHandle::Xlib(preview),
                 ) => (
-                    studio.window as usize,
-                    program.window as usize,
-                    preview.window as usize,
+                    usize::try_from(studio.window)
+                        .map_err(|_| "Xlib studio handle exceeds pointer width".to_string())?,
+                    usize::try_from(program.window)
+                        .map_err(|_| "Xlib program handle exceeds pointer width".to_string())?,
+                    usize::try_from(preview.window)
+                        .map_err(|_| "Xlib preview handle exceeds pointer width".to_string())?,
                     display
                         .display
                         .map(|pointer| pointer.as_ptr() as usize)
@@ -181,29 +184,28 @@ fn portal_candidates(selection: &PortalSelection) -> Vec<SourceCandidate> {
                 .clone()
                 .or_else(|| stream.mapping_id.clone())
                 .unwrap_or_else(|| format!("Portal-Quelle {}", index + 1));
-            match stream.is_window() {
-                true => {
-                    SourceCandidate::Window {
-                        runtime_id: format!("portal:window:{node}"),
-                        name,
-                        // The portal does not expose a stable process path.  The
-                        // marker plus node id lets the renderer associate the
-                        // candidate with this session; a restart requires a new
-                        // portal selection instead of a silent rebind.
-                        binding: WindowBinding {
-                            process_path: marker.clone(),
-                            window_title: node.to_string(),
-                        },
-                    }
+            if stream.is_window() {
+                SourceCandidate::Window {
+                    runtime_id: format!("portal:window:{node}"),
+                    name,
+                    // The portal does not expose a stable process path.  The
+                    // marker plus node id lets the renderer associate the
+                    // candidate with this session; a restart requires a new
+                    // portal selection instead of a silent rebind.
+                    binding: WindowBinding {
+                        process_path: marker.clone(),
+                        window_title: node.to_string(),
+                    },
                 }
-                _ => SourceCandidate::Display {
+            } else {
+                SourceCandidate::Display {
                     runtime_id: format!("portal:display:{node}"),
                     name,
                     binding: DisplayBinding {
                         adapter_luid: marker.clone(),
                         output_id: node,
                     },
-                },
+                }
             }
         })
         .collect()

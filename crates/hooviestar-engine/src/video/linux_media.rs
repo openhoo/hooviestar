@@ -196,25 +196,27 @@ impl LinuxMedia {
                 }
             })
             .map_err(|error| error.to_string())?;
-        match self.commands.lock() {
-            Ok(mut commands) => {
-                commands.insert(
-                    source_id,
-                    MediaWorker {
-                        commands: tx,
-                        ring: worker_ring,
-                        thread: Some(worker),
-                    },
-                );
-            }
+        let replaced = match self.commands.lock() {
+            Ok(mut commands) => commands.insert(
+                source_id,
+                MediaWorker {
+                    commands: tx,
+                    ring: worker_ring,
+                    thread: Some(worker),
+                },
+            ),
             Err(_) => {
                 // The worker thread already runs; hand it a Stop so the
                 // pipeline tears down via PipelineNullGuard instead of being
                 // orphaned by this early return.
                 let _ = tx.send(MediaCommand::Stop);
+                let _ = worker.join();
                 return Err("media command lock poisoned".to_string());
             }
-        }
+        };
+        // Replacing a worker joins its thread. Never do that while holding
+        // the command-map mutex: the renderer must remain responsive.
+        drop(replaced);
         Ok(())
     }
     pub fn command(&self, source_id: Uuid, command: MediaCommand) {

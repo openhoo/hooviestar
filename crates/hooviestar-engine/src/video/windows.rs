@@ -632,10 +632,10 @@ impl D3d11Compositor {
                 TextAlign::Right => 2u8,
             },
         );
-        if let Some((cached_family, format)) = self.text_formats.get(&key) {
-            if cached_family == family {
-                return Ok(format.clone());
-            }
+        if let Some((cached_family, format)) = self.text_formats.get(&key)
+            && cached_family == family
+        {
+            return Ok(format.clone());
         }
         let family_name = family.to_string();
         let family: Vec<u16> = family.encode_utf16().chain(Some(0)).collect();
@@ -846,25 +846,27 @@ impl RenderRuntime {
                     let next_output = snapshot.output.clone();
                     try_resize_compositor(
                         next_output,
-                        surfaces,
-                        &mut output,
-                        &mut stack.compositor,
-                        &mut stack.media_context,
-                        &mut stack.mf_last_error,
-                        &mut media_sources,
-                        &mut media_pump.last_media_state,
-                        &mut last_failures,
-                        &mut media_pump.read_backoff,
-                        &mut captures,
-                        &mut frames,
-                        &mut stale_windows,
-                        &mut display_captures,
-                        &mut image_textures,
-                        &mut media_pump.previous_visible,
-                        &mut last_source_sync,
-                        &mut resize_retry_failures,
-                        &mut next_resize_attempt,
-                        &events,
+                        ResizeCompositorContext {
+                            surfaces,
+                            output: &mut output,
+                            stack: &mut stack,
+                            device_state: DeviceTiedState {
+                                media_sources: &mut media_sources,
+                                last_media_state: &mut media_pump.last_media_state,
+                                last_failures: &mut last_failures,
+                                read_backoff: &mut media_pump.read_backoff,
+                                captures: &mut captures,
+                                frames: &mut frames,
+                                stale_windows: &mut stale_windows,
+                                display_captures: &mut display_captures,
+                                image_textures: &mut image_textures,
+                                previous_visible: &mut media_pump.previous_visible,
+                            },
+                            last_source_sync: &mut last_source_sync,
+                            retry_failures: &mut resize_retry_failures,
+                            next_attempt: &mut next_resize_attempt,
+                            events: &events,
+                        },
                     );
 
                     if last_source_sync.elapsed() >= Duration::from_secs(1) {
@@ -904,13 +906,15 @@ impl RenderRuntime {
                             match pass {
                                 SyncPass::Window => synchronize_window_captures(
                                     &snapshot,
-                                    surfaces,
-                                    &stack.compositor.device,
-                                    &events,
                                     &mut captures,
                                     &mut frames,
-                                    &mut last_failures,
-                                    &mut creations_this_tick,
+                                    WindowCaptureSyncContext {
+                                        surfaces,
+                                        device: &stack.compositor.device,
+                                        events: &events,
+                                        failures: &mut last_failures,
+                                        creations: &mut creations_this_tick,
+                                    },
                                 ),
                                 SyncPass::Display => synchronize_display_captures(
                                     &snapshot,
@@ -1097,26 +1101,28 @@ impl RenderRuntime {
                     ) {
                         if recover_after_render_error(
                             &error,
-                            surfaces,
-                            &output,
-                            &mut stack.compositor,
-                            &mut stack.media_context,
-                            &mut stack.mf_last_error,
-                            &mut media_sources,
-                            &mut media_pump.last_media_state,
-                            &mut last_failures,
-                            &mut media_pump.read_backoff,
-                            &mut captures,
-                            &mut frames,
-                            &mut stale_windows,
-                            &mut display_captures,
-                            &mut image_textures,
-                            &mut media_pump.previous_visible,
-                            &mut recovery_streak,
-                            &mut rendered_frames_since_recovery,
-                            &mut last_source_sync,
-                            &thread_stop,
-                            &events,
+                            RenderRecoveryContext {
+                                surfaces,
+                                output: &output,
+                                stack: &mut stack,
+                                device_state: DeviceTiedState {
+                                    media_sources: &mut media_sources,
+                                    last_media_state: &mut media_pump.last_media_state,
+                                    last_failures: &mut last_failures,
+                                    read_backoff: &mut media_pump.read_backoff,
+                                    captures: &mut captures,
+                                    frames: &mut frames,
+                                    stale_windows: &mut stale_windows,
+                                    display_captures: &mut display_captures,
+                                    image_textures: &mut image_textures,
+                                    previous_visible: &mut media_pump.previous_visible,
+                                },
+                                recovery_streak: &mut recovery_streak,
+                                rendered_frames: &mut rendered_frames_since_recovery,
+                                last_source_sync: &mut last_source_sync,
+                                thread_stop: &thread_stop,
+                                events: &events,
+                            },
                         ) {
                             break;
                         }
@@ -1164,7 +1170,8 @@ impl RenderRuntime {
 
     pub fn shutdown(&self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.lock().take() {
+        let thread = self.thread.lock().take();
+        if let Some(thread) = thread {
             let _ = thread.join();
         }
     }
@@ -1205,57 +1212,60 @@ fn restart_media_context(
 /// Geraeteabhaengigen Zustand nach Device-Verlust verwerfen; der
 /// naechste Sync-Tick baut die Quellen neu auf. `available_displays`
 /// bleibt absichtlich unberuehrt (historisches Verhalten).
-fn clear_device_tied_state(
-    media_sources: &mut HashMap<Uuid, (String, MediaVideoSource)>,
-    last_media_state: &mut HashMap<Uuid, (bool, f64)>,
-    last_failures: &mut HashMap<(Uuid, FailureKind), String>,
-    read_backoff: &mut HashSet<Uuid>,
-    media_context: &mut Option<MediaFoundationContext>,
-    captures: &mut HashMap<Uuid, WindowCapture>,
-    frames: &mut HashMap<Uuid, D3d11CapturedFrame>,
-    stale_windows: &mut HashSet<Uuid>,
-    display_captures: &mut HashMap<Uuid, DisplayCapture>,
-    image_textures: &mut HashMap<Uuid, (String, ID3D11Texture2D)>,
-    previous_visible: &mut HashSet<Uuid>,
-) {
-    media_sources.clear();
-    last_media_state.clear();
-    last_failures.clear();
-    read_backoff.clear();
-    drop(media_context.take());
-    captures.clear();
-    frames.clear();
-    stale_windows.clear();
-    display_captures.clear();
-    image_textures.clear();
-    previous_visible.clear();
+struct DeviceTiedState<'a> {
+    media_sources: &'a mut HashMap<Uuid, (String, MediaVideoSource)>,
+    last_media_state: &'a mut HashMap<Uuid, (bool, f64)>,
+    last_failures: &'a mut HashMap<(Uuid, FailureKind), String>,
+    read_backoff: &'a mut HashSet<Uuid>,
+    captures: &'a mut HashMap<Uuid, WindowCapture>,
+    frames: &'a mut HashMap<Uuid, D3d11CapturedFrame>,
+    stale_windows: &'a mut HashSet<Uuid>,
+    display_captures: &'a mut HashMap<Uuid, DisplayCapture>,
+    image_textures: &'a mut HashMap<Uuid, (String, ID3D11Texture2D)>,
+    previous_visible: &'a mut HashSet<Uuid>,
+}
+
+impl DeviceTiedState<'_> {
+    fn clear(&mut self, media_context: &mut Option<MediaFoundationContext>) {
+        self.media_sources.clear();
+        self.last_media_state.clear();
+        self.last_failures.clear();
+        self.read_backoff.clear();
+        drop(media_context.take());
+        self.captures.clear();
+        self.frames.clear();
+        self.stale_windows.clear();
+        self.display_captures.clear();
+        self.image_textures.clear();
+        self.previous_visible.clear();
+    }
+}
+
+struct ResizeCompositorContext<'a> {
+    surfaces: NativeSurfaces,
+    output: &'a mut OutputConfig,
+    stack: &'a mut WindowsRenderStack,
+    device_state: DeviceTiedState<'a>,
+    last_source_sync: &'a mut Instant,
+    retry_failures: &'a mut u32,
+    next_attempt: &'a mut Instant,
+    events: &'a mpsc::Sender<EngineEvent>,
 }
 
 /// Groessenaenderung lazily retryen: der alte Kompositor rendert in
 /// der alten Groesse weiter, eine nicht erzeugbare Groesse kostet
 /// nicht das fatale Recovery-Budget.
-fn try_resize_compositor(
-    next_output: OutputConfig,
-    surfaces: NativeSurfaces,
-    output: &mut OutputConfig,
-    compositor: &mut D3d11Compositor,
-    media_context: &mut Option<MediaFoundationContext>,
-    mf_last_error: &mut Option<String>,
-    media_sources: &mut HashMap<Uuid, (String, MediaVideoSource)>,
-    last_media_state: &mut HashMap<Uuid, (bool, f64)>,
-    last_failures: &mut HashMap<(Uuid, FailureKind), String>,
-    read_backoff: &mut HashSet<Uuid>,
-    captures: &mut HashMap<Uuid, WindowCapture>,
-    frames: &mut HashMap<Uuid, D3d11CapturedFrame>,
-    stale_windows: &mut HashSet<Uuid>,
-    display_captures: &mut HashMap<Uuid, DisplayCapture>,
-    image_textures: &mut HashMap<Uuid, (String, ID3D11Texture2D)>,
-    previous_visible: &mut HashSet<Uuid>,
-    last_source_sync: &mut Instant,
-    resize_retry_failures: &mut u32,
-    next_resize_attempt: &mut Instant,
-    events: &mpsc::Sender<EngineEvent>,
-) {
+fn try_resize_compositor(next_output: OutputConfig, context: ResizeCompositorContext<'_>) {
+    let ResizeCompositorContext {
+        surfaces,
+        output,
+        stack,
+        mut device_state,
+        last_source_sync,
+        retry_failures,
+        next_attempt,
+        events,
+    } = context;
     // Nicht-Groessen-Aenderungen (fps, Hintergrund) greifen sofort,
     // unabhaengig vom ausstehenden Retry einer nicht erzeugbaren
     // Groesse; nur width/height bleiben an das gelungene Recreate
@@ -1267,7 +1277,7 @@ fn try_resize_compositor(
         // Kompositor rendert in der alten Groesse weiter,
         // eine nicht erzeugbare Groesse kostet nicht das
         // fatale Recovery-Budget.
-        if Instant::now() >= *next_resize_attempt {
+        if Instant::now() >= *next_attempt {
             let _ = events.send(EngineEvent::DeviceRecovery {
                 phase: DeviceRecoveryPhase::Started,
                 detail: None,
@@ -1284,45 +1294,36 @@ fn try_resize_compositor(
                     // scheitert das Create, bleibt der alte
                     // Kompositor mit allen Quellen
                     // weiter lauffaehig.
-                    clear_device_tied_state(
-                        media_sources,
-                        last_media_state,
-                        last_failures,
-                        read_backoff,
-                        media_context,
-                        captures,
-                        frames,
-                        stale_windows,
-                        display_captures,
-                        image_textures,
-                        previous_visible,
+                    device_state.clear(&mut stack.media_context);
+                    stack.compositor = recreated;
+                    restart_media_context(
+                        &mut stack.media_context,
+                        &mut stack.mf_last_error,
+                        &stack.compositor.device,
                     );
-                    *compositor = recreated;
-                    restart_media_context(media_context, mf_last_error, &compositor.device);
                     *output = next_output;
                     *last_source_sync = Instant::now() - Duration::from_secs(2);
-                    *resize_retry_failures = 0;
-                    *next_resize_attempt = Instant::now();
+                    *retry_failures = 0;
+                    *next_attempt = Instant::now();
                     let _ = events.send(EngineEvent::DeviceRecovery {
                         phase: DeviceRecoveryPhase::Succeeded,
                         detail: None,
                     });
                 }
                 Err(error) => {
-                    *resize_retry_failures += 1;
+                    *retry_failures += 1;
                     let _ = events.send(EngineEvent::DeviceRecovery {
                         phase: DeviceRecoveryPhase::Failed,
                         detail: Some(error.to_string()),
                     });
-                    *next_resize_attempt =
-                        Instant::now() + backoff_duration(*resize_retry_failures);
+                    *next_attempt = Instant::now() + backoff_duration(*retry_failures);
                 }
             }
         }
     } else {
         *output = next_output;
-        *resize_retry_failures = 0;
-        *next_resize_attempt = Instant::now();
+        *retry_failures = 0;
+        *next_attempt = Instant::now();
     }
 }
 
@@ -1700,51 +1701,43 @@ fn pump_media(
 /// Thread nicht: Geraeteabhaengigen Zustand neu aufbauen und
 /// weiterlaufen. Rueckgabe `true`: endgueltig aufgegeben, der
 /// Aufrufer beendet die Schleife.
+struct RenderRecoveryContext<'a> {
+    surfaces: NativeSurfaces,
+    output: &'a OutputConfig,
+    stack: &'a mut WindowsRenderStack,
+    device_state: DeviceTiedState<'a>,
+    recovery_streak: &'a mut u32,
+    rendered_frames: &'a mut u32,
+    last_source_sync: &'a mut Instant,
+    thread_stop: &'a AtomicBool,
+    events: &'a mpsc::Sender<EngineEvent>,
+}
+
 fn recover_after_render_error(
     error: &WindowsVideoError,
-    surfaces: NativeSurfaces,
-    output: &OutputConfig,
-    compositor: &mut D3d11Compositor,
-    media_context: &mut Option<MediaFoundationContext>,
-    mf_last_error: &mut Option<String>,
-    media_sources: &mut HashMap<Uuid, (String, MediaVideoSource)>,
-    last_media_state: &mut HashMap<Uuid, (bool, f64)>,
-    last_failures: &mut HashMap<(Uuid, FailureKind), String>,
-    read_backoff: &mut HashSet<Uuid>,
-    captures: &mut HashMap<Uuid, WindowCapture>,
-    frames: &mut HashMap<Uuid, D3d11CapturedFrame>,
-    stale_windows: &mut HashSet<Uuid>,
-    display_captures: &mut HashMap<Uuid, DisplayCapture>,
-    image_textures: &mut HashMap<Uuid, (String, ID3D11Texture2D)>,
-    previous_visible: &mut HashSet<Uuid>,
-    recovery_streak: &mut u32,
-    rendered_frames_since_recovery: &mut u32,
-    last_source_sync: &mut Instant,
-    thread_stop: &AtomicBool,
-    events: &mpsc::Sender<EngineEvent>,
+    context: RenderRecoveryContext<'_>,
 ) -> bool {
+    let RenderRecoveryContext {
+        surfaces,
+        output,
+        stack,
+        mut device_state,
+        recovery_streak,
+        rendered_frames,
+        last_source_sync,
+        thread_stop,
+        events,
+    } = context;
     // Jeder Eingriff zaehlt — unabhaengig vom Create-Ausgang: Eine
     // Flatter-Serie (Create gelingt, Rendern scheitert weiter) muss
     // ueber Backoff abgebremst werden und am Streak-Limit terminieren.
     *recovery_streak += 1;
-    *rendered_frames_since_recovery = 0;
+    *rendered_frames = 0;
     let _ = events.send(EngineEvent::DeviceRecovery {
         phase: DeviceRecoveryPhase::Started,
         detail: Some(error.to_string()),
     });
-    clear_device_tied_state(
-        media_sources,
-        last_media_state,
-        last_failures,
-        read_backoff,
-        media_context,
-        captures,
-        frames,
-        stale_windows,
-        display_captures,
-        image_textures,
-        previous_visible,
-    );
+    device_state.clear(&mut stack.media_context);
     *last_source_sync = Instant::now() - Duration::from_secs(2);
     match D3d11Compositor::create(
         surfaces.program,
@@ -1753,8 +1746,12 @@ fn recover_after_render_error(
         output.height,
     ) {
         Ok(recreated) => {
-            *compositor = recreated;
-            restart_media_context(media_context, mf_last_error, &compositor.device);
+            stack.compositor = recreated;
+            restart_media_context(
+                &mut stack.media_context,
+                &mut stack.mf_last_error,
+                &stack.compositor.device,
+            );
             let _ = events.send(EngineEvent::DeviceRecovery {
                 phase: DeviceRecoveryPhase::Succeeded,
                 detail: None,
@@ -2033,16 +2030,27 @@ fn synchronize_display_captures(
     }
 }
 
+struct WindowCaptureSyncContext<'a> {
+    surfaces: NativeSurfaces,
+    device: &'a D3d11Device,
+    events: &'a mpsc::Sender<EngineEvent>,
+    failures: &'a mut HashMap<(Uuid, FailureKind), String>,
+    creations: &'a mut u32,
+}
+
 fn synchronize_window_captures(
     project: &ProjectV1,
-    surfaces: NativeSurfaces,
-    device: &D3d11Device,
-    events: &mpsc::Sender<EngineEvent>,
     captures: &mut HashMap<Uuid, WindowCapture>,
     frames: &mut HashMap<Uuid, D3d11CapturedFrame>,
-    failures: &mut HashMap<(Uuid, FailureKind), String>,
-    creations: &mut u32,
+    context: WindowCaptureSyncContext<'_>,
 ) {
+    let WindowCaptureSyncContext {
+        surfaces,
+        device,
+        events,
+        failures,
+        creations,
+    } = context;
     let desired: HashMap<Uuid, &crate::project::WindowBinding> = project
         .sources
         .iter()

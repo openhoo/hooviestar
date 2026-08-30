@@ -61,7 +61,7 @@ fn main() {
             let samples = unsafe {
                 std::slice::from_raw_parts_mut(buffer.cast::<f32>(), frames as usize * 2)
             };
-            for frame in samples.chunks_exact_mut(2) {
+            for frame in samples.as_chunks_mut::<2>().0 {
                 let sample = phase.sin() * 0.2;
                 frame[0] = sample;
                 frame[1] = sample;

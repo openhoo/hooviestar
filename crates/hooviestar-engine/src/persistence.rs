@@ -4,9 +4,10 @@ use std::{
     fs::{self},
     io::{self, Write},
     path::{Path, PathBuf},
+    process,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
@@ -18,6 +19,7 @@ use parking_lot::Mutex;
 use crate::project::ProjectV1;
 
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(250);
+static SIBLING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, thiserror::Error)]
 pub enum PersistenceError {
@@ -165,11 +167,7 @@ pub fn save_atomic(path: &Path, project: &ProjectV1) -> Result<(), PersistenceEr
     }
     // Eindeutiger Temporaername pro Schreibvorgang: zwei Instanzen oder
     // Threads duerfen sich nie eine tmp-Inode teilen.
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let temporary = path.with_extension(format!("tmp.{stamp}"));
+    let temporary = unique_sibling(path, "tmp", "");
     if let Err(error) = write_exclusive(&temporary, project) {
         let _ = fs::remove_file(&temporary);
         return Err(error);
@@ -292,12 +290,25 @@ fn receive_worker_result(receiver: Receiver<Result<(), String>>) -> Result<(), P
         .map_err(|message| PersistenceError::Io(io::Error::other(message)))
 }
 
-fn backup_corrupt(path: &Path) -> Result<(ProjectV1, Option<PathBuf>), PersistenceError> {
+/// Generates a collision-resistant sibling name for files created by this
+/// process. Nanoseconds make names useful during diagnosis; PID plus a
+/// process-local sequence keep concurrent saves and rapid corruptions apart
+/// even on filesystems or clocks with coarse resolution.
+fn unique_sibling(path: &Path, label: &str, suffix: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
-    let backup = path.with_extension(format!("corrupt-{stamp}.json"));
+        .as_nanos();
+    let sequence = SIBLING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    path.with_extension(format!(
+        "{label}.{stamp}.{}.{}{suffix}",
+        process::id(),
+        sequence,
+    ))
+}
+
+fn backup_corrupt(path: &Path) -> Result<(ProjectV1, Option<PathBuf>), PersistenceError> {
+    let backup = unique_sibling(path, "corrupt", ".json");
     fs::rename(path, &backup)?;
     Ok((ProjectV1::empty(), Some(backup)))
 }
@@ -451,22 +462,28 @@ mod tests {
     fn corrupt_project_is_backed_up_and_reset() {
         let (_directory, path) = temp_project_path();
         // empty() erzeugt frische UUIDs - Struktur statt Wertgleichheit.
-        fs::write(&path, b"{ keine gueltigen Projektdaten").unwrap();
+        let first_corruption = b"{ keine gueltigen Projektdaten";
+        fs::write(&path, first_corruption).unwrap();
         let (project, backup) = load_or_default(&path).unwrap();
         assert!(project.validate().is_ok());
         assert!(project.sources.is_empty());
-        let backup = backup.expect("korrupte Datei muss gesichert werden");
-        assert!(backup.is_file());
+        let first_backup = backup.expect("korrupte Datei muss gesichert werden");
+        assert!(first_backup.is_file());
+        assert_eq!(fs::read(&first_backup).unwrap(), first_corruption);
         assert!(!path.exists());
 
         // Auch ProjectStore::start muss ueber einer korrupten Datei sauber
         // auf das Default-Projekt umschalten und die Reste sichern.
-        fs::write(&path, b"{ immer noch kein Projekt").unwrap();
+        let second_corruption = b"{ immer noch kein Projekt";
+        fs::write(&path, second_corruption).unwrap();
         let (store, started, backup) = ProjectStore::start(path.clone()).unwrap();
         assert!(started.validate().is_ok());
         assert!(started.sources.is_empty());
-        let backup = backup.expect("zweiter Korruptionsfall muss gesichert werden");
-        assert!(backup.is_file());
+        let second_backup = backup.expect("zweiter Korruptionsfall muss gesichert werden");
+        assert!(second_backup.is_file());
+        assert_ne!(first_backup, second_backup);
+        assert_eq!(fs::read(&first_backup).unwrap(), first_corruption);
+        assert_eq!(fs::read(&second_backup).unwrap(), second_corruption);
         store.shutdown().unwrap();
     }
 

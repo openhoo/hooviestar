@@ -11,6 +11,7 @@ use std::{
     io::{Read as _, Write as _},
     os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd},
     os::unix::net::UnixStream,
+    ptr::NonNull,
     rc::Rc,
     sync::{Arc, Mutex, mpsc},
     thread,
@@ -754,7 +755,8 @@ unsafe fn extract_frame(
     raw: *mut pw::sys::pw_buffer,
     data: &mut StreamData,
 ) -> Option<CapturedFrame> {
-    let pw_buffer = unsafe { &*raw };
+    let raw = NonNull::new(raw)?;
+    let pw_buffer = unsafe { raw.as_ref() };
     if pw_buffer.buffer.is_null() {
         return None;
     }
@@ -771,11 +773,11 @@ unsafe fn extract_frame(
         }
         let chunk = unsafe { &*descriptor.chunk };
         let offset = chunk.offset;
-        let stride = chunk.stride.max(0) as u32;
-        if stride == 0 || descriptor.fd < 0 {
-            return None;
-        }
-        let fd = unsafe { BorrowedFd::borrow_raw(descriptor.fd as i32) }
+        let stride = u32::try_from(chunk.stride)
+            .ok()
+            .filter(|stride| *stride > 0)?;
+        let raw_fd = i32::try_from(descriptor.fd).ok().filter(|fd| *fd >= 0)?;
+        let fd = unsafe { BorrowedFd::borrow_raw(raw_fd) }
             .try_clone_to_owned()
             .ok()?;
         planes.push(DmaBufPlane { fd, offset, stride });
@@ -783,7 +785,7 @@ unsafe fn extract_frame(
     if planes.is_empty() {
         return None;
     }
-    let token = SendBufferToken(raw as usize);
+    let token = SendBufferToken(raw.as_ptr() as usize);
     let sequence = data.sequence;
     data.sequence = data.sequence.wrapping_add(1);
     Some(CapturedFrame {
@@ -792,7 +794,9 @@ unsafe fn extract_frame(
         timestamp_ns: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_nanos() as u64,
+            .as_nanos()
+            .try_into()
+            .unwrap_or(u64::MAX),
         width: data.width,
         height: data.height,
         drm_format: data.drm_format,
@@ -822,5 +826,26 @@ fn spa_format_to_drm(value: u32) -> u32 {
             fourcc(b'X', b'B', b'2', b'4')
         }
         _ => drm_xrgb8888(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_frame_rejects_a_null_ffi_buffer() {
+        let (frames, _receiver) = mpsc::channel();
+        let mut data = StreamData {
+            source_id: Uuid::new_v4(),
+            width: 1,
+            height: 1,
+            drm_format: drm_xrgb8888(),
+            modifier: DRM_FORMAT_MOD_INVALID,
+            sequence: 0,
+            pending: Arc::new(Mutex::new(HashSet::new())),
+            frames,
+        };
+        assert!(unsafe { extract_frame(std::ptr::null_mut(), &mut data) }.is_none());
     }
 }

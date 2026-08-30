@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     mem::{ManuallyDrop, size_of},
-    path::PathBuf,
+    path::{Path, PathBuf},
     slice,
     sync::{
         Arc, Mutex as StdMutex,
@@ -188,7 +188,8 @@ impl ProcessAudioCapture {
 
     pub fn shutdown(&self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.lock().take() {
+        let thread = self.thread.lock().take();
+        if let Some(thread) = thread {
             let _ = thread.join();
         }
     }
@@ -263,7 +264,8 @@ impl AudioRuntime {
                         Err(error) => {
                             *thread_last_failure.lock() = Some(error.clone());
                             eprintln!("WASAPI mixer stopped: {error}");
-                            let _ = events.send(EngineEvent::EngineError {
+                            let _ = events.send(EngineEvent::AudioWarning {
+                                kind: AudioWarningKind::DeviceInvalidated,
                                 message: format!("Audio-Mischer wurde unerwartet beendet: {error}"),
                             });
                             if started.elapsed() >= MIXER_HEALTHY_RUNTIME {
@@ -277,7 +279,8 @@ impl AudioRuntime {
                                 && !exhausted_reported
                             {
                                 exhausted_reported = true;
-                                let _ = events.send(EngineEvent::EngineError {
+                                let _ = events.send(EngineEvent::AudioWarning {
+                                    kind: AudioWarningKind::DeviceInvalidated,
                                     message: "Audio-Mischer konnte nach wiederholten Fehlern \
                                         vorübergehend nicht neu gestartet werden; weitere \
                                         Versuche laufen im Hintergrund."
@@ -324,7 +327,8 @@ impl AudioRuntime {
 
     pub fn shutdown(&self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.lock().take() {
+        let thread = self.thread.lock().take();
+        if let Some(thread) = thread {
             let _ = thread.join();
         }
         // Tresor leeren: Ohne Nachfolge-Inkarnation stellen die Drops
@@ -454,22 +458,23 @@ fn mixer_thread_initialized(
                     let stop = stop.clone();
                     let vault = handle_vault;
                     move || {
-                        management_loop(
+                        management_loop(ManagementLoopContext {
                             project,
-                            management_events,
+                            events: management_events,
                             media_audio,
                             journal_path,
                             live,
                             stop,
-                            thread_mgmt_stop,
-                            vault,
-                        )
+                            mgmt_stop: thread_mgmt_stop,
+                            handle_vault: vault,
+                        })
                     }
                 })
                 .map_err(|error| error.to_string())?,
         ),
     };
     let _ = ready.send(Ok(()));
+    let _ = events.send(EngineEvent::AudioRecovered);
 
     let mut last_levels = Instant::now();
     // Aufeinanderfolgende Warte-Timeouts zählen: Ein gesundes Endgerät
@@ -516,7 +521,7 @@ fn mixer_thread_initialized(
             ramps.push(Some(shared.gain.lock()));
         }
         let mut levels: Vec<(f32, f64, usize)> = vec![(0.0, 0.0, 0); snapshot.len()];
-        for frame in output.chunks_exact_mut(2) {
+        for frame in output.as_chunks_mut::<2>().0 {
             let mut mixed = [0.0f32; 2];
             for (slot, (_, shared)) in snapshot.iter().enumerate() {
                 let input = rings[slot].as_mut().map_or([0.0, 0.0], |ring| ring.pop());
@@ -649,18 +654,40 @@ struct CooldownEntry {
     binding: Option<AudioSessionBinding>,
 }
 
+struct SourceManagementContext<'a> {
+    events: &'a mpsc::Sender<EngineEvent>,
+    media_audio: &'a MediaAudioBus,
+    journal_path: &'a Path,
+    live: &'a Mutex<HashMap<Uuid, Arc<LiveSource>>>,
+}
+
+#[derive(Default)]
+struct SourceManagementState {
+    handles: HashMap<Uuid, SourceHandle>,
+    availability: HashMap<Uuid, bool>,
+    retry_cooldown: HashMap<Uuid, CooldownEntry>,
+    last_overruns: HashMap<Uuid, u64>,
+    stale_rings: HashMap<Uuid, (u32, bool)>,
+}
+
 fn synchronize_sources(
     desired: &HashMap<Uuid, (DesiredInput, f32, bool)>,
-    events: &mpsc::Sender<EngineEvent>,
-    media_audio: &MediaAudioBus,
-    journal_path: &PathBuf,
-    handles: &mut HashMap<Uuid, SourceHandle>,
-    live: &Mutex<HashMap<Uuid, Arc<LiveSource>>>,
-    availability: &mut HashMap<Uuid, bool>,
-    retry_cooldown: &mut HashMap<Uuid, CooldownEntry>,
-    last_overruns: &mut HashMap<Uuid, u64>,
-    stale_rings: &mut HashMap<Uuid, (u32, bool)>,
+    context: &SourceManagementContext<'_>,
+    state: &mut SourceManagementState,
 ) {
+    let SourceManagementState {
+        handles,
+        availability,
+        retry_cooldown,
+        last_overruns,
+        stale_rings,
+    } = state;
+    let SourceManagementContext {
+        events,
+        media_audio,
+        journal_path,
+        live,
+    } = context;
     handles.retain(|source_id, _| desired.contains_key(source_id));
     availability.retain(|source_id, _| desired.contains_key(source_id));
     retry_cooldown.retain(|source_id, _| desired.contains_key(source_id));
@@ -723,14 +750,14 @@ fn synchronize_sources(
                 // Auch während der Sperre folgt der weitermischende
                 // Fallback Lautstärke und Stummschaltung (Parität
                 // zum Bindungstreffer oben).
-                if let Some(handle) = handles.get_mut(source_id) {
-                    if let Some(shared) = live.lock().get(source_id) {
-                        if (handle.target_volume - *volume).abs() > f32::EPSILON {
-                            shared.gain.lock().set(*volume, 480);
-                            handle.target_volume = *volume;
-                        }
-                        shared.muted.store(*muted, Ordering::Relaxed);
+                if let Some(handle) = handles.get_mut(source_id)
+                    && let Some(shared) = live.lock().get(source_id)
+                {
+                    if (handle.target_volume - *volume).abs() > f32::EPSILON {
+                        shared.gain.lock().set(*volume, 480);
+                        handle.target_volume = *volume;
                     }
+                    shared.muted.store(*muted, Ordering::Relaxed);
                 }
                 continue;
             }
@@ -790,7 +817,7 @@ fn synchronize_sources(
                         pid,
                         target_volume: *volume,
                         restore,
-                        journal_path: journal_path.clone(),
+                        journal_path: journal_path.to_path_buf(),
                     },
                 );
                 // Bind-Rückstand verwerfen, bevor die Quelle gemischt wird:
@@ -922,7 +949,7 @@ fn report_ring_health(
 
 /// Eigenständiger Verwaltungs-Thread: spiegelt den Projekt-Wunschzustand in
 /// fertige Mischringe, ohne den Render-Thread zu blockieren.
-fn management_loop(
+struct ManagementLoopContext {
     project: Arc<parking_lot::RwLock<ProjectV1>>,
     events: mpsc::Sender<EngineEvent>,
     media_audio: MediaAudioBus,
@@ -931,14 +958,31 @@ fn management_loop(
     stop: Arc<AtomicBool>,
     mgmt_stop: Arc<AtomicBool>,
     handle_vault: HandleVault,
-) {
+}
+
+fn management_loop(context: ManagementLoopContext) {
+    let ManagementLoopContext {
+        project,
+        events,
+        media_audio,
+        journal_path,
+        live,
+        stop,
+        mgmt_stop,
+        handle_vault,
+    } = context;
     // Noch lebende Handles der Vorgänger-Inkarnation übernehmen: Die
     // Capture-Threads laufen weiter, die Stummschaltung bleibt bestehen.
-    let mut handles: HashMap<Uuid, SourceHandle> = std::mem::take(&mut *handle_vault.lock());
-    let mut availability: HashMap<Uuid, bool> = HashMap::new();
-    let mut retry_cooldown: HashMap<Uuid, CooldownEntry> = HashMap::new();
-    let mut last_overruns: HashMap<Uuid, u64> = HashMap::new();
-    let mut stale_rings: HashMap<Uuid, (u32, bool)> = HashMap::new();
+    let mut source_state = SourceManagementState {
+        handles: std::mem::take(&mut *handle_vault.lock()),
+        ..SourceManagementState::default()
+    };
+    let source_context = SourceManagementContext {
+        events: &events,
+        media_audio: &media_audio,
+        journal_path: &journal_path,
+        live: &live,
+    };
     // Endet beim Supervisor-Stopp ODER beim eigenen Notstopp des Guards
     // (nach Render-Fehler); nur ersterer bedeutet echtes Herunterfahren.
     while !stop.load(Ordering::Acquire) && !mgmt_stop.load(Ordering::Acquire) {
@@ -967,24 +1011,13 @@ fn management_loop(
                 })
                 .collect()
         };
-        synchronize_sources(
-            &desired,
-            &events,
-            &media_audio,
-            &journal_path,
-            &mut handles,
-            &live,
-            &mut availability,
-            &mut retry_cooldown,
-            &mut last_overruns,
-            &mut stale_rings,
-        );
+        synchronize_sources(&desired, &source_context, &mut source_state);
         report_ring_health(
             &events,
-            &handles,
+            &source_state.handles,
             &live,
-            &mut last_overruns,
-            &mut stale_rings,
+            &mut source_state.last_overruns,
+            &mut source_state.stale_rings,
         );
         sleep_stoppable_either(&stop, &mgmt_stop, MANAGEMENT_SYNC_INTERVAL);
     }
@@ -995,9 +1028,9 @@ fn management_loop(
     // aufzuheben. Übernimmt keine Inkarnation mehr (ausgeschöpfte Neustarts),
     // räumt AudioRuntime beim Stopp/Drop den Tresor aus.
     if stop.load(Ordering::Acquire) {
-        handles.clear();
+        source_state.handles.clear();
     } else {
-        *handle_vault.lock() = handles;
+        *handle_vault.lock() = source_state.handles;
     }
 }
 
@@ -1107,7 +1140,7 @@ fn capture_thread_initialized(
                 let samples =
                     unsafe { slice::from_raw_parts(data.cast::<i16>(), frame_count as usize * 2) };
                 let mut output = ring.lock();
-                for sample in samples.chunks_exact(2) {
+                for sample in samples.as_chunks::<2>().0 {
                     output.push([
                         f32::from(sample[0]) / 32_768.0,
                         f32::from(sample[1]) / 32_768.0,

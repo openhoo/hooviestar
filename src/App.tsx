@@ -4,8 +4,9 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { engineStore } from "./engineStore";
 import { pipTransform } from "./types";
-import type { EngineCommand, Scene, Source, SourceCandidate, TextSource, Transform } from "./types";
+import type { EngineCommand, ProjectV1, Scene, Source, SourceCandidate, TextSource, Transform } from "./types";
 import { runGuarded } from "./guarded";
+import { SerialQueue } from "./serialQueue";
 import { useAudioFieldBridge } from "./hooks/useAudioFieldBridge";
 import { isWindowsPlatform } from "./platform";
 import { AddSourceDialog } from "./components/AddSourceDialog";
@@ -49,6 +50,12 @@ const BOTH_SCENE_HOTKEY = "Ctrl+Alt+3";
 
 interface SceneTarget { scene: Scene; transform: Transform; bottom?: boolean }
 
+function activeSceneOf(project: ProjectV1): Scene {
+  const scene = project.scenes.find((entry) => entry.id === project.activeSceneId);
+  if (!scene) throw new Error("Aktive Szene fehlt im validierten Projekt");
+  return scene;
+}
+
 export default function App() {
   const { project, status, levels, mediaStates } = useSyncExternalStore(
     engineStore.subscribe,
@@ -60,6 +67,8 @@ export default function App() {
   const [hotkeyMessage, setHotkeyMessage] = useState<string | null>(null);
   const [sceneError, setSceneError] = useState<string | null>(null);
   const [itemError, setItemError] = useState<string | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [windowError, setWindowError] = useState<string | null>(null);
   const onboardingDismissedRef = useRef(false);
   // Optimistische Feld-Deltas je Quelle: überbrückt das Snapshot-Event-Lag, damit
   // aufeinanderfolgende update_source-Aufrufe nicht gegenseitig Felder zurücksetzen.
@@ -67,6 +76,10 @@ export default function App() {
   // überlagert, damit ein parallel laufendes update_source sie nicht mit dem
   // Snapshot-Stand zurücküberschreibt.
   const pendingSourceFieldsRef = useRef(new Map<string, Record<string, unknown>>());
+  // Alle persistierten Mutationen derselben Quelle teilen eine Reihenfolge.
+  // Ohne diese Queue können ältere IPC-Aufrufe später abschließen und neuere
+  // Text-/Lautstärke-/Stummwerte wieder überschreiben.
+  const sourceMutationQueueRef = useRef(new SerialQueue());
   // Audio-Brücke: IPC-Koaleszierung für Lautstärke/Stumm besitzt die Hook;
   // das Feld-Overlay (pendingSourceFieldsRef) bleibt hier und wird übergeben.
   const {
@@ -76,13 +89,14 @@ export default function App() {
     setMixerVolume,
     pendingField,
     prunePendingFields,
-  } = useAudioFieldBridge(pendingSourceFieldsRef);
+  } = useAudioFieldBridge(pendingSourceFieldsRef, sourceMutationQueueRef.current);
   const [textError, setTextError] = useState<string | null>(null);
   const addButton = useRef<HTMLButtonElement>(null);
   // Native-Vorschau: das Element überlebt Projekt-Updates; Beobachter und
   // Meldung werden genau einmal eingerichtet (siehe attachPreviewBounds).
   const previewNodeRef = useRef<HTMLDivElement | null>(null);
   const previewObserverRef = useRef<ResizeObserver | null>(null);
+  const previewRequestRef = useRef(0);
 
   useEffect(() => {
     void engineStore.start();
@@ -102,12 +116,22 @@ export default function App() {
     const preview = previewNodeRef.current;
     if (!preview || !isWindowsPlatform()) return;
     const bounds = preview.getBoundingClientRect();
+    const request = ++previewRequestRef.current;
     void invoke("set_preview_bounds", {
       x: bounds.x,
       y: bounds.y,
       width: bounds.width,
       height: bounds.height,
-    });
+    }).then(
+      () => {
+        if (previewRequestRef.current === request) setPreviewError(null);
+      },
+      (error: unknown) => {
+        if (previewRequestRef.current === request) {
+          setPreviewError(`Vorschaufehler: ${String(error)}`);
+        }
+      },
+    );
   }, []);
 
   // Ref-Callback statt Effect: das Element wird beim Einhängen beobachtet,
@@ -134,7 +158,16 @@ export default function App() {
       sceneId,
       name: `Szene ${scenes.length + 1}`,
     });
-    await engineStore.dispatch({ type: "set_active_scene", sceneId });
+    try {
+      await engineStore.dispatch({ type: "set_active_scene", sceneId });
+    } catch (error) {
+      try {
+        await engineStore.dispatch({ type: "remove_scene", sceneId });
+      } catch (rollback) {
+        throw new Error(`${String(error)}; Szenen-Rollback fehlgeschlagen: ${String(rollback)}`);
+      }
+      throw error;
+    }
   }, []);
 
   const handleAddScene = useCallback(() => void runGuarded(addScene, setSceneError), [addScene]);
@@ -149,8 +182,7 @@ export default function App() {
     const value = new FormData(event.currentTarget).get("hotkey");
     const hotkey = typeof value === "string" && value.trim() ? value.trim() : null;
     const snapshot = engineStore.getSnapshot().project!;
-    const activeScene =
-      snapshot.scenes.find((scene) => scene.id === snapshot.activeSceneId) ?? snapshot.scenes[0];
+    const activeScene = activeSceneOf(snapshot);
     void runGuarded(
       () => engineStore.dispatch({ type: "set_scene_hotkey", sceneId: activeScene.id, hotkey }),
       setHotkeyMessage,
@@ -179,7 +211,11 @@ export default function App() {
         }
       }
     } catch (error) {
-      await engineStore.dispatch({ type: "remove_source", sourceId: source.id });
+      try {
+        await engineStore.dispatch({ type: "remove_source", sourceId: source.id });
+      } catch (rollback) {
+        throw new Error(`${String(error)}; Quellen-Rollback fehlgeschlagen: ${String(rollback)}`);
+      }
       throw error;
     }
     setSelectedSourceId(source.id);
@@ -213,8 +249,7 @@ export default function App() {
 
   const addTextSource = useCallback(async () => {
     const snapshot = engineStore.getSnapshot().project!;
-    const scene =
-      snapshot.scenes.find((entry) => entry.id === snapshot.activeSceneId) ?? snapshot.scenes[0];
+    const scene = activeSceneOf(snapshot);
     const source: Source = {
       type: "text",
       id: crypto.randomUUID(),
@@ -247,8 +282,7 @@ export default function App() {
     if (typeof path !== "string") return;
     const canonicalPath = await invoke<string>("canonicalize_file", { path });
     const snapshot = engineStore.getSnapshot().project!;
-    const scene =
-      snapshot.scenes.find((entry) => entry.id === snapshot.activeSceneId) ?? snapshot.scenes[0];
+    const scene = activeSceneOf(snapshot);
     const source: Source = {
       type: "image",
       id: crypto.randomUUID(),
@@ -316,7 +350,9 @@ export default function App() {
     }
     const next = { ...snapshotSource, ...pending } as Source;
     try {
-      await engineStore.dispatch({ type: "update_source", source: next });
+      await sourceMutationQueueRef.current.enqueue(sourceId, () =>
+        engineStore.dispatch({ type: "update_source", source: next }),
+      );
     } catch (error) {
       if (pendingSourceFieldsRef.current.get(sourceId) === pending) pendingSourceFieldsRef.current.delete(sourceId);
       throw error;
@@ -378,8 +414,7 @@ export default function App() {
   // Beschriftungen „Nach oben“/„Nach unten“ dem Verhalten entsprechen.
   const runItemAction = useCallback((itemId: string, action: ItemAction) => {
     const snapshot = engineStore.getSnapshot().project!;
-    const activeScene =
-      snapshot.scenes.find((scene) => scene.id === snapshot.activeSceneId) ?? snapshot.scenes[0];
+    const activeScene = activeSceneOf(snapshot);
     const item = activeScene.items.find((entry) => entry.id === itemId);
     if (!item) return;
     let command: EngineCommand;
@@ -415,14 +450,18 @@ export default function App() {
   // Kaskadierendes Entfernen: die Engine räumt referenzierende Items ab;
   // hier nur die Auswahl und ihre Fehlermeldungen zurücksetzen.
   const removeSource = useCallback((sourceId: string) => {
-    setSelectedSourceId((current) => (current === sourceId ? null : current));
-    setItemError(null);
-    setTextError(null);
-    return runGuarded(() => engineStore.dispatch({ type: "remove_source", sourceId }), setItemError);
+    return runGuarded(async () => {
+      await engineStore.dispatch({ type: "remove_source", sourceId });
+      setSelectedSourceId((current) => (current === sourceId ? null : current));
+      setTextError(null);
+    }, setItemError);
   }, []);
 
   const quitStudio = useCallback(() => {
-    void getCurrentWindow().close();
+    setWindowError(null);
+    void getCurrentWindow().close().catch((error: unknown) => {
+      setWindowError(`Fensterfehler: ${String(error)}`);
+    });
   }, []);
 
   if (!project) {
@@ -434,8 +473,7 @@ export default function App() {
     );
   }
 
-  const activeScene =
-    project.scenes.find((scene) => scene.id === project.activeSceneId) ?? project.scenes[0];
+  const activeScene = activeSceneOf(project);
   const selectedSource =
     project.sources.find((source) => source.id === selectedSourceId) ?? null;
   const selectedItem = selectedSource
@@ -578,7 +616,7 @@ export default function App() {
       </div>
 
       <StatusBar
-        status={status}
+        status={windowError ?? previewError ?? status}
         output={project.output}
         sceneCount={project.scenes.length}
         sourceCount={project.sources.length}

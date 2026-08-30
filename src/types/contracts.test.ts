@@ -18,16 +18,30 @@ describe("shared engine contract", () => {
   });
   it("rejects persisted audio volumes outside the mixer range", () => {
     const project = structuredClone(fixture);
-    project.sources[4].volume = 1.01;
+    project.sources[4]!.volume = 1.01;
     expect(parseProjectV1(project)).toBeNull();
-    project.sources[4].volume = 0.5;
-    project.sources[5].volume = -0.01;
+    project.sources[4]!.volume = 0.5;
+    project.sources[5]!.volume = -0.01;
     expect(parseProjectV1(project)).toBeNull();
+  });
+  it("rejects values Rust cannot deserialize at the shared contract boundary", () => {
+    const malformedUuid = structuredClone(fixture);
+    malformedUuid.sources[0]!.id = "not-a-uuid";
+    expect(parseProjectV1(malformedUuid)).toBeNull();
+
+    const fractionalOutput = structuredClone(fixture);
+    fractionalOutput.sources[1]!.binding!.outputId = 1.5;
+    expect(parseProjectV1(fractionalOutput)).toBeNull();
+
+    const oversizedFontWeight = structuredClone(fixture);
+    oversizedFontWeight.sources[3]!.fontWeight = 65_536;
+    expect(parseProjectV1(oversizedFontWeight)).toBeNull();
   });
   it("keeps command and event tags unique", () => {
     expect(new Set(ENGINE_COMMAND_TYPES).size).toBe(ENGINE_COMMAND_TYPES.length);
     expect(new Set(ENGINE_EVENT_TYPES).size).toBe(ENGINE_EVENT_TYPES.length);
     expect(parseEngineEvent({ type: "audio_warning", kind: "underrun", message: "x" })).toEqual({ type: "audio_warning", kind: "underrun", message: "x" });
+    expect(parseEngineEvent({ type: "audio_recovered" })).toEqual({ type: "audio_recovered" });
     expect(
       parseEngineEvent({
         type: "unsupported_media",
@@ -56,12 +70,39 @@ describe("shared engine contract", () => {
       }),
     ).toBeNull();
   });
+  it("rejects malformed event UUIDs and non-finite telemetry", () => {
+    expect(parseEngineEvent({ type: "source_available", sourceId: "source-1" })).toBeNull();
+    expect(
+      parseEngineEvent({
+        type: "levels",
+        entries: [{
+          sourceId: "00000000-0000-4000-8000-000000000001",
+          peak: Number.POSITIVE_INFINITY,
+          rms: 0.25,
+        }],
+      }),
+    ).toBeNull();
+    expect(
+      parseEngineEvent({
+        type: "media_state",
+        sourceId: "00000000-0000-4000-8000-000000000001",
+        state: { playing: true, positionSeconds: Number.NaN, durationSeconds: null },
+      }),
+    ).toBeNull();
+  });
   it("rejects unknown event types", () => {
     expect(parseEngineEvent({ type: "scene_teleport" })).toBeNull();
   });
   it("rejects scene items referencing unknown sources", () => {
     const project = structuredClone(fixture);
-    project.scenes[0].items[0].sourceId = "00000000-0000-4000-8000-0000000000ff";
+    project.scenes[0]!.items[0]!.sourceId = "00000000-0000-4000-8000-0000000000ff";
+    expect(parseProjectV1(project)).toBeNull();
+  });
+  it("rejects a source appearing twice in one scene", () => {
+    const project = structuredClone(fixture);
+    const duplicate = structuredClone(project.scenes[0]!.items[0]!);
+    duplicate.id = "00000000-0000-4000-8000-0000000000fe";
+    project.scenes[0]!.items.push(duplicate);
     expect(parseProjectV1(project)).toBeNull();
   });
   it("positively parses every pinned event sample from the shared Rust fixture", () => {

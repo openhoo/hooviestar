@@ -68,20 +68,22 @@ impl RuntimeResources {
         }
         let _ = app.global_shortcut().unregister_all();
         self.stop_events.store(true, Ordering::Release);
-        if let Some(engine) = self.engine.lock().expect("engine mutex poisoned").take()
+        let engine = self.engine.lock().expect("engine mutex poisoned").take();
+        if let Some(engine) = engine
             && let Err(error) = engine.shutdown()
         {
             eprintln!("[hooviestar] engine shutdown persistence error: {error}");
         }
-        if let Some(thread) = self
+        let event_thread = self
             .event_thread
             .lock()
             .expect("event thread mutex poisoned")
-            .take()
-        {
+            .take();
+        if let Some(thread) = event_thread {
             let _ = thread.join();
         }
-        if let Some(preview) = self.preview.lock().expect("preview mutex poisoned").take() {
+        let preview = self.preview.lock().expect("preview mutex poisoned").take();
+        if let Some(preview) = preview {
             let _ = preview.destroy();
         }
         self.portal.clear();
@@ -109,6 +111,7 @@ fn dispatch(
         );
     }
     if let EngineCommand::RemoveScene { scene_id } = &command {
+        let scene_id = *scene_id;
         let _hotkey_guard = state
             .inner()
             .hotkey_mutations
@@ -120,22 +123,33 @@ fn dispatch(
             .snapshot()
             .scenes
             .into_iter()
-            .find(|scene| scene.id == *scene_id)
+            .find(|scene| scene.id == scene_id)
             .and_then(|scene| scene.hotkey);
-        state
-            .inner()
-            .engine
-            .command(command)
-            .map_err(|error| error.to_string())?;
-        if let Some(shortcut) = shortcut {
-            // Best effort: Eine Alt-Registrierung, die beim Start einen
-            // Konflikt verlor und nie registriert wurde, darf Löschen nicht
-            // scheitern lassen.
-            if app.global_shortcut().is_registered(shortcut.as_str())
-                && let Err(error) = app.global_shortcut().unregister(shortcut.as_str())
+        // Registrierung zuerst entfernen: Scheitert das, bleibt die Szene
+        // unverändert statt als unsichtbare Ghost-Bindung weiterzuleben.
+        let unregistered = if let Some(shortcut) = &shortcut
+            && app.global_shortcut().is_registered(shortcut.as_str())
+        {
+            app.global_shortcut()
+                .unregister(shortcut.as_str())
+                .map_err(|error| {
+                    format!("Hotkey {shortcut} konnte nicht entfernt werden: {error}")
+                })?;
+            true
+        } else {
+            false
+        };
+        if let Err(error) = state.inner().engine.command(command) {
+            if unregistered
+                && let Some(shortcut) = &shortcut
+                && let Err(rollback) =
+                    register_hotkey(&app, state.inner().engine.clone(), scene_id, shortcut)
             {
-                eprintln!("[hooviestar] failed to unregister scene hotkey {shortcut}: {error}");
+                return Err(format!(
+                    "{error}; Hotkey-Rollback für {shortcut} fehlgeschlagen: {rollback}"
+                ));
             }
+            return Err(error.to_string());
         }
         return Ok(());
     }
@@ -147,7 +161,10 @@ fn dispatch(
 }
 
 #[tauri::command]
-fn engine_status(app: tauri::AppHandle, state: State<'_, AppState>) -> &'static str {
+fn engine_status(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<&'static str, String> {
     let mut events: Vec<EngineEvent> = state
         .inner()
         .initial_events
@@ -165,38 +182,32 @@ fn engine_status(app: tauri::AppHandle, state: State<'_, AppState>) -> &'static 
     for (scene_id, message) in pending {
         events.push(EngineEvent::HotkeyError { scene_id, message });
     }
-    // Erst bereit signalisieren, dann entleeren: Ereignisse, die dazwischen
-    // ankommen, umgehen den Puffer und gehen direkt an den Emit-Pfad.
+    // pending_events bleibt bis zum Ende des Replays gesperrt. Der Forwarder
+    // sperrt denselben Gate-Mutex vor seinem Ready-Check; neuere Ereignisse
+    // können die Startsequenz damit nicht überholen.
+    let mut pending_guard = state
+        .inner()
+        .pending_events
+        .lock()
+        .expect("pending event mutex poisoned");
     state.events_ready.store(true, Ordering::Release);
-    events.extend(
-        state
-            .inner()
-            .pending_events
-            .lock()
-            .expect("pending event mutex poisoned")
-            .drain(..),
-    );
+    events.extend(pending_guard.drain(..));
     // Der Webview haengt seinen Listener vor diesem Aufruf an (engineStore
     // start(): listen() vor engine_status), darum gehen hier verpasste
     // Ereignisse direkt an den selben Emit-Pfad wie der Forwarder-Thread.
     for (index, event) in events.iter().enumerate() {
         if let Err(error) = app.emit("engine-event", event) {
             eprintln!("[hooviestar] failed to emit replayed engine event: {error}");
-            let mut pending_guard = state
-                .inner()
-                .pending_events
-                .lock()
-                .expect("pending event mutex poisoned");
-            // Nicht emittierte Ereignisse vor den zwischenzeitlich
-            // eingetroffenen wieder einreihen; die Reihenfolge bleibt
-            // erhalten und events_ready bleibt gesetzt.
-            let mut requeued = events[index..].to_vec();
-            requeued.extend(pending_guard.drain(..));
-            *pending_guard = requeued;
-            break;
+            *pending_guard = events[index..].to_vec();
+            state.events_ready.store(false, Ordering::Release);
+            // IPC-Fehler an den Webview zurückgeben: engineStore entfernt den
+            // Listener und darf den vollständigen Handshake erneut versuchen.
+            return Err(format!(
+                "Engine-Ereignis konnte nicht zugestellt werden: {error}"
+            ));
         }
     }
-    "running"
+    Ok("running")
 }
 
 #[tauri::command]
@@ -227,6 +238,40 @@ async fn canonicalize_file(path: String) -> Result<String, String> {
     .map_err(|error| format!("Pfadprüfung fehlgeschlagen: {error}"))?
 }
 
+fn physical_preview_bounds(
+    scale: f64,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<(i32, i32, i32, i32), String> {
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err("Ungültiger Skalierungsfaktor für Vorschau".into());
+    }
+    if ![x, y, width, height].iter().all(|value| value.is_finite()) || width <= 0.0 || height <= 0.0
+    {
+        return Err("Ungültige Vorschaugeometrie".into());
+    }
+    let physical = |value: f64| {
+        let scaled = (value * scale).round();
+        if !scaled.is_finite() || scaled < i32::MIN as f64 || scaled > i32::MAX as f64 {
+            Err("Vorschaugeometrie liegt außerhalb des unterstützten Bereichs".to_string())
+        } else {
+            Ok(scaled as i32)
+        }
+    };
+    let bounds = (
+        physical(x)?,
+        physical(y)?,
+        physical(width)?,
+        physical(height)?,
+    );
+    if bounds.2 <= 0 || bounds.3 <= 0 {
+        return Err("Vorschaugröße muss mindestens einen physischen Pixel betragen".into());
+    }
+    Ok(bounds)
+}
+
 #[tauri::command]
 fn set_preview_bounds(
     x: f64,
@@ -240,14 +285,8 @@ fn set_preview_bounds(
         .get_webview_window("studio")
         .ok_or_else(|| "Studio-Fenster nicht verfügbar".to_string())?;
     let scale = studio.scale_factor().map_err(|error| error.to_string())?;
-    let physical = |value: f64| (value * scale).round() as i32;
-    platform::set_preview_bounds(
-        state.inner().preview,
-        physical(x),
-        physical(y),
-        physical(width),
-        physical(height),
-    )
+    let (x, y, width, height) = physical_preview_bounds(scale, x, y, width, height)?;
+    platform::set_preview_bounds(state.inner().preview, x, y, width, height)
 }
 
 pub fn run() {
@@ -353,9 +392,17 @@ pub fn run() {
                                         printed_once = false;
                                     }
                                 } else {
-                                    drop(pending);
-                                    if let Err(error) = handle.emit("engine-event", event) {
+                                    // Emit unter demselben Gate wie Replay:
+                                    // Start-Ereignisse bleiben vor Live-Events.
+                                    // Bei Fehler das aktuelle Event erhalten
+                                    // und wieder in den Pufferbetrieb wechseln.
+                                    if let Err(error) = handle.emit("engine-event", &event) {
                                         eprintln!("[hooviestar] failed to emit engine event: {error}");
+                                        state.events_ready.store(false, Ordering::Release);
+                                        if pending.len() >= 512 {
+                                            pending.remove(0);
+                                        }
+                                        pending.push(event);
                                     }
                                 }
                             }
@@ -499,14 +546,30 @@ fn update_scene_hotkey(
         let message = format!("{shortcut}: {error}");
         return Err(message);
     }
-    if let Some(shortcut) = &old_shortcut {
-        // Best effort: Eine Alt-Registrierung, die beim Start einen Konflikt
-        // verlor und nie registriert wurde, darf Neusetzen oder Löschen nicht
-        // scheitern lassen.
-        if app.global_shortcut().is_registered(shortcut.as_str())
-            && let Err(error) = app.global_shortcut().unregister(shortcut.as_str())
-        {
-            eprintln!("[hooviestar] failed to unregister old scene hotkey {shortcut}: {error}");
+    let old_was_registered = old_shortcut
+        .as_ref()
+        .is_some_and(|shortcut| app.global_shortcut().is_registered(shortcut.as_str()));
+    if old_was_registered && let Some(shortcut) = &old_shortcut {
+        // Eine Alt-Registrierung, die beim Start einen Konflikt verlor, ist
+        // nicht registriert und bleibt ein No-op. Ein echter Unregister-Fehler
+        // bricht dagegen ab: sonst bliebe eine Ghost-Bindung aktiv.
+        if let Err(error) = app.global_shortcut().unregister(shortcut.as_str()) {
+            let rollback = new_shortcut.as_ref().and_then(|new_shortcut| {
+                app.global_shortcut()
+                    .unregister(new_shortcut.as_str())
+                    .err()
+                    .map(|rollback| {
+                        format!(
+                            "neuer Hotkey {new_shortcut} konnte nicht zurückgerollt werden: {rollback}"
+                        )
+                    })
+            });
+            let mut message =
+                format!("Alter Hotkey {shortcut} konnte nicht entfernt werden: {error}");
+            if let Some(rollback) = rollback {
+                message.push_str(&format!("; {rollback}"));
+            }
+            return Err(message);
         }
     }
 
@@ -515,13 +578,28 @@ fn update_scene_hotkey(
         hotkey: new_shortcut.clone(),
     };
     if let Err(error) = engine.command(command) {
-        if let Some(shortcut) = &new_shortcut {
-            let _ = app.global_shortcut().unregister(shortcut.as_str());
+        let mut rollback_failures = Vec::new();
+        if let Some(shortcut) = &new_shortcut
+            && let Err(rollback) = app.global_shortcut().unregister(shortcut.as_str())
+        {
+            rollback_failures.push(format!(
+                "neuer Hotkey {shortcut} konnte nicht entfernt werden: {rollback}"
+            ));
         }
-        if let Some(shortcut) = &old_shortcut {
-            let _ = register_hotkey(app, engine, scene_id, shortcut);
+        if old_was_registered
+            && let Some(shortcut) = &old_shortcut
+            && let Err(rollback) = register_hotkey(app, engine, scene_id, shortcut)
+        {
+            rollback_failures.push(format!(
+                "alter Hotkey {shortcut} konnte nicht wiederhergestellt werden: {rollback}"
+            ));
         }
-        return Err(error.to_string());
+        let mut message = error.to_string();
+        if !rollback_failures.is_empty() {
+            message.push_str("; Hotkey-Rollback fehlgeschlagen: ");
+            message.push_str(&rollback_failures.join("; "));
+        }
+        return Err(message);
     }
     Ok(())
 }
@@ -541,4 +619,26 @@ fn register_hotkey(
             }
         })
         .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::physical_preview_bounds;
+
+    #[test]
+    fn preview_bounds_scale_and_round_once() {
+        assert_eq!(
+            physical_preview_bounds(1.5, -10.4, 20.2, 100.0, 50.0),
+            Ok((-16, 30, 150, 75))
+        );
+    }
+
+    #[test]
+    fn preview_bounds_reject_invalid_or_unrepresentable_geometry() {
+        assert!(physical_preview_bounds(1.0, 0.0, 0.0, f64::NAN, 50.0).is_err());
+        assert!(physical_preview_bounds(1.0, 0.0, 0.0, -1.0, 50.0).is_err());
+        assert!(physical_preview_bounds(0.0, 0.0, 0.0, 100.0, 50.0).is_err());
+        assert!(physical_preview_bounds(1.0, f64::MAX, 0.0, 100.0, 50.0).is_err());
+        assert!(physical_preview_bounds(0.001, 0.0, 0.0, 1.0, 1.0).is_err());
+    }
 }

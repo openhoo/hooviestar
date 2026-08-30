@@ -180,8 +180,16 @@ function bool(value: unknown): value is boolean {
   return typeof value === "boolean";
 }
 
-function uuid(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0;
+/** Canonical hyphenated UUID accepted by Rust's `uuid::Uuid` boundary. */
+export function isUuid(value: unknown): value is Uuid {
+  return (
+    typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
+  );
+}
+
+function uint(value: unknown, max: number): value is number {
+  return num(value) && Number.isInteger(value) && value >= 0 && value <= max;
 }
 
 function color(value: unknown): value is HexColor {
@@ -248,7 +256,7 @@ export function parseSource(value: unknown): Source | null {
   if (!isRecord(value)) return null;
   const type = value.type;
   if (!SOURCE_TYPES.includes(type as SourceType)) return null;
-  if (!uuid(value.id) || !str(value.name)) return null;
+  if (!isUuid(value.id) || !str(value.name)) return null;
   const id = value.id as string;
   const name = value.name as string;
   // project.rs:238-240 – leere Quellnamen (nach Trimmen) sind ungültig.
@@ -261,7 +269,7 @@ export function parseSource(value: unknown): Source | null {
     }
     case "display": {
       const b = value.binding;
-      if (!isRecord(b) || !str(b.adapterLuid) || !num(b.outputId)) return null;
+      if (!isRecord(b) || !str(b.adapterLuid) || !uint(b.outputId, 0xffff_ffff)) return null;
       return { type, id, name, binding: { adapterLuid: b.adapterLuid, outputId: b.outputId } };
     }
     case "image":
@@ -271,7 +279,7 @@ export function parseSource(value: unknown): Source | null {
         !str(value.text) ||
         !str(value.fontFamily) ||
         !num(value.fontSizePx) ||
-        !num(value.fontWeight) ||
+        !uint(value.fontWeight, 0xffff) ||
         !color(value.color) ||
         !color(value.backgroundColor)
       ) {
@@ -338,7 +346,7 @@ export function parseSource(value: unknown): Source | null {
 export function parseSceneItem(value: unknown): SceneItem | null {
   if (!isRecord(value)) return null;
   const transform = parseTransform(value.transform);
-  if (!uuid(value.id) || !uuid(value.sourceId) || !bool(value.visible) || !bool(value.locked) || !transform) {
+  if (!isUuid(value.id) || !isUuid(value.sourceId) || !bool(value.visible) || !bool(value.locked) || !transform) {
     return null;
   }
   return {
@@ -351,7 +359,7 @@ export function parseSceneItem(value: unknown): SceneItem | null {
 }
 
 export function parseScene(value: unknown): Scene | null {
-  if (!isRecord(value) || !uuid(value.id) || !str(value.name)) return null;
+  if (!isRecord(value) || !isUuid(value.id) || !str(value.name)) return null;
   // project.rs:271-273 – leere Szenennamen (nach Trimmen) sind ungültig.
   if ((value.name as string).trim().length === 0) return null;
   // project.rs:141/serde – abwesender Schlüssel zählt wie null als kein
@@ -406,7 +414,7 @@ export function parseProjectV1(value: unknown): ProjectV1 | null {
   const output = parseOutputConfig(value.output);
   if (!output) return null;
   if (!Array.isArray(value.sources) || !Array.isArray(value.scenes)) return null;
-  if (!uuid(value.activeSceneId)) return null;
+  if (!isUuid(value.activeSceneId)) return null;
   const sources: Source[] = [];
   const sourceIds = new Set<string>();
   // project.rs:232/267-269 – ein ID-Namespace über Quellen, Szenen und Items.
@@ -435,6 +443,7 @@ export function parseProjectV1(value: unknown): ProjectV1 | null {
       if (hotkeys.has(normalized)) return null;
       hotkeys.add(normalized);
     }
+    const sceneSourceIds = new Set<string>();
     for (const item of scene.items) {
       // project.rs:289-291 – doppelte Item-ID oder Kollision über Arten.
       if (itemIds.has(item.id) || allIds.has(item.id)) return null;
@@ -442,6 +451,9 @@ export function parseProjectV1(value: unknown): ProjectV1 | null {
       allIds.add(item.id);
       // project.rs:292-294 – referenzierte Quelle muss existieren.
       if (!sourceIds.has(item.sourceId)) return null;
+      // Renderer und UI halten genau eine Textur/Zeile je Quelle und Szene.
+      if (sceneSourceIds.has(item.sourceId)) return null;
+      sceneSourceIds.add(item.sourceId);
     }
     scenes.push(scene);
   }

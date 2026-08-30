@@ -1,13 +1,30 @@
 use std::{
-    fs::{self, File},
+    fs::{self},
     io::{self, Write},
     path::{Path, PathBuf},
     process,
     sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
 use std::env;
+
+static SIBLING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn unique_sibling(path: &Path, label: &str) -> PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(
+        ".{stamp}.{}.{}.{label}",
+        process::id(),
+        SIBLING_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+    ));
+    PathBuf::from(name)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -59,16 +76,12 @@ impl RestoreJournal {
         // schreiben; ein fixer Name ließ beide dieselbe Temp-Datei
         // truncieren und halb geschriebene JSON-Bytes umbenennen. Jeder
         // Schreiber benennt jetzt seine eigenen vollständigen Bytes um.
-        static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-        let mut temporary_name = path.as_os_str().to_os_string();
-        temporary_name.push(format!(
-            ".{}.{}.tmp",
-            process::id(),
-            TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed),
-        ));
-        let temporary = PathBuf::from(temporary_name);
+        let temporary = unique_sibling(path, "tmp");
         let result = (|| -> io::Result<()> {
-            let mut file = File::create(&temporary)?;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
             serde_json::to_writer_pretty(&mut file, self)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
             file.write_all(b"\n")?;
@@ -97,16 +110,10 @@ pub fn default_journal_path() -> io::Result<PathBuf> {
         base.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "state directory unavailable"))?;
     Ok(base.join("Hooviestar").join("audio-restore.json"))
 }
-/// Moves an unreadable journal aside as `<path>.corrupt`, replacing any earlier
-/// quarantine, so the original bytes stay available for diagnosis.
+/// Moves an unreadable journal to a collision-resistant sibling so repeated
+/// corruptions keep every original byte sequence available for diagnosis.
 pub fn quarantine_corrupt(path: &Path) -> io::Result<PathBuf> {
-    let mut quarantine = PathBuf::from(path);
-    quarantine.as_mut_os_string().push(".corrupt");
-    match fs::remove_file(&quarantine) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
+    let quarantine = unique_sibling(path, "corrupt");
     fs::rename(path, &quarantine)?;
     Ok(quarantine)
 }
@@ -181,6 +188,22 @@ mod tests {
         fs::write(&path, b"{ not json at all").unwrap();
         let error = RestoreJournal::load(&path).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn repeated_quarantine_preserves_every_corruption() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal.json");
+        let first_bytes = b"{ first corrupt journal";
+        let second_bytes = b"{ second corrupt journal";
+        fs::write(&path, first_bytes).unwrap();
+        let first = quarantine_corrupt(&path).unwrap();
+        fs::write(&path, second_bytes).unwrap();
+        let second = quarantine_corrupt(&path).unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(fs::read(first).unwrap(), first_bytes);
+        assert_eq!(fs::read(second).unwrap(), second_bytes);
     }
 
     #[test]

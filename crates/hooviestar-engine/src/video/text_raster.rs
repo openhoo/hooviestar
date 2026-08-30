@@ -19,6 +19,10 @@ use std::sync::{Arc, LazyLock};
 /// Upper bound for font pixel sizes; corrupt project files must not trigger
 /// unbounded glyph coverage allocations in fontdue.
 const MAX_PX_SIZE: f32 = 4096.0;
+/// One raster stays below 64 MiB RGBA8; the cache evicts cold entries before
+/// exceeding 128 MiB. This bounds malformed or overly large text layouts.
+const MAX_TEXT_RASTER_BYTES: usize = 64 * 1024 * 1024;
+const MAX_TEXT_CACHE_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct TextKey {
@@ -53,7 +57,7 @@ impl TextCache {
     pub fn rasterize(&mut self, key: TextKey) -> Result<&RasterizedText> {
         if !self.entries.contains_key(&key) {
             let value = rasterize(&key)?;
-            self.entries.insert(key.clone(), value);
+            self.insert_bounded(key.clone(), value)?;
         }
         self.entries
             .get(&key)
@@ -65,7 +69,7 @@ impl TextCache {
     fn rasterize_with_db(&mut self, db: &Database, key: TextKey) -> Result<&RasterizedText> {
         if !self.entries.contains_key(&key) {
             let value = rasterize_with_db(db, &key)?;
-            self.entries.insert(key.clone(), value);
+            self.insert_bounded(key.clone(), value)?;
         }
         self.entries
             .get(&key)
@@ -77,6 +81,28 @@ impl TextCache {
 
     pub fn clear(&mut self) {
         self.entries.clear();
+    }
+
+    fn insert_bounded(&mut self, key: TextKey, value: RasterizedText) -> Result<()> {
+        let incoming = value.rgba8.len();
+        if incoming > MAX_TEXT_RASTER_BYTES {
+            return Err(anyhow!("text raster exceeds 64 MiB"));
+        }
+        let mut used = self
+            .entries
+            .values()
+            .map(|entry| entry.rgba8.len())
+            .sum::<usize>();
+        while used.saturating_add(incoming) > MAX_TEXT_CACHE_BYTES {
+            let Some(evicted) = self.entries.keys().next().cloned() else {
+                return Err(anyhow!("text cache budget exhausted"));
+            };
+            if let Some(entry) = self.entries.remove(&evicted) {
+                used = used.saturating_sub(entry.rgba8.len());
+            }
+        }
+        self.entries.insert(key, value);
+        Ok(())
     }
 }
 
@@ -160,6 +186,19 @@ fn rasterize(key: &TextKey) -> Result<RasterizedText> {
 /// tests pass their own in-memory database built from the bundled fixture
 /// font, so coverage never depends on which system fonts a host ships.
 fn rasterize_with_db(db: &Database, key: &TextKey) -> Result<RasterizedText> {
+    let width = key.width.max(1) as usize;
+    let height = key.height.max(1) as usize;
+    let size = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .filter(|size| *size <= MAX_TEXT_RASTER_BYTES)
+        .ok_or_else(|| {
+            anyhow!(
+                "text raster {}x{} exceeds 64 MiB limit",
+                key.width,
+                key.height
+            )
+        })?;
     let families = [Family::Name(&key.family), Family::SansSerif];
     let id = db
         .query(&Query {
@@ -170,20 +209,8 @@ fn rasterize_with_db(db: &Database, key: &TextKey) -> Result<RasterizedText> {
         })
         .ok_or_else(|| anyhow!("font family '{}' is unavailable", key.family))?;
     let font = load_font(db, id)?;
-    let width = key.width.max(1) as usize;
-    let height = key.height.max(1) as usize;
     let bg = key.background;
     let fg = key.color;
-    let size = width
-        .checked_mul(height)
-        .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or_else(|| {
-            anyhow!(
-                "text raster {}x{} exceeds size limits",
-                key.width,
-                key.height
-            )
-        })?;
     let mut pixels = vec![0u8; size];
 
     for px in pixels.as_chunks_mut::<4>().0 {

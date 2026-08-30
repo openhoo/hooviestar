@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { engineStore } from "../engineStore";
+import { SerialQueue } from "../serialQueue";
 import type { EngineCommand, ProjectV1 } from "../types";
 
 /**
@@ -13,6 +14,7 @@ import type { EngineCommand, ProjectV1 } from "../types";
  */
 export function useAudioFieldBridge(
   pendingSourceFieldsRef: React.RefObject<Map<string, Record<string, unknown>>>,
+  sourceMutationQueue: SerialQueue,
 ) {
   const [audioError, setAudioError] = useState<string | null>(null);
   // IPC-Koaleszierung für Lautstärke/Stumm: ausstehende Befehle je Quelle+Feld,
@@ -24,7 +26,7 @@ export function useAudioFieldBridge(
     for (const [key, command] of batch) {
       if (command.type !== "set_audio_volume" && command.type !== "set_audio_muted") continue;
       const value = command.type === "set_audio_volume" ? command.volume : command.muted;
-      void engineStore.dispatch(command).catch((error: unknown) => {
+      void sourceMutationQueue.enqueue(command.sourceId, () => engineStore.dispatch(command)).catch((error: unknown) => {
         // Fehlschlag sichtbar machen und das Overlay selbst heilen lassen:
         // der Pending-Eintrag fällt weg, sofern nicht inzwischen ein neuerer
         // Wert geschrieben wurde (dann bleibt dessen Optimistik erhalten).
@@ -47,7 +49,7 @@ export function useAudioFieldBridge(
     if (batch.size === 0) return;
     audioPendingDispatchRef.current = new Map();
     dispatchAudioBatch(batch);
-  }, [pendingSourceFieldsRef]);
+  }, [pendingSourceFieldsRef, sourceMutationQueue]);
 
   const setAudioField = useCallback((sourceId: string, field: "volume" | "muted", value: number | boolean) => {
     const pending = pendingSourceFieldsRef.current.get(sourceId);
@@ -72,7 +74,7 @@ export function useAudioFieldBridge(
     const batch = audioPendingDispatchRef.current;
     audioPendingDispatchRef.current = new Map();
     dispatchAudioBatch(batch);
-  }, [pendingSourceFieldsRef]);
+  }, [pendingSourceFieldsRef, sourceMutationQueue]);
 
   const pendingField = useCallback(<T,>(sourceId: string, field: string, fallback: T): T => {
     const pending = pendingSourceFieldsRef.current.get(sourceId)?.[field];
@@ -95,13 +97,18 @@ export function useAudioFieldBridge(
   // Optimistik nicht länger als nötig am Snapshot hängt.
   const prunePendingFields = useCallback((project: ProjectV1) => {
     const pendingBySource = pendingSourceFieldsRef.current;
-    for (const source of project.sources) {
-      const pending = pendingBySource.get(source.id);
-      if (!pending) continue;
+    const sourcesById = new Map(project.sources.map((source) => [source.id, source]));
+    for (const [sourceId, pending] of pendingBySource) {
+      const source = sourcesById.get(sourceId);
+      if (!source) {
+        // Entfernte Quellen dürfen keine dauerhaften Overlay-Reste behalten.
+        pendingBySource.delete(sourceId);
+        continue;
+      }
       for (const key of Object.keys(pending)) {
         if (pending[key] === (source as unknown as Record<string, unknown>)[key]) delete pending[key];
       }
-      if (Object.keys(pending).length === 0) pendingBySource.delete(source.id);
+      if (Object.keys(pending).length === 0) pendingBySource.delete(sourceId);
     }
   }, [pendingSourceFieldsRef]);
 

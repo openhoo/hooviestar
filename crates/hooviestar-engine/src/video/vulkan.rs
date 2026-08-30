@@ -54,6 +54,16 @@ const ITEM_FRAG: &[u8] = include_bytes!("shaders/item.frag.spv");
 const COMPOSITE_VERT: &[u8] = include_bytes!("shaders/composite.vert.spv");
 const COMPOSITE_FRAG: &[u8] = include_bytes!("shaders/composite.frag.spv");
 const MAX_SCENE_ITEMS: usize = 128;
+/// Aggregate GPU budget for decoded images and rasterized text in the active
+/// scene. External capture/media textures have separate fixed-size paths.
+const MAX_STATIC_TEXTURE_BYTES: usize = 256 * 1024 * 1024;
+
+fn static_texture_budget_allows(resident: usize, replaced: usize, incoming: usize) -> bool {
+    resident
+        .checked_sub(replaced)
+        .and_then(|remaining| remaining.checked_add(incoming))
+        .is_some_and(|next| next <= MAX_STATIC_TEXTURE_BYTES)
+}
 /// Maximum consecutive compositor creation failures before the render thread
 /// gives up permanently (mirrors the Windows render loop).
 const MAX_RECOVERY_FAILURES: u32 = 8;
@@ -145,6 +155,7 @@ enum StaticIdentity {
 struct CachedStaticTexture {
     identity: StaticIdentity,
     texture: ImportedFrame,
+    byte_len: usize,
 }
 
 /// What [`VulkanCompositor::synchronize_static_textures`] prepared for one
@@ -916,7 +927,35 @@ impl VulkanCompositor {
         else {
             return;
         };
-        let mut desired = HashSet::new();
+        let desired = scene
+            .items
+            .iter()
+            .filter(|item| item.visible)
+            .filter_map(|item| {
+                project
+                    .sources
+                    .iter()
+                    .find(|source| source.id() == item.source_id)
+            })
+            .filter_map(|source| match source {
+                Source::Image { id, .. } | Source::Text { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        // Scene switches release old GPU allocations before new decodes and
+        // uploads are budgeted; stale textures must not cause false failures.
+        let stale = self
+            .static_textures
+            .keys()
+            .copied()
+            .filter(|source_id| !desired.contains(source_id))
+            .collect::<Vec<_>>();
+        for source_id in stale {
+            if let Some(cached) = self.static_textures.remove(&source_id) {
+                destroy_imported(&self.device, cached.texture);
+            }
+            caches.static_failures.remove(&source_id);
+        }
         let mut desired_text = Vec::new();
         let mut desired_images = HashSet::new();
 
@@ -930,7 +969,6 @@ impl VulkanCompositor {
             };
             let prepared = match source {
                 Source::Image { id, path, .. } => {
-                    desired.insert(*id);
                     caches
                         .image_cache
                         .get_or_decode(path)
@@ -980,7 +1018,6 @@ impl VulkanCompositor {
                     align,
                     ..
                 } => {
-                    desired.insert(*id);
                     let wanted = DesiredTextKey {
                         text: text.as_str(),
                         family: font_family.as_str(),
@@ -1056,6 +1093,21 @@ impl VulkanCompositor {
                                 rgba8,
                             } => (StaticIdentity::Text(key), width, height, rgba8),
                         };
+                        let resident = self
+                            .static_textures
+                            .values()
+                            .map(|cached| cached.byte_len)
+                            .sum::<usize>();
+                        let replaced = self
+                            .static_textures
+                            .get(&source_id)
+                            .map_or(0, |cached| cached.byte_len);
+                        if !static_texture_budget_allows(resident, replaced, rgba8.len()) {
+                            return Err(format!(
+                                "statische Texturen überschreiten 256 MiB (Quelle {source_id})"
+                            ));
+                        }
+                        let byte_len = rgba8.len();
                         upload_rgba_texture(
                             &self.instance,
                             &self.device,
@@ -1067,10 +1119,14 @@ impl VulkanCompositor {
                             &rgba8,
                         )
                         .map(|texture| {
-                            if let Some(previous) = self
-                                .static_textures
-                                .insert(source_id, CachedStaticTexture { identity, texture })
-                            {
+                            if let Some(previous) = self.static_textures.insert(
+                                source_id,
+                                CachedStaticTexture {
+                                    identity,
+                                    texture,
+                                    byte_len,
+                                },
+                            ) {
                                 destroy_imported(&self.device, previous.texture);
                             }
                             (source_id, true)
@@ -1101,19 +1157,6 @@ impl VulkanCompositor {
         caches
             .image_cache
             .retain(|path| desired_images.contains(path));
-
-        let stale = self
-            .static_textures
-            .keys()
-            .copied()
-            .filter(|source_id| !desired.contains(source_id))
-            .collect::<Vec<_>>();
-        for source_id in stale {
-            if let Some(cached) = self.static_textures.remove(&source_id) {
-                destroy_imported(&self.device, cached.texture);
-            }
-            caches.static_failures.remove(&source_id);
-        }
     }
     /// See [`VulkanCompositor::synchronize_portal_textures`] for the
     /// transition-emission contract and the render-thread-owned failure map.
@@ -2210,7 +2253,8 @@ impl RenderRuntime {
 
     pub fn shutdown(&self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.lock().expect("renderer mutex poisoned").take() {
+        let thread = self.thread.lock().expect("renderer mutex poisoned").take();
+        if let Some(thread) = thread {
             let _ = thread.join();
         }
     }
@@ -4205,6 +4249,7 @@ fn destroy_target(
     destroy_swapchain_state(device, target);
     unsafe { surface_loader.destroy_surface(target.surface, None) };
 }
+
 /// Frees every swapchain-owned resource except the surface, which a
 /// replacement target adopts (see `recreate_swapchain`).
 fn destroy_swapchain_state(device: &Device, target: &mut SwapchainTarget) {
@@ -4223,5 +4268,26 @@ fn destroy_swapchain_state(device: &Device, target: &mut SwapchainTarget) {
             device.destroy_semaphore(semaphore, None);
         }
         target.loader.destroy_swapchain(target.swapchain, None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn static_texture_budget_accounts_for_replacement_and_overflow() {
+        assert!(static_texture_budget_allows(
+            200,
+            100,
+            MAX_STATIC_TEXTURE_BYTES - 100
+        ));
+        assert!(!static_texture_budget_allows(
+            200,
+            0,
+            MAX_STATIC_TEXTURE_BYTES
+        ));
+        assert!(!static_texture_budget_allows(0, 1, 1));
+        assert!(!static_texture_budget_allows(usize::MAX, 0, 1));
     }
 }

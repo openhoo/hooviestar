@@ -162,6 +162,11 @@ export interface AudioWarningEvent {
   message: string;
 }
 
+/** Audioausgabe nach internem Geräte-/Daemon-Neustart wieder bereit. */
+export interface AudioRecoveredEvent {
+  type: "audio_recovered";
+}
+
 /** Unerwarteter Engine-Fehler, der keinem Quell-/Geräteereignis zugeordnet ist. */
 export interface EngineErrorEvent {
   type: "engine_error";
@@ -178,6 +183,7 @@ export type EngineEvent =
   | MediaStateEvent
   | UnsupportedMediaEvent
   | AudioWarningEvent
+  | AudioRecoveredEvent
   | EngineErrorEvent;
 
 export const ENGINE_EVENT_TYPES = [
@@ -190,6 +196,7 @@ export const ENGINE_EVENT_TYPES = [
   "media_state",
   "unsupported_media",
   "audio_warning",
+  "audio_recovered",
   "engine_error",
 ] as const satisfies readonly EngineEvent["type"][];
 
@@ -198,9 +205,14 @@ export const ENGINE_EVENT_TYPES = [
 /* ------------------------------------------------------------------ */
 
 import {
+  isUuid,
   isRecord,
   parseProjectV1,
 } from "./project";
+
+function finiteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
 
 export function parseEngineEvent(value: unknown): EngineEvent | null {
   if (!isRecord(value)) return null;
@@ -212,11 +224,11 @@ export function parseEngineEvent(value: unknown): EngineEvent | null {
       return project ? { type: "snapshot", project } : null;
     }
     case "source_available":
-      return typeof value.sourceId === "string"
+      return isUuid(value.sourceId)
         ? { type: "source_available", sourceId: value.sourceId }
         : null;
     case "source_unavailable":
-      return typeof value.sourceId === "string" && typeof value.reason === "string"
+      return isUuid(value.sourceId) && typeof value.reason === "string"
         ? { type: "source_unavailable", sourceId: value.sourceId, reason: value.reason }
         : null;
     case "levels": {
@@ -225,9 +237,9 @@ export function parseEngineEvent(value: unknown): EngineEvent | null {
       for (const e of value.entries) {
         if (
           !isRecord(e) ||
-          typeof e.sourceId !== "string" ||
-          typeof e.peak !== "number" ||
-          typeof e.rms !== "number"
+          !isUuid(e.sourceId) ||
+          !finiteNumber(e.peak) ||
+          !finiteNumber(e.rms)
         ) {
           return null;
         }
@@ -236,7 +248,7 @@ export function parseEngineEvent(value: unknown): EngineEvent | null {
       return { type: "levels", entries };
     }
     case "hotkey_error":
-      return typeof value.sceneId === "string" && typeof value.message === "string"
+      return isUuid(value.sceneId) && typeof value.message === "string"
         ? { type: "hotkey_error", sceneId: value.sceneId, message: value.message }
         : null;
     case "device_recovery": {
@@ -247,10 +259,10 @@ export function parseEngineEvent(value: unknown): EngineEvent | null {
       return { type: "device_recovery", phase, detail };
     }
     case "media_state": {
-      if (typeof value.sourceId !== "string" || !isRecord(value.state)) return null;
+      if (!isUuid(value.sourceId) || !isRecord(value.state)) return null;
       const s = value.state;
-      if (typeof s.playing !== "boolean" || typeof s.positionSeconds !== "number") return null;
-      if (s.durationSeconds !== null && typeof s.durationSeconds !== "number") return null;
+      if (typeof s.playing !== "boolean" || !finiteNumber(s.positionSeconds)) return null;
+      if (s.durationSeconds !== null && !finiteNumber(s.durationSeconds)) return null;
       return {
         type: "media_state",
         sourceId: value.sourceId,
@@ -262,7 +274,7 @@ export function parseEngineEvent(value: unknown): EngineEvent | null {
       };
     }
     case "unsupported_media":
-      return typeof value.sourceId === "string" && typeof value.reason === "string"
+      return isUuid(value.sourceId) && typeof value.reason === "string"
         ? { type: "unsupported_media", sourceId: value.sourceId, reason: value.reason }
         : null;
     case "audio_warning": {
@@ -271,6 +283,8 @@ export function parseEngineEvent(value: unknown): EngineEvent | null {
       if (typeof value.message !== "string") return null;
       return { type: "audio_warning", kind, message: value.message };
     }
+    case "audio_recovered":
+      return { type: "audio_recovered" };
     case "engine_error":
       return typeof value.message === "string" ? { type: "engine_error", message: value.message } : null;
     default:

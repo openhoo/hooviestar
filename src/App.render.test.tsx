@@ -11,12 +11,15 @@ import fixture from "../contracts/project-v1.json";
 import { parseProjectV1 } from "./types";
 
 const dispatchedCommands: Array<Record<string, unknown>> = [];
+let rejectedDispatchType: string | null = null;
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(async (command: string, args?: Record<string, unknown>) => {
     if (command === "get_snapshot") return structuredClone(fixture);
     if (command === "dispatch") {
-      dispatchedCommands.push((args?.command ?? {}) as Record<string, unknown>);
+      const dispatched = (args?.command ?? {}) as Record<string, unknown>;
+      dispatchedCommands.push(dispatched);
+      if (dispatched.type === rejectedDispatchType) throw new Error("dispatch failed");
       return null;
     }
     return null;
@@ -53,7 +56,7 @@ function sceneRowButton(sceneName: string): HTMLButtonElement {
 
 function placedSource() {
   const active = project.scenes.find((scene) => scene.id === project.activeSceneId)!;
-  return project.sources.find((entry) => entry.id === active.items[0].sourceId)!;
+  return project.sources.find((entry) => entry.id === active.items[0]!.sourceId)!;
 }
 
 function placedSourceRowButton(): HTMLButtonElement {
@@ -70,6 +73,7 @@ function placedSourceRowButton(): HTMLButtonElement {
 describe("studio shell", () => {
   beforeEach(() => {
     dispatchedCommands.length = 0;
+    rejectedDispatchType = null;
   });
   afterEach(cleanup);
 
@@ -87,12 +91,24 @@ describe("studio shell", () => {
 
   it("wechselt die Szene über das Szenen-Dock per set_active_scene", async () => {
     await renderStudio();
-    const target = project.scenes[project.scenes.length - 1];
+    const target = project.scenes[project.scenes.length - 1]!;
     fireEvent.click(sceneRowButton(target.name));
     await waitFor(() => {
       expect(dispatchedCommands).toContainEqual(expect.objectContaining({ type: "set_active_scene", sceneId: target.id }));
     });
     expect(dispatchedCommands.filter((command) => command.type === "set_active_scene")).toHaveLength(1);
+  });
+
+  it("rollt eine neue Szene zurück, wenn ihre Aktivierung fehlschlägt", async () => {
+    await renderStudio();
+    rejectedDispatchType = "set_active_scene";
+    fireEvent.click(screen.getByRole("button", { name: "Szene hinzufügen" }));
+
+    await screen.findByText(/dispatch failed/);
+    const added = dispatchedCommands.find((command) => command.type === "add_scene");
+    expect(added).toBeTruthy();
+    expect(dispatchedCommands).toContainEqual({ type: "set_active_scene", sceneId: added!.sceneId });
+    expect(dispatchedCommands).toContainEqual({ type: "remove_scene", sceneId: added!.sceneId });
   });
 
   it("listet im Quellen-Dock Elemente der aktiven Szene und außerhalb liegende Quellen", async () => {
@@ -146,6 +162,19 @@ describe("studio shell", () => {
     expect(dispatchedCommands.find((command) => command.type === "remove_source")).toEqual(
       expect.objectContaining({ type: "remove_source", sourceId: source.id }),
     );
+  });
+
+  it("behält die Quellenauswahl bei fehlgeschlagener Entfernung", async () => {
+    await renderStudio();
+    rejectedDispatchType = "remove_source";
+    const sourceButton = placedSourceRowButton();
+    fireEvent.click(sourceButton);
+    const removeButton = screen.getByTitle("Ausgewählte Quelle entfernen");
+    fireEvent.click(removeButton);
+    fireEvent.click(removeButton);
+
+    await screen.findByText(/dispatch failed/);
+    expect(sourceButton.closest(".source-row")?.classList.contains("selected")).toBe(true);
   });
 
   it("erlaubt das Entfernen der letzten Szene nicht", async () => {

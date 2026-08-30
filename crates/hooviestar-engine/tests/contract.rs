@@ -23,7 +23,7 @@ fn every_command_tag_round_trips() {
 #[test]
 fn every_event_tag_round_trips() {
     let fixtures = load_event_fixtures();
-    assert_eq!(fixtures.len(), 10, "one wire sample per event tag");
+    assert_eq!(fixtures.len(), 11, "one wire sample per event tag");
     assert_unique_type_tags(&fixtures);
     assert_round_trip::<EngineEvent>("events", &fixtures);
 }

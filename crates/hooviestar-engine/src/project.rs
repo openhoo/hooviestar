@@ -268,6 +268,7 @@ impl ProjectV1 {
         let mut hotkeys = HashSet::new();
         let mut item_ids = HashSet::new();
         for scene in &self.scenes {
+            let mut scene_source_ids = HashSet::new();
             if scene.name.trim().is_empty() {
                 return Err("scene name is empty".into());
             }
@@ -291,6 +292,9 @@ impl ProjectV1 {
                 }
                 if !source_ids.contains(&item.source_id) {
                     return Err("scene item source is missing".into());
+                }
+                if !scene_source_ids.insert(item.source_id) {
+                    return Err("source appears more than once in scene".into());
                 }
                 let t = item.transform;
                 if ![
@@ -406,5 +410,36 @@ mod tests {
         assert_eq!(project.validate(), Err("invalid scene hotkey".into()));
         project.scenes[0].hotkey = Some("Ctrl+Alt+9".into());
         project.validate().unwrap();
+    }
+
+    #[test]
+    fn duplicate_source_in_one_scene_is_rejected() {
+        let mut project = ProjectV1::empty();
+        let source_id = Uuid::new_v4();
+        project.sources.push(Source::Image {
+            id: source_id,
+            name: "Bild".into(),
+            path: "/tmp/image.png".into(),
+        });
+        project.scenes[0].items.extend([
+            SceneItem {
+                id: Uuid::new_v4(),
+                source_id,
+                visible: true,
+                locked: false,
+                transform: Transform::default(),
+            },
+            SceneItem {
+                id: Uuid::new_v4(),
+                source_id,
+                visible: true,
+                locked: false,
+                transform: Transform::default(),
+            },
+        ]);
+        assert_eq!(
+            project.validate(),
+            Err("source appears more than once in scene".into())
+        );
     }
 }

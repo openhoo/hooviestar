@@ -148,6 +148,9 @@
     "message": "empty"
   },
   {
+    "type": "audio_recovered"
+  },
+  {
     "type": "engine_error",
     "message": "failed"
   }

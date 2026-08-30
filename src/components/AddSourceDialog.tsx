@@ -24,8 +24,10 @@ function AddSourceDialogImpl({
   const [candidates, setCandidates] = useState<SourceCandidate[]>([]);
   const [portalRequired, setPortalRequired] = useState(false);
   const [sourceLoading, setSourceLoading] = useState(false);
+  const [actionBusy, setActionBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const dialogRef = useRef<HTMLElement>(null);
+  const operationBusyRef = useRef(false);
 
   // Nur beim Mount enumerieren: das Dialog wird bei jeder Öffnung frisch
   // gerendert, daher genügt ein leerer Abhängigkeitsarray.
@@ -57,10 +59,20 @@ function AddSourceDialogImpl({
   // Fängt Rejektionen der per onClick feuergelassenen Async-Flows ab und macht
   // sie über den Meldungskanal sichtbar (Helfer: src/guarded.ts).
   function guarded(flow: () => Promise<unknown>) {
-    return () => void runGuarded(flow, setMessage);
+    return () => {
+      if (operationBusyRef.current) return;
+      operationBusyRef.current = true;
+      setActionBusy(true);
+      void runGuarded(flow, setMessage).finally(() => {
+        operationBusyRef.current = false;
+        setActionBusy(false);
+      });
+    };
   }
 
   async function selectPortalSources() {
+    if (operationBusyRef.current) return;
+    operationBusyRef.current = true;
     setSourceLoading(true);
     try {
       const result = await onSelectPortal();
@@ -70,6 +82,7 @@ function AddSourceDialogImpl({
     } catch (error) {
       setMessage(String(error));
     } finally {
+      operationBusyRef.current = false;
       setSourceLoading(false);
     }
   }
@@ -85,8 +98,8 @@ function AddSourceDialogImpl({
       event.currentTarget.querySelectorAll<HTMLElement>("button:not(:disabled), input:not(:disabled)"),
     );
     if (controls.length === 0) return;
-    const first = controls[0];
-    const last = controls[controls.length - 1];
+    const first = controls[0]!;
+    const last = controls[controls.length - 1]!;
     if (event.shiftKey && document.activeElement === first) {
       event.preventDefault();
       last.focus();
@@ -101,13 +114,14 @@ function AddSourceDialogImpl({
       <section ref={dialogRef} className="dialog" role="dialog" aria-modal="true" aria-labelledby="add-title" onKeyDown={trapDialogKeys}>
         <div className="panel-title"><h2 id="add-title">Quelle hinzufügen</h2><button aria-label="Schließen" onClick={onClose}>×</button></div>
         <div className="source-options">
-          <button onClick={guarded(onAddText)}><strong>Text</strong><span>GPU-gerenderte Beschriftung</span></button>
-          <button onClick={guarded(onAddImage)}><strong>Bild</strong><span>PNG, JPEG oder BMP</span></button>
-          <button onClick={guarded(onAddMedia)}><strong>Medium</strong><span>MP4, MP3 oder WAV</span></button>
+          <button disabled={sourceLoading || actionBusy} onClick={guarded(onAddText)}><strong>Text</strong><span>GPU-gerenderte Beschriftung</span></button>
+          <button disabled={sourceLoading || actionBusy} onClick={guarded(onAddImage)}><strong>Bild</strong><span>PNG, JPEG oder BMP</span></button>
+          <button disabled={sourceLoading || actionBusy} onClick={guarded(onAddMedia)}><strong>Medium</strong><span>MP4, MP3 oder WAV</span></button>
           {sourceLoading && <p role="status">Quellen werden gesucht…</p>}
-          {portalRequired && <button onClick={() => void selectPortalSources()}><strong>Fenster oder Monitor auswählen</strong><span>Desktop-Portal öffnen</span></button>}
+          {actionBusy && <p role="status">Quelle wird hinzugefügt…</p>}
+          {portalRequired && <button disabled={sourceLoading || actionBusy} onClick={() => void selectPortalSources()}><strong>Fenster oder Monitor auswählen</strong><span>Desktop-Portal öffnen</span></button>}
           {candidates.map((candidate) => (
-            <button key={`${candidate.type}:${candidate.runtimeId}`} onClick={guarded(() => onAddCandidate(candidate))}>
+            <button disabled={sourceLoading || actionBusy} key={`${candidate.type}:${candidate.runtimeId}`} onClick={guarded(() => onAddCandidate(candidate))}>
               <strong>{candidate.name}</strong>
               <span>{candidate.type === "window" ? "Fenster" : candidate.type === "display" ? "Monitor" : "Anwendungs-Audio"}</span>
             </button>

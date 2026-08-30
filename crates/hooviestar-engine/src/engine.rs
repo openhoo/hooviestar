@@ -201,6 +201,7 @@ pub enum EngineEvent {
         kind: AudioWarningKind,
         message: String,
     },
+    AudioRecovered,
     EngineError {
         message: String,
     },
@@ -553,13 +554,21 @@ fn apply(p: &mut ProjectV1, c: EngineCommand) -> Result<(), EngineError> {
             item_id,
             source_id,
             transform,
-        } => scene_mut(p, scene_id)?.items.push(SceneItem {
-            id: item_id,
-            source_id,
-            visible: true,
-            locked: false,
-            transform,
-        }),
+        } => {
+            let scene = scene_mut(p, scene_id)?;
+            if scene.items.iter().any(|item| item.source_id == source_id) {
+                return Err(EngineError::InvalidProject(
+                    "source appears more than once in scene".into(),
+                ));
+            }
+            scene.items.push(SceneItem {
+                id: item_id,
+                source_id,
+                visible: true,
+                locked: false,
+                transform,
+            });
+        }
         EngineCommand::RemoveSceneItem { scene_id, item_id } => {
             let scene = scene_mut(p, scene_id)?;
             let Some(item) = scene.items.iter().find(|i| i.id == item_id) else {
@@ -722,18 +731,20 @@ mod tests {
     fn reorder_scene_item_clamps_out_of_range_index_to_end() {
         let mut project = ProjectV1::empty();
         let scene = project.scenes[0].id;
-        let source_id = Uuid::new_v4();
+        let source_ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
         let (first, middle, last) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-        apply(
-            &mut project,
-            EngineCommand::AddSource {
-                source: text_source(source_id),
-            },
-        )
-        .unwrap();
-        add_item(&mut project, scene, first, source_id);
-        add_item(&mut project, scene, middle, source_id);
-        add_item(&mut project, scene, last, source_id);
+        for source_id in source_ids {
+            apply(
+                &mut project,
+                EngineCommand::AddSource {
+                    source: text_source(source_id),
+                },
+            )
+            .unwrap();
+        }
+        add_item(&mut project, scene, first, source_ids[0]);
+        add_item(&mut project, scene, middle, source_ids[1]);
+        add_item(&mut project, scene, last, source_ids[2]);
         apply(
             &mut project,
             EngineCommand::ReorderSceneItem {
@@ -950,6 +961,36 @@ mod tests {
             Transform::default()
         );
         assert_eq!(project.scenes[0].items.len(), 1);
+    }
+
+    #[test]
+    fn add_scene_item_rejects_duplicate_source_without_mutation() {
+        let mut project = ProjectV1::empty();
+        let scene = project.scenes[0].id;
+        let source_id = Uuid::new_v4();
+        apply(
+            &mut project,
+            EngineCommand::AddSource {
+                source: text_source(source_id),
+            },
+        )
+        .unwrap();
+        add_item(&mut project, scene, Uuid::new_v4(), source_id);
+        let before = project.clone();
+        assert!(matches!(
+            apply(
+                &mut project,
+                EngineCommand::AddSceneItem {
+                    scene_id: scene,
+                    item_id: Uuid::new_v4(),
+                    source_id,
+                    transform: Transform::default(),
+                }
+            ),
+            Err(EngineError::InvalidProject(message))
+                if message == "source appears more than once in scene"
+        ));
+        assert_eq!(project, before);
     }
 
     #[test]

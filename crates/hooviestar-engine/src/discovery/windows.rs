@@ -406,8 +406,10 @@ fn process_image_still_running(process_path: &std::path::Path) -> bool {
     let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
         return true;
     };
-    let mut entry = PROCESSENTRY32W::default();
-    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..PROCESSENTRY32W::default()
+    };
     let mut found = false;
     unsafe {
         if Process32FirstW(snapshot, &mut entry).is_ok() {
