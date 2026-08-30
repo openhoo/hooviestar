@@ -205,7 +205,8 @@ jobs:
           if ($installers.Count -ne 1) { throw "Expected exactly one NSIS installer, found $($installers.Count)" }
           $signature = Get-AuthenticodeSignature $installers[0].FullName
           if ($env:WINDOWS_CERTIFICATE_SELF_SIGNED -eq "true") {
-            if ($signature.Status -ne "UnknownError" -or $signature.StatusMessage -notmatch "0x800B0109") {
+            $untrustedRootMessage = "terminated in a root certificate which is not trusted by the trust provider"
+            if ($signature.Status -ne "UnknownError" -or -not $signature.StatusMessage.Contains($untrustedRootMessage)) {
               throw "Self-signed Authenticode signature did not fail only for its untrusted root: $($signature.Status) $($signature.StatusMessage)"
             }
           } elseif ($signature.Status -ne "Valid") {

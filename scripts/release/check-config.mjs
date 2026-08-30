@@ -96,7 +96,9 @@ expect(
 );
 expect(
   releaseWorkflow.includes('$signature.Status -ne "UnknownError"') &&
-    releaseWorkflow.includes('StatusMessage -notmatch "0x800B0109"'),
+    releaseWorkflow.includes(
+      'terminated in a root certificate which is not trusted by the trust provider',
+    ),
   "self-signed untrusted-root verification is missing",
 );
 expect(releaseWorkflow.includes("finally {"), "temporary PFX cleanup is not fail-safe");
