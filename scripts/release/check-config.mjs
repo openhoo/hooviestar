@@ -145,7 +145,8 @@ expect(releaseWorkflow.includes("toolchain: 1.98.0"), "release Rust toolchain is
 expect(releaseWorkflow.includes("node-version: 24.20.0"), "release Node version is not pinned");
 
 const tag = process.env.GITHUB_REF_NAME;
-if (tag) {
+if (process.env.GITHUB_REF_TYPE === "tag") {
+  expect(tag, "tag ref name is missing");
   expect(tag === `v${version}`, `tag ${tag} does not match version v${version}`);
 }
 
