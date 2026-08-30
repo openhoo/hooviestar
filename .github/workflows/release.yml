@@ -161,31 +161,6 @@ jobs:
           $isSelfSigned = $cert.Subject -eq $cert.Issuer
           if ($env:WINDOWS_CERTIFICATE_TRUST_MODE -eq "self-signed") {
             if (-not $isSelfSigned) { throw "Self-signed trust mode requires a self-signed certificate" }
-            $publicCertificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($cert.RawData)
-            $storeNames = @(
-              [System.Security.Cryptography.X509Certificates.StoreName]::Root,
-              [System.Security.Cryptography.X509Certificates.StoreName]::TrustedPublisher
-            )
-            foreach ($storeName in $storeNames) {
-              $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
-                $storeName,
-                [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
-              )
-              try {
-                $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
-                $store.Add($publicCertificate)
-                $matches = @($store.Certificates.Find(
-                  [System.Security.Cryptography.X509Certificates.X509FindType]::FindByThumbprint,
-                  $cert.Thumbprint,
-                  $false
-                ))
-                if ($matches.Count -ne 1) { throw "Failed to add self-signed certificate to user $storeName store" }
-              } finally {
-                $store.Close()
-                $store.Dispose()
-              }
-            }
-            $publicCertificate.Dispose()
           } elseif ($isSelfSigned) {
             throw "Self-signed certificate rejected while WINDOWS_CERTIFICATE_TRUST_MODE is trusted"
           }
@@ -229,7 +204,13 @@ jobs:
           $installers = @(Get-ChildItem "target/$env:TARGET/release/bundle/nsis" -Filter *.exe)
           if ($installers.Count -ne 1) { throw "Expected exactly one NSIS installer, found $($installers.Count)" }
           $signature = Get-AuthenticodeSignature $installers[0].FullName
-          if ($signature.Status -ne "Valid") { throw "Invalid Authenticode signature: $($signature.Status)" }
+          if ($env:WINDOWS_CERTIFICATE_SELF_SIGNED -eq "true") {
+            if ($signature.Status -ne "UnknownError" -or $signature.StatusMessage -notmatch "0x800B0109") {
+              throw "Self-signed Authenticode signature did not fail only for its untrusted root: $($signature.Status) $($signature.StatusMessage)"
+            }
+          } elseif ($signature.Status -ne "Valid") {
+            throw "Invalid Authenticode signature: $($signature.Status)"
+          }
           if (-not $signature.TimeStamperCertificate) { throw "Authenticode timestamp is missing" }
           if ($signature.SignerCertificate.Thumbprint -ne $env:WINDOWS_CERTIFICATE_THUMBPRINT) {
             throw "Installer was signed by an unexpected certificate"

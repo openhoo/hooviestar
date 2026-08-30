@@ -95,12 +95,9 @@ expect(
   "Windows code-signing EKU compatibility check is missing",
 );
 expect(
-  releaseWorkflow.includes("StoreName]::Root") &&
-    releaseWorkflow.includes("StoreName]::TrustedPublisher") &&
-    releaseWorkflow.includes("X509Store]::new") &&
-    releaseWorkflow.includes("StoreLocation]::CurrentUser") &&
-    releaseWorkflow.includes("$store.Add($publicCertificate)"),
-  "non-interactive self-signed publisher trust is missing",
+  releaseWorkflow.includes('$signature.Status -ne "UnknownError"') &&
+    releaseWorkflow.includes('StatusMessage -notmatch "0x800B0109"'),
+  "self-signed untrusted-root verification is missing",
 );
 expect(releaseWorkflow.includes("finally {"), "temporary PFX cleanup is not fail-safe");
 expect(releaseWorkflow.includes("$cert.NotBefore"), "Windows certificate start-date validation is missing");
