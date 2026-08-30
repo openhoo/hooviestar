@@ -22,13 +22,6 @@ function fixture() {
   for (const asset of assets) writeFileSync(join(assetsDir, asset.name), asset.content);
   return {
     assetsDir,
-    release: {
-      tag_name: "v0.2.0",
-      draft: true,
-      body: "Release notes",
-      created_at: "2026-08-30T20:00:00Z",
-      assets: assets.map(({ id, name }) => ({ id, name })),
-    },
   };
 }
 
@@ -38,10 +31,12 @@ test("builds complete NSIS, AppImage, and Debian updater entries from finalized 
     const manifest = buildUpdaterManifest({
       ...data,
       repository: "openhoo/hooviestar",
+      tag: "v0.2.0",
       version: "0.2.0",
+      publishedAt: "2026-08-30T20:00:00Z",
     });
     assert.equal(manifest.version, "0.2.0");
-    assert.equal(manifest.notes, "Release notes");
+    assert.equal(manifest.notes, "Hooviestar v0.2.0");
     assert.deepEqual(Object.keys(manifest.platforms), [
       "windows-x86_64",
       "windows-x86_64-nsis",
@@ -49,9 +44,12 @@ test("builds complete NSIS, AppImage, and Debian updater entries from finalized 
       "linux-x86_64-appimage",
       "linux-x86_64-deb",
     ]);
-    assert.match(manifest.platforms["windows-x86_64"].url, /assets\/101$/);
-    assert.match(manifest.platforms["linux-x86_64"].url, /assets\/103$/);
-    assert.match(manifest.platforms["linux-x86_64-deb"].url, /assets\/105$/);
+    assert.equal(
+      manifest.platforms["windows-x86_64"].url,
+      "https://github.com/openhoo/hooviestar/releases/download/v0.2.0/Hooviestar_0.2.0_x64-setup.exe",
+    );
+    assert.match(manifest.platforms["linux-x86_64"].url, /Hooviestar_0\.2\.0_amd64\.AppImage$/);
+    assert.match(manifest.platforms["linux-x86_64-deb"].url, /Hooviestar_0\.2\.0_amd64\.deb$/);
     assert.equal(manifest.platforms["windows-x86_64"].signature, signature);
   } finally {
     rmSync(data.assetsDir, { recursive: true, force: true });
@@ -61,13 +59,15 @@ test("builds complete NSIS, AppImage, and Debian updater entries from finalized 
 test("rejects a partial updater asset set", () => {
   const data = fixture();
   try {
-    data.release.assets = data.release.assets.filter((asset) => !asset.name.endsWith(".deb.sig"));
+    rmSync(join(data.assetsDir, "Hooviestar_0.2.0_amd64.deb.sig"));
     assert.throws(
       () =>
         buildUpdaterManifest({
           ...data,
           repository: "openhoo/hooviestar",
+          tag: "v0.2.0",
           version: "0.2.0",
+          publishedAt: "2026-08-30T20:00:00Z",
         }),
       /exactly one Debian updater signature/,
     );
@@ -79,14 +79,15 @@ test("rejects a partial updater asset set", () => {
 test("rejects a duplicated updater asset set", () => {
   const data = fixture();
   try {
-    data.release.assets.push({ id: 107, name: "Hooviestar_0.2.0_portable.exe" });
     writeFileSync(join(data.assetsDir, "Hooviestar_0.2.0_portable.exe"), "exe");
     assert.throws(
       () =>
         buildUpdaterManifest({
           ...data,
           repository: "openhoo/hooviestar",
+          tag: "v0.2.0",
           version: "0.2.0",
+          publishedAt: "2026-08-30T20:00:00Z",
         }),
       /exactly one Windows NSIS updater asset, found 2/,
     );
@@ -95,18 +96,19 @@ test("rejects a duplicated updater asset set", () => {
   }
 });
 
-test("rejects an invalid release asset id", () => {
+test("rejects an invalid repository name", () => {
   const data = fixture();
   try {
-    data.release.assets.find((asset) => asset.name.endsWith(".AppImage")).id = 0;
     assert.throws(
       () =>
         buildUpdaterManifest({
           ...data,
-          repository: "openhoo/hooviestar",
+          repository: "openhoo/../hooviestar",
+          tag: "v0.2.0",
           version: "0.2.0",
+          publishedAt: "2026-08-30T20:00:00Z",
         }),
-      /invalid release asset id/,
+      /invalid GitHub repository name/,
     );
   } finally {
     rmSync(data.assetsDir, { recursive: true, force: true });

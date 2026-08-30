@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { basename, dirname, join, resolve } from "node:path";
 import { isReleaseSemver } from "./semver.mjs";
@@ -23,45 +23,48 @@ function readUpdaterSignature(assetsDir, name) {
   return encoded;
 }
 
-export function buildUpdaterManifest({ release, assetsDir, repository, version }) {
-  if (release.tag_name !== `v${version}`) {
-    throw new Error(`release tag ${release.tag_name} does not match v${version}`);
+export function buildUpdaterManifest({ assetsDir, repository, tag, version, publishedAt }) {
+  if (tag !== `v${version}`) {
+    throw new Error(`release tag ${tag} does not match v${version}`);
   }
-  if (!release.draft) {
-    throw new Error("updater manifest must be finalized while release is still a draft");
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) {
+    throw new Error("invalid GitHub repository name");
   }
-  if (!Array.isArray(release.assets)) {
-    throw new Error("release assets are missing");
+  if (typeof publishedAt !== "string" || Number.isNaN(Date.parse(publishedAt))) {
+    throw new Error("invalid updater publication date");
   }
+  const assets = readdirSync(assetsDir, { withFileTypes: true })
+    .filter((entry) => entry.isFile())
+    .map((entry) => entry.name);
 
   const windows = requireExactlyOne(
-    release.assets,
-    (asset) => asset.name.endsWith(".exe"),
+    assets,
+    (asset) => asset.endsWith(".exe"),
     "Windows NSIS updater asset",
   );
   const linux = requireExactlyOne(
-    release.assets,
-    (asset) => asset.name.endsWith(".AppImage"),
+    assets,
+    (asset) => asset.endsWith(".AppImage"),
     "Linux AppImage updater asset",
   );
   const debian = requireExactlyOne(
-    release.assets,
-    (asset) => asset.name.endsWith(".deb"),
+    assets,
+    (asset) => asset.endsWith(".deb"),
     "Debian updater asset",
   );
   const windowsSignature = requireExactlyOne(
-    release.assets,
-    (asset) => asset.name === `${windows.name}.sig`,
+    assets,
+    (asset) => asset === `${windows}.sig`,
     "Windows updater signature",
   );
   const linuxSignature = requireExactlyOne(
-    release.assets,
-    (asset) => asset.name === `${linux.name}.sig`,
+    assets,
+    (asset) => asset === `${linux}.sig`,
     "Linux updater signature",
   );
   const debianSignature = requireExactlyOne(
-    release.assets,
-    (asset) => asset.name === `${debian.name}.sig`,
+    assets,
+    (asset) => asset === `${debian}.sig`,
     "Debian updater signature",
   );
 
@@ -73,35 +76,32 @@ export function buildUpdaterManifest({ release, assetsDir, repository, version }
     linuxSignature,
     debianSignature,
   ]) {
-    const localName = basename(asset.name);
-    if (localName !== asset.name) {
-      throw new Error(`unsafe release asset name: ${asset.name}`);
-    }
-    if (!Number.isSafeInteger(asset.id) || asset.id <= 0) {
-      throw new Error(`invalid release asset id for ${asset.name}`);
+    const localName = basename(asset);
+    if (localName !== asset || !/^[A-Za-z0-9][A-Za-z0-9._+-]*$/.test(asset)) {
+      throw new Error(`unsafe release asset name: ${asset}`);
     }
     readFileSync(join(assetsDir, localName));
   }
 
-  const apiAssetUrl = (asset) =>
-    `https://api.github.com/repos/${repository}/releases/assets/${asset.id}`;
+  const releaseDownloadUrl = (asset) =>
+    `https://github.com/${repository}/releases/download/${encodeURIComponent(tag)}/${encodeURIComponent(asset)}`;
   const windowsEntry = {
-    signature: readUpdaterSignature(assetsDir, windowsSignature.name),
-    url: apiAssetUrl(windows),
+    signature: readUpdaterSignature(assetsDir, windowsSignature),
+    url: releaseDownloadUrl(windows),
   };
   const linuxEntry = {
-    signature: readUpdaterSignature(assetsDir, linuxSignature.name),
-    url: apiAssetUrl(linux),
+    signature: readUpdaterSignature(assetsDir, linuxSignature),
+    url: releaseDownloadUrl(linux),
   };
   const debianEntry = {
-    signature: readUpdaterSignature(assetsDir, debianSignature.name),
-    url: apiAssetUrl(debian),
+    signature: readUpdaterSignature(assetsDir, debianSignature),
+    url: releaseDownloadUrl(debian),
   };
 
   return {
     version,
-    notes: typeof release.body === "string" ? release.body : "",
-    pub_date: release.created_at,
+    notes: `Hooviestar ${tag}`,
+    pub_date: publishedAt,
     platforms: {
       "windows-x86_64": windowsEntry,
       "windows-x86_64-nsis": windowsEntry,
@@ -116,9 +116,8 @@ async function main() {
   const assetsDir = resolve(process.argv[2] ?? "release-assets");
   const repository = process.env.GITHUB_REPOSITORY;
   const tag = process.env.GITHUB_REF_NAME;
-  const token = process.env.GH_TOKEN;
-  if (!repository || !tag || !token) {
-    throw new Error("GITHUB_REPOSITORY, GITHUB_REF_NAME, and GH_TOKEN are required");
+  if (!repository || !tag) {
+    throw new Error("GITHUB_REPOSITORY and GITHUB_REF_NAME are required");
   }
   if (!tag.startsWith("v") || !isReleaseSemver(tag.slice(1))) {
     throw new Error(`invalid release tag: ${tag}`);
@@ -128,25 +127,12 @@ async function main() {
   if (tag !== `v${packageVersion}`) {
     throw new Error(`release tag ${tag} does not match package version ${packageVersion}`);
   }
-  const response = await fetch(
-    `https://api.github.com/repos/${repository}/releases/tags/${encodeURIComponent(tag)}`,
-    {
-      headers: {
-        Accept: "application/vnd.github+json",
-        Authorization: `Bearer ${token}`,
-        "X-GitHub-Api-Version": "2022-11-28",
-      },
-    },
-  );
-  if (!response.ok) {
-    throw new Error(`failed to read draft release: HTTP ${response.status}`);
-  }
-  const release = await response.json();
   const manifest = buildUpdaterManifest({
-    release,
     assetsDir,
     repository,
+    tag,
     version: packageVersion,
+    publishedAt: new Date().toISOString(),
   });
   writeFileSync(join(assetsDir, "latest.json"), `${JSON.stringify(manifest, null, 2)}\n`, {
     mode: 0o600,
