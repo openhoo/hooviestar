@@ -17,14 +17,21 @@ const writeJson = (path, value) => writeFileSync(pathOf(path), `${JSON.stringify
 const packageJson = JSON.parse(read("package.json"));
 const packageLock = JSON.parse(read("package-lock.json"));
 const originalFiles = new Map(
-  ["package.json", "package-lock.json", "src-tauri/tauri.conf.json", "Cargo.toml", "Cargo.lock"].map(
-    (path) => [path, read(path)],
-  ),
+  [
+    "package.json",
+    "package-lock.json",
+    "src-tauri/tauri.conf.json",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+  ].map((path) => [path, read(path)]),
 );
 let tauriConfig = originalFiles.get("src-tauri/tauri.conf.json");
 let cargoToml = originalFiles.get("Cargo.toml");
+let readme = originalFiles.get("README.md");
 const tauriVersionPattern = /(^  "version"\s*:\s*")[^"]+("\s*,\s*$)/m;
 const cargoVersionPattern = /(\[workspace\.package\][\s\S]*?^version\s*=\s*")[^"]+(".*$)/m;
+const readmeVersionPattern = /(Hooviestar is at version )\S+( and under active development\.)/;
 
 if (!tauriVersionPattern.test(tauriConfig)) {
   throw new Error("tauri.conf.json version field is missing");
@@ -32,12 +39,16 @@ if (!tauriVersionPattern.test(tauriConfig)) {
 if (!cargoVersionPattern.test(cargoToml)) {
   throw new Error("Cargo workspace version field is missing");
 }
+if (!readmeVersionPattern.test(readme)) {
+  throw new Error("README status version is missing");
+}
 
 packageJson.version = version;
 packageLock.version = version;
 packageLock.packages[""].version = version;
 tauriConfig = tauriConfig.replace(tauriVersionPattern, `$1${version}$2`);
 cargoToml = cargoToml.replace(cargoVersionPattern, `$1${version}$2`);
+readme = readme.replace(readmeVersionPattern, `$1${version}$2`);
 
 let prepared = false;
 try {
@@ -45,6 +56,7 @@ try {
   writeJson("package-lock.json", packageLock);
   writeFileSync(pathOf("src-tauri/tauri.conf.json"), tauriConfig);
   writeFileSync(pathOf("Cargo.toml"), cargoToml);
+  writeFileSync(pathOf("README.md"), readme);
 
   const lockUpdate = spawnSync(
     "cargo",

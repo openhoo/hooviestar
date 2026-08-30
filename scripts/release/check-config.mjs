@@ -19,6 +19,7 @@ const tauri = readJson("src-tauri/tauri.conf.json");
 const localBuildTauri = readJson("src-tauri/tauri.local-build.conf.json");
 const cargoToml = read("Cargo.toml");
 const cargoLock = read("Cargo.lock");
+const readme = read("README.md");
 const releaseWorkflow = read(".github/workflows/release.yml");
 const ciWorkflow = read(".github/workflows/ci.yml");
 const tauriRuntime = read("src-tauri/src/lib.rs");
@@ -35,6 +36,10 @@ expect(version === workspaceVersion, "package.json and Cargo workspace versions 
 expect(tauri.version === version, "tauri.conf.json version differs");
 expect(packageLock.version === version, "package-lock.json root version differs");
 expect(packageLock.packages?.[""]?.version === version, "package-lock root package version differs");
+expect(
+  readme.includes(`Hooviestar is at version ${version} and under active development.`),
+  "README status version differs",
+);
 
 const workspaceLockVersions = cargoLock
   .split("\n[[package]]\n")
@@ -83,6 +88,11 @@ expect(
 expect(
   releaseWorkflow.includes("Self-signed trust mode requires a self-signed certificate"),
   "self-signed Windows certificate guard is missing",
+);
+expect(
+  releaseWorkflow.includes("$_.ObjectId -eq $codeSigningOid") &&
+    releaseWorkflow.includes("$_.Value -eq $codeSigningOid"),
+  "Windows code-signing EKU compatibility check is missing",
 );
 expect(
   releaseWorkflow.includes("Cert:\\CurrentUser\\TrustedPublisher"),

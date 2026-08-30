@@ -153,7 +153,10 @@ jobs:
           $cert = $leafCertificates[0]
           if ($cert.NotBefore -gt (Get-Date)) { throw "Code-signing certificate is not valid yet" }
           if ($cert.NotAfter -le (Get-Date).AddDays(7)) { throw "Code-signing certificate expires within seven days" }
-          $codeSigningEku = $cert.EnhancedKeyUsageList | Where-Object { $_.ObjectId.Value -eq "1.3.6.1.5.5.7.3.3" }
+          $codeSigningOid = "1.3.6.1.5.5.7.3.3"
+          $codeSigningEku = $cert.EnhancedKeyUsageList | Where-Object {
+            $_.ObjectId -eq $codeSigningOid -or $_.ObjectId.Value -eq $codeSigningOid -or $_.Value -eq $codeSigningOid
+          }
           if (-not $codeSigningEku) { throw "Certificate is not valid for code signing" }
           $isSelfSigned = $cert.Subject -eq $cert.Issuer
           if ($env:WINDOWS_CERTIFICATE_TRUST_MODE -eq "self-signed") {
