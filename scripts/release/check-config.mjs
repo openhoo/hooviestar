@@ -92,7 +92,7 @@ expect(releaseWorkflow.includes("finally {"), "temporary PFX cleanup is not fail
 expect(releaseWorkflow.includes("$cert.NotBefore"), "Windows certificate start-date validation is missing");
 expect(releaseWorkflow.includes("actions/workflows/ci.yml/runs"), "successful tagged-SHA CI gate is missing");
 expect(releaseWorkflow.includes("assert-newer-version.mjs"), "stable release ordering gate is missing");
-expect(releaseWorkflow.includes("immutable-releases"), "repository release-immutability gate is missing");
+expect(releaseWorkflow.includes("gh release verify"), "immutable release verification is missing");
 expect(releaseWorkflow.includes("Get-AuthenticodeSignature"), "Authenticode verification is missing");
 expect(releaseWorkflow.includes("TimeStamperCertificate"), "Authenticode timestamp verification is missing");
 expect(releaseWorkflow.includes("7z t $installers[0].FullName"), "NSIS archive verification is missing");

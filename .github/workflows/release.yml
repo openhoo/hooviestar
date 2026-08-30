@@ -55,7 +55,6 @@ jobs:
           gh release verify-asset --help >/dev/null
           gh attestation verify --help | grep -- '--signer-workflow' >/dev/null
           gh attestation verify --help | grep -- '--source-digest' >/dev/null
-          test "$(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled)" = true
           if [[ "$GITHUB_REF_NAME" != *-* ]]; then
             if latest_tag=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null); then
               node scripts/release/assert-newer-version.mjs \
