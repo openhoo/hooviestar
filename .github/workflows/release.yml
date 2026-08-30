@@ -164,8 +164,10 @@ jobs:
             $cerPath = Join-Path $env:RUNNER_TEMP "hooviestar-codesign.cer"
             try {
               Export-Certificate -Cert $cert -FilePath $cerPath -Type CERT | Out-Null
-              Import-Certificate -FilePath $cerPath -CertStoreLocation Cert:\CurrentUser\Root | Out-Null
-              Import-Certificate -FilePath $cerPath -CertStoreLocation Cert:\CurrentUser\TrustedPublisher | Out-Null
+              & certutil.exe -user -addstore -f Root $cerPath | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw "Failed to add self-signed certificate to user Root store" }
+              & certutil.exe -user -addstore -f TrustedPublisher $cerPath | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw "Failed to add self-signed certificate to user TrustedPublisher store" }
             } finally {
               if (Test-Path $cerPath) { Remove-Item $cerPath -Force }
             }
