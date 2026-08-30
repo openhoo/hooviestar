@@ -340,19 +340,6 @@ jobs:
             (.platforms["linux-x86_64-deb"].signature | length > 80) and
             (.platforms["linux-x86_64-deb"].url | startswith("https://github.com/\($repository)/releases/download/\($tag)/"))
           ' release-assets/latest.json >/dev/null
-          windows_url=$(jq -r '.platforms["windows-x86_64"].url' release-assets/latest.json)
-          linux_url=$(jq -r '.platforms["linux-x86_64"].url' release-assets/latest.json)
-          debian_url=$(jq -r '.platforms["linux-x86_64-deb"].url' release-assets/latest.json)
-          windows_name=$(find release-assets -maxdepth 1 -name '*.exe' -printf '%f\n')
-          linux_name=$(find release-assets -maxdepth 1 -name '*.AppImage' -printf '%f\n')
-          debian_name=$(find release-assets -maxdepth 1 -name '*.deb' -printf '%f\n')
-          release=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$VERSION")
-          actual_windows_url=$(jq -r --arg name "$windows_name" '.assets[] | select(.name == $name) | .browser_download_url' <<<"$release")
-          actual_linux_url=$(jq -r --arg name "$linux_name" '.assets[] | select(.name == $name) | .browser_download_url' <<<"$release")
-          actual_debian_url=$(jq -r --arg name "$debian_name" '.assets[] | select(.name == $name) | .browser_download_url' <<<"$release")
-          test "$windows_url" = "$actual_windows_url"
-          test "$linux_url" = "$actual_linux_url"
-          test "$debian_url" = "$actual_debian_url"
       - name: Generate SPDX SBOM
         uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2, Syft v1.51.1
         env:
@@ -447,6 +434,19 @@ jobs:
           else
             test "$(jq -r .isPrerelease <<<"$release")" = false
           fi
+          release_api=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME")
+          windows_url=$(jq -r '.platforms["windows-x86_64"].url' release-assets/latest.json)
+          linux_url=$(jq -r '.platforms["linux-x86_64"].url' release-assets/latest.json)
+          debian_url=$(jq -r '.platforms["linux-x86_64-deb"].url' release-assets/latest.json)
+          windows_name=$(find release-assets -maxdepth 1 -name '*.exe' -printf '%f\n')
+          linux_name=$(find release-assets -maxdepth 1 -name '*.AppImage' -printf '%f\n')
+          debian_name=$(find release-assets -maxdepth 1 -name '*.deb' -printf '%f\n')
+          actual_windows_url=$(jq -r --arg name "$windows_name" '.assets[] | select(.name == $name) | .browser_download_url' <<<"$release_api")
+          actual_linux_url=$(jq -r --arg name "$linux_name" '.assets[] | select(.name == $name) | .browser_download_url' <<<"$release_api")
+          actual_debian_url=$(jq -r --arg name "$debian_name" '.assets[] | select(.name == $name) | .browser_download_url' <<<"$release_api")
+          test "$windows_url" = "$actual_windows_url"
+          test "$linux_url" = "$actual_linux_url"
+          test "$debian_url" = "$actual_debian_url"
           verified=false
           for attempt in $(seq 1 30); do
             if gh release verify "$GITHUB_REF_NAME" \

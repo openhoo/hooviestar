@@ -114,6 +114,14 @@ expect(releaseWorkflow.includes("dpkg-deb --field"), "Debian package verificatio
 expect(releaseWorkflow.includes("releaseDraft: true"), "release is not staged as a draft");
 expect(releaseWorkflow.includes("--draft=false"), "verified draft publication is missing");
 expect(releaseWorkflow.includes("latest.json"), "updater manifest verification is missing");
+const publishDraftPosition = releaseWorkflow.indexOf('gh release edit "$GITHUB_REF_NAME"');
+const liveManifestPosition = releaseWorkflow.indexOf(
+  'release_api=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME")',
+);
+expect(
+  publishDraftPosition >= 0 && liveManifestPosition > publishDraftPosition,
+  "live updater URL verification must run after draft publication",
+);
 expect(releaseWorkflow.includes("uploadUpdaterJson: false"), "matrix updater-manifest writes are not disabled");
 expect(
   releaseWorkflow.includes("build-updater-manifest.mjs"),
