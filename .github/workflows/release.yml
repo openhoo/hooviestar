@@ -161,16 +161,31 @@ jobs:
           $isSelfSigned = $cert.Subject -eq $cert.Issuer
           if ($env:WINDOWS_CERTIFICATE_TRUST_MODE -eq "self-signed") {
             if (-not $isSelfSigned) { throw "Self-signed trust mode requires a self-signed certificate" }
-            $cerPath = Join-Path $env:RUNNER_TEMP "hooviestar-codesign.cer"
-            try {
-              Export-Certificate -Cert $cert -FilePath $cerPath -Type CERT | Out-Null
-              & certutil.exe -user -addstore -f Root $cerPath | Out-Null
-              if ($LASTEXITCODE -ne 0) { throw "Failed to add self-signed certificate to user Root store" }
-              & certutil.exe -user -addstore -f TrustedPublisher $cerPath | Out-Null
-              if ($LASTEXITCODE -ne 0) { throw "Failed to add self-signed certificate to user TrustedPublisher store" }
-            } finally {
-              if (Test-Path $cerPath) { Remove-Item $cerPath -Force }
+            $publicCertificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($cert.RawData)
+            $storeNames = @(
+              [System.Security.Cryptography.X509Certificates.StoreName]::Root,
+              [System.Security.Cryptography.X509Certificates.StoreName]::TrustedPublisher
+            )
+            foreach ($storeName in $storeNames) {
+              $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
+                $storeName,
+                [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
+              )
+              try {
+                $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+                $store.Add($publicCertificate)
+                $matches = @($store.Certificates.Find(
+                  [System.Security.Cryptography.X509Certificates.X509FindType]::FindByThumbprint,
+                  $cert.Thumbprint,
+                  $false
+                ))
+                if ($matches.Count -ne 1) { throw "Failed to add self-signed certificate to user $storeName store" }
+              } finally {
+                $store.Close()
+                $store.Dispose()
+              }
             }
+            $publicCertificate.Dispose()
           } elseif ($isSelfSigned) {
             throw "Self-signed certificate rejected while WINDOWS_CERTIFICATE_TRUST_MODE is trusted"
           }

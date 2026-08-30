@@ -6,7 +6,7 @@ Native GPU scene compositing for a clean Discord screen-share window on Windows 
 
 Hooviestar keeps scene setup, source controls, audio mixing, and preview tooling in one visible studio window. In Discord, select the virtual **Hooviestar – Program** app: it stays mapped for capture but outside the physical desktop, so controls and setup dialogs never become part of the shared output.
 
-> **Status:** Hooviestar is at version 0.1.3 and under active development. Build it from source and expect the project format and platform integration to evolve.
+> **Status:** Hooviestar is at version 0.1.4 and under active development. Build it from source and expect the project format and platform integration to evolve.
 
 ![Hooviestar studio with a text source selected](docs/screenshots/studio-with-source.png)
 

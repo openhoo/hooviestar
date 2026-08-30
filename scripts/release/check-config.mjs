@@ -95,8 +95,11 @@ expect(
   "Windows code-signing EKU compatibility check is missing",
 );
 expect(
-  releaseWorkflow.includes("certutil.exe -user -addstore -f Root") &&
-    releaseWorkflow.includes("certutil.exe -user -addstore -f TrustedPublisher"),
+  releaseWorkflow.includes("StoreName]::Root") &&
+    releaseWorkflow.includes("StoreName]::TrustedPublisher") &&
+    releaseWorkflow.includes("X509Store]::new") &&
+    releaseWorkflow.includes("StoreLocation]::CurrentUser") &&
+    releaseWorkflow.includes("$store.Add($publicCertificate)"),
   "non-interactive self-signed publisher trust is missing",
 );
 expect(releaseWorkflow.includes("finally {"), "temporary PFX cleanup is not fail-safe");
