@@ -2,6 +2,10 @@
 name = "hooviestar"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+description.workspace = true
+homepage.workspace = true
+repository.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
@@ -20,7 +24,9 @@ uuid.workspace = true
 tauri = { version = "2.8", features = ["unstable"] }
 tauri-plugin-dialog = "2.4"
 tauri-plugin-global-shortcut = "2.3"
+tauri-plugin-single-instance = "2.4.4"
 tauri-plugin-updater = "2.10.1"
+tauri-plugin-window-state = "2.4.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 raw-window-handle = "0.6"

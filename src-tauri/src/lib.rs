@@ -1,4 +1,5 @@
 mod platform;
+mod taskbar;
 mod updater;
 
 use std::{
@@ -19,6 +20,7 @@ use platform::NativePreview;
 use tauri::WindowEvent;
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, window::WindowBuilder};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+use tauri_plugin_window_state::StateFlags;
 use uuid::Uuid;
 
 struct AppState {
@@ -41,6 +43,8 @@ struct AppState {
     events_ready: AtomicBool,
     pending_events: Mutex<Vec<EngineEvent>>,
 }
+
+static STUDIO_ACTIVATION_RETRYING: AtomicBool = AtomicBool::new(false);
 
 struct RuntimeResources {
     engine: Mutex<Option<Arc<EngineHandle>>>,
@@ -305,12 +309,75 @@ fn set_preview_visible(visible: bool, state: State<'_, AppState>) -> Result<(), 
     platform::set_preview_visible(state.inner().preview, visible)
 }
 
+fn activate_studio(app: &AppHandle) {
+    if try_activate_studio(app) {
+        return;
+    }
+    if STUDIO_ACTIVATION_RETRYING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let app = app.clone();
+    if let Err(error) = thread::Builder::new()
+        .name("studio-activation".into())
+        .spawn(move || {
+            // Die Single-Instance-Meldung kann während des ersten Setup-Laufs
+            // eintreffen. Begrenzt nach dem statisch konfigurierten Studio
+            // suchen, ohne den Plugin-Callback oder UI-Thread zu blockieren.
+            for _ in 0..20 {
+                thread::sleep(Duration::from_millis(50));
+                if try_activate_studio(&app) {
+                    STUDIO_ACTIVATION_RETRYING.store(false, Ordering::Release);
+                    return;
+                }
+            }
+            STUDIO_ACTIVATION_RETRYING.store(false, Ordering::Release);
+            eprintln!("[hooviestar] second launch could not find Studio window");
+        })
+    {
+        STUDIO_ACTIVATION_RETRYING.store(false, Ordering::Release);
+        eprintln!("[hooviestar] failed to start Studio activation retry: {error}");
+    }
+}
+
+fn try_activate_studio(app: &AppHandle) -> bool {
+    let Some(studio) = app.get_webview_window("studio") else {
+        return false;
+    };
+    if let Err(error) = studio.show() {
+        eprintln!("[hooviestar] failed to show Studio after second launch: {error}");
+    }
+    if let Err(error) = studio.unminimize() {
+        eprintln!("[hooviestar] failed to restore Studio after second launch: {error}");
+    }
+    if let Err(error) = studio.set_focus() {
+        eprintln!("[hooviestar] failed to focus Studio after second launch: {error}");
+    }
+    true
+}
+
 pub fn run() {
     platform::configure_graphics_backend();
     let resources = Arc::new(RuntimeResources::new());
     let setup_resources = resources.clone();
     let app = tauri::Builder::default()
+        // Muss laut Plugin-Vertrag zuerst registriert werden. Eine zweite
+        // Instanz darf keine weiteren Program-Fenster, Geräte oder Hotkeys
+        // erzeugen; sie aktiviert nur das bestehende Studio.
+        .plugin(tauri_plugin_single_instance::init(|app, _arguments, _cwd| {
+            activate_studio(app);
+        }))
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                // Auch zukünftige Webview-Fenster bleiben ausgeschlossen.
+                // Sichtbarkeit und Fullscreen werden absichtlich nie restauriert.
+                .with_filter(|label| label == "studio")
+                .with_state_flags(
+                    StateFlags::POSITION | StateFlags::SIZE | StateFlags::MAXIMIZED,
+                )
+                .build(),
+        )
         .manage(resources.clone())
+        .manage(taskbar::TaskbarState::default())
         .manage(updater::UpdateState::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -363,6 +430,7 @@ pub fn run() {
             let initial_events = Mutex::new({
                 let mut buffered = Vec::new();
                 while let Ok(event) = events.try_recv() {
+                    taskbar::record_engine_event(app.handle(), &event);
                     buffered.push(event);
                 }
                 buffered
@@ -388,6 +456,7 @@ pub fn run() {
                     while !stop_events.load(Ordering::Acquire) {
                         match events.recv_timeout(Duration::from_millis(100)) {
                             Ok(event) => {
+                                taskbar::record_engine_event(&handle, &event);
                                 let state = handle.state::<AppState>();
                                 let mut pending = state
                                     .pending_events

@@ -1,3 +1,5 @@
+<img src="src-tauri/icons/icon.png" width="104" align="right" alt="Hooviestar logo">
+
 # Hooviestar
 
 Native GPU scene compositing for a clean Discord screen-share window on Windows and Linux.
@@ -18,6 +20,9 @@ Hooviestar keeps scene setup, source controls, audio mixing, and preview tooling
 - Scene ordering, visibility, locking, renaming, and global scene hotkeys.
 - Per-source volume, mute controls, live meters, and media playback controls.
 - One visible Studio plus capture-only Program and native Preview surfaces.
+- Single-instance startup that restores and focuses the existing Studio.
+- Persisted Studio size, position, and maximized state with monitor-safe restore.
+- Native taskbar update progress and a Windows error overlay for failed updates or GPU recovery.
 - Atomic, debounced project persistence with corrupt-file recovery.
 - Shared JSON command, event, and project contracts across TypeScript and Rust.
 
@@ -155,7 +160,7 @@ The reusable workflow is versioned as [the Windows/Discord qualification skill](
 
 Version tags produce a Windows NSIS installer, Linux AppImage, and Debian package. The release stays a draft until Windows Authenticode, Tauri updater signatures, an SPDX 2.3 SBOM, SHA-256 checksums, Sigstore signing, GitHub provenance/SBOM attestations, and the cross-platform `latest.json` manifest pass verification. Packaged NSIS, AppImage, and Debian builds then install their matching signed updates automatically on startup.
 
-See [Releasing Hooviestar](docs/releasing.md) for signing-secret setup, version preparation, publication, updater behavior, and independent verification.
+See [Releasing Hooviestar](docs/releasing.md) for signing-secret setup, version preparation, publication, updater behavior, and independent verification. The [Windows integration review](docs/windows-integration.md) records current bundle metadata and prioritized native Tauri opportunities.
 
 ## Project data
 

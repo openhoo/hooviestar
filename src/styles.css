@@ -162,30 +162,13 @@ button:disabled {
 }
 
 .brand-mark {
-  position: relative;
   flex: none;
-  width: 28px;
-  height: 28px;
+  display: block;
+  width: 30px;
+  height: 30px;
   border-radius: 8px;
-  background: linear-gradient(145deg, #8e87ff, #5b51df);
-  box-shadow: 0 5px 18px #6d63f235, inset 0 0 0 1px #ffffff24;
-}
-
-.brand-mark i {
-  position: absolute;
-  width: 9px;
-  height: 14px;
-  top: 7px;
-  border: 2px solid #fff;
-  border-radius: 3px;
-}
-
-.brand-mark i:first-child {
-  left: 6px;
-}
-
-.brand-mark i:last-child {
-  right: 6px;
+  background: url("./assets/hooviestar-icon-64.png") center / cover no-repeat;
+  box-shadow: 0 5px 18px #6d63f245, 0 0 0 1px #ffffff1f;
 }
 
 .brand-copy {

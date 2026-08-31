@@ -621,7 +621,7 @@ export default function App() {
     <main className="studio">
       <header className="topbar">
         <div className="brand">
-          <span className="brand-mark" aria-hidden="true"><i /><i /></span>
+          <span className="brand-mark" aria-hidden="true" />
           <div className="brand-copy">
             <h1>Hooviestar</h1>
             <p>Discord-Szenenstudio</p>

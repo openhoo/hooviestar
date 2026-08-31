@@ -5,6 +5,7 @@ import { isReleaseSemver } from "./semver.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const read = (path) => readFileSync(resolve(root, path), "utf8");
+const readBuffer = (path) => readFileSync(resolve(root, path));
 const readJson = (path) => JSON.parse(read(path));
 const fail = (message) => {
   throw new Error(`release configuration: ${message}`);
@@ -18,12 +19,14 @@ const packageLock = readJson("package-lock.json");
 const tauri = readJson("src-tauri/tauri.conf.json");
 const localBuildTauri = readJson("src-tauri/tauri.local-build.conf.json");
 const cargoToml = read("Cargo.toml");
+const tauriCargoToml = read("src-tauri/Cargo.toml");
 const cargoLock = read("Cargo.lock");
 const readme = read("README.md");
 const releaseWorkflow = read(".github/workflows/release.yml");
 const ciWorkflow = read(".github/workflows/ci.yml");
 const tauriRuntime = read("src-tauri/src/lib.rs");
 const updaterRuntime = read("src-tauri/src/updater.rs");
+const taskbarRuntime = read("src-tauri/src/taskbar.rs");
 const frontend = read("src/App.tsx");
 
 const workspaceVersion = cargoToml.match(
@@ -59,6 +62,59 @@ expect(
 for (const target of ["nsis", "appimage", "deb"]) {
   expect(tauri.bundle?.targets?.includes(target), `${target} installer target is missing`);
 }
+expect(tauri.bundle?.publisher === "OpenHoo", "bundle publisher is missing");
+expect(
+  tauri.bundle?.homepage === "https://github.com/openhoo/hooviestar",
+  "bundle homepage is missing",
+);
+expect(tauri.bundle?.license === "MIT", "bundle license is missing");
+expect(tauri.bundle?.category === "Video", "bundle category is missing");
+expect(tauri.bundle?.windows?.allowDowngrades === false, "Windows downgrade protection is disabled");
+expect(
+  tauri.bundle?.windows?.webviewInstallMode?.type === "embedBootstrapper",
+  "embedded WebView2 bootstrapper is missing",
+);
+expect(
+  ["English", "German"].every((language) =>
+    tauri.bundle?.windows?.nsis?.languages?.includes(language)
+  ),
+  "English and German NSIS languages are required",
+);
+expect(tauri.app?.windows?.[0]?.theme === "Dark", "Studio native theme is not dark");
+expect(
+  tauri.app?.windows?.[0]?.backgroundColor === "#0b0d10",
+  "Studio startup background does not match the UI",
+);
+
+const pngDimensions = (path) => {
+  const png = readBuffer(path);
+  expect(png.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex")), `${path} is not PNG`);
+  return { width: png.readUInt32BE(16), height: png.readUInt32BE(20) };
+};
+const iconPng = pngDimensions("src-tauri/icons/icon.png");
+expect(iconPng.width === 512 && iconPng.height === 512, "bundle PNG icon must be 512x512");
+const uiIcon = pngDimensions("src/assets/hooviestar-icon-64.png");
+expect(uiIcon.width === 64 && uiIcon.height === 64, "Studio brand icon must be 64x64");
+const iconSource = pngDimensions("assets/branding/hooviestar-icon-source.png");
+expect(
+  iconSource.width === iconSource.height && iconSource.width >= 1024,
+  "branding source must be square and at least 1024px",
+);
+const ico = readBuffer("src-tauri/icons/icon.ico");
+expect(ico.readUInt16LE(0) === 0 && ico.readUInt16LE(2) === 1, "bundle ICO header is invalid");
+const icoCount = ico.readUInt16LE(4);
+const icoSizes = Array.from({ length: icoCount }, (_, index) => {
+  const width = ico[6 + index * 16];
+  const height = ico[7 + index * 16];
+  const normalizedWidth = width === 0 ? 256 : width;
+  const normalizedHeight = height === 0 ? 256 : height;
+  return `${normalizedWidth}x${normalizedHeight}`;
+}).sort((left, right) => Number(left.split("x")[0]) - Number(right.split("x")[0]));
+expect(
+  JSON.stringify(icoSizes) ===
+    JSON.stringify(["16x16", "24x24", "32x32", "48x48", "64x64", "256x256"]),
+  "bundle ICO must contain 16, 24, 32, 48, 64 and 256px frames",
+);
 const updater = tauri.plugins?.updater;
 expect(
   updater?.endpoints?.includes(
@@ -70,8 +126,49 @@ expect(typeof updater?.pubkey === "string" && updater.pubkey.length > 80, "updat
 const decodedKey = Buffer.from(updater.pubkey, "base64").toString("utf8");
 expect(decodedKey.startsWith("untrusted comment: minisign public key:"), "updater public key is invalid");
 expect(tauriRuntime.includes("tauri_plugin_updater::Builder"), "updater plugin is not registered");
+const singleInstancePlugin = tauriRuntime.indexOf(".plugin(tauri_plugin_single_instance::init");
+expect(singleInstancePlugin >= 0, "single-instance plugin is not registered");
+expect(
+  singleInstancePlugin === tauriRuntime.indexOf(".plugin("),
+  "single-instance must remain the first registered plugin",
+);
+expect(
+  tauriCargoToml.includes('tauri-plugin-single-instance = "2.4.4"'),
+  "single-instance dependency is missing or unexpectedly changed",
+);
+expect(
+  tauriRuntime.includes('with_filter(|label| label == "studio")'),
+  "window-state persistence is not restricted to Studio",
+);
+for (const flag of ["POSITION", "SIZE", "MAXIMIZED"]) {
+  expect(tauriRuntime.includes(`StateFlags::${flag}`), `window-state ${flag} flag is missing`);
+}
+for (const unsafeFlag of ["VISIBLE", "FULLSCREEN"]) {
+  expect(
+    !tauriRuntime.includes(`StateFlags::${unsafeFlag}`),
+    `window-state must not restore ${unsafeFlag}`,
+  );
+}
+expect(
+  tauriCargoToml.includes('tauri-plugin-window-state = "2.4.1"'),
+  "window-state dependency is missing or unexpectedly changed",
+);
+expect(
+  ["studio.show()", "studio.unminimize()", "studio.set_focus()"].every((call) =>
+    tauriRuntime.includes(call)
+  ),
+  "second launch does not fully restore and focus Studio",
+);
 expect(tauriRuntime.includes("updater::spawn"), "automatic updater is not started");
 expect(updaterRuntime.includes("download_and_install"), "automatic update installation is missing");
+expect(updaterRuntime.includes("download_percentage"), "updater download progress is missing");
+expect(updaterRuntime.includes("UpdateStatus::Installing"), "updater install phase is missing");
+expect(taskbarRuntime.includes("set_progress_bar"), "native taskbar progress is missing");
+expect(taskbarRuntime.includes("set_overlay_icon"), "Windows taskbar error overlay is missing");
+expect(
+  taskbarRuntime.includes("self.device == Activity::Error || self.update == Activity::Error"),
+  "taskbar error-priority guard is missing",
+);
 expect(updaterRuntime.includes("CHECK_TIMEOUT"), "automatic update check timeout is missing");
 expect(updaterRuntime.includes("DOWNLOAD_TIMEOUT"), "automatic update download timeout is missing");
 expect(updaterRuntime.includes("app.restart()"), "automatic restart after update is missing");

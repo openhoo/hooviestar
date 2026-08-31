@@ -14,20 +14,44 @@
       "csp": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost"
     },
     "windows": [
-      { "label": "studio", "title": "Hooviestar", "width": 1440, "height": 900, "minWidth": 800, "minHeight": 560, "maximized": true }
+      {
+        "label": "studio",
+        "title": "Hooviestar",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 800,
+        "minHeight": 560,
+        "maximized": true,
+        "preventOverflow": true,
+        "theme": "Dark",
+        "backgroundColor": "#0b0d10"
+      }
     ]
   },
   "bundle": {
     "active": true,
     "createUpdaterArtifacts": true,
     "targets": ["nsis", "deb", "appimage"],
+    "publisher": "OpenHoo",
+    "homepage": "https://github.com/openhoo/hooviestar",
+    "copyright": "Copyright © 2026 OpenHoo",
+    "license": "MIT",
+    "category": "Video",
     "shortDescription": "Native GPU scene compositor for Discord",
     "longDescription": "Compose windows, displays, text, images and local media into a clean Program window for Discord screen sharing.",
     "icon": ["icons/icon.png", "icons/icon.ico"],
     "windows": {
       "digestAlgorithm": "sha256",
       "timestampUrl": "http://timestamp.digicert.com",
-      "nsis": { "installMode": "currentUser" }
+      "allowDowngrades": false,
+      "webviewInstallMode": {
+        "type": "embedBootstrapper",
+        "silent": true
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["English", "German"]
+      }
     },
     "linux": {
       "appimage": {

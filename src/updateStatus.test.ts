@@ -6,7 +6,11 @@ describe("update status", () => {
     expect(updateStatusMessage({ status: "checking" })).toContain("Suche");
     expect(updateStatusMessage({ status: "up_to_date" })).toContain("aktuell");
     expect(updateStatusMessage({ status: "available", version: "1.2.3" })).toContain("1.2.3");
-    expect(updateStatusMessage({ status: "downloading", version: "1.2.3" })).toContain("installiert");
+    expect(updateStatusMessage({ status: "downloading", version: "1.2.3", progress: null }))
+      .toContain("heruntergeladen");
+    expect(updateStatusMessage({ status: "downloading", version: "1.2.3", progress: 42 }))
+      .toContain("42 %");
+    expect(updateStatusMessage({ status: "installing", version: "1.2.3" })).toContain("installiert");
     expect(updateStatusMessage({ status: "installed", version: "1.2.3" })).toContain("Neustart");
   });
 
