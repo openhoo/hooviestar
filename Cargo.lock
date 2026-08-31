@@ -2008,7 +2008,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hooviestar"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "hooviestar-engine",
  "raw-window-handle",
@@ -2027,7 +2027,7 @@ dependencies = [
 
 [[package]]
 name = "hooviestar-engine"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "ash",
