@@ -149,7 +149,7 @@ Windows also has an interactive, measured Discord qualification for real scene s
 pwsh -File .\scripts\windows-discord\Start-Publisher.ps1 -NativeOnly
 ```
 
-Full qualification requires publisher and receiver JSON reports; ordinary hosted CI cannot replace the interactive Discord/GPU/audio run.
+The reusable workflow is versioned as [the Windows/Discord qualification skill](skills/hooviestar-windows-discord-qualification/SKILL.md). Its deterministic negative and harness-contract tests run with `npm run test:windows-qualification`. Full qualification requires fresh same-run publisher and receiver JSON reports; ordinary hosted CI cannot replace the interactive Discord/GPU/audio run.
 
 ## Releases and updates
 

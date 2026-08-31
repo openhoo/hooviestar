@@ -7,6 +7,9 @@ param(
 
     [string]$RepoPath,
 
+    [ValidatePattern("^[A-Za-z0-9._-]+$")]
+    [string]$RunId,
+
     [string]$ReportPath,
 
     [string]$StatusPath,
@@ -28,10 +31,18 @@ if (-not $StatusPath) { $StatusPath = Join-Path $resultRoot "discord-receiver-ta
 if (-not $LogPath) { $LogPath = Join-Path $resultRoot "discord-receiver-task.log" }
 if (-not $ErrorLogPath) { $ErrorLogPath = Join-Path $resultRoot "discord-receiver-task.stderr.log" }
 New-Item -ItemType Directory -Force -Path $resultRoot | Out-Null
+if (-not $RunId) {
+    $activeRunPath = Join-Path $resultRoot "active-run.json"
+    if (-not (Test-Path $activeRunPath)) { throw "No active qualification run. Pass -RunId." }
+    $RunId = [string](Get-Content $activeRunPath -Raw | ConvertFrom-Json).qualificationRunId
+}
 
 $started = Get-Date
 $exitCode = 1
 $failure = $null
+$reportPassed = $false
+$reportFresh = $false
+$reportRunId = $null
 try {
     $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
     $env:CARGO_TERM_COLOR = "never"
@@ -49,6 +60,7 @@ try {
             "-File", $receiverScript,
             "-DurationSeconds", $DurationSeconds,
             "-WindowTitleContains", ('"' + $WindowTitleContains + '"'),
+            "-RunId", $RunId,
             "-ReportPath", $ReportPath
         ) `
         -RedirectStandardOutput $LogPath `
@@ -57,6 +69,14 @@ try {
         -PassThru
     $exitCode = $receiver.ExitCode
     if ($exitCode -ne 0) { throw "Discord receiver returned exit $exitCode" }
+    if (-not (Test-Path $ReportPath)) { throw "Discord receiver report is missing: $ReportPath" }
+    $reportDocument = Get-Content $ReportPath -Raw | ConvertFrom-Json
+    $reportPassed = $reportDocument.passed -eq $true
+    $reportRunId = [string]$reportDocument.qualificationRunId
+    $reportFresh = (Get-Item $ReportPath).LastWriteTimeUtc -ge $started.ToUniversalTime()
+    if (-not $reportPassed) { throw "Discord receiver report did not pass." }
+    if ($reportRunId -ne $RunId) { throw "Discord receiver report run ID mismatch." }
+    if (-not $reportFresh) { throw "Discord receiver report predates this task." }
 }
 catch {
     $failure = $_.Exception.Message
@@ -66,11 +86,15 @@ catch {
 finally {
     [ordered]@{
         exitCode = $exitCode
+        qualificationRunId = $RunId
         started = $started.ToString("o")
         completed = (Get-Date).ToString("o")
         durationSeconds = $DurationSeconds
         windowTitleContains = $WindowTitleContains
         reportExists = (Test-Path $ReportPath)
+        reportPassed = $reportPassed
+        reportFresh = $reportFresh
+        reportRunId = $reportRunId
         reportPath = $ReportPath
         logPath = $LogPath
         errorLogPath = $ErrorLogPath

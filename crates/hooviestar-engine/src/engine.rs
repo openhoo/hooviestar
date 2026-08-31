@@ -347,6 +347,10 @@ impl EngineHandle {
     pub fn snapshot(&self) -> ProjectV1 {
         self.project.read().clone()
     }
+    #[cfg(target_os = "windows")]
+    pub fn rendered_frame_count(&self) -> u64 {
+        self.renderer.rendered_frame_count()
+    }
     pub fn take_events(&self) -> Result<Receiver<EngineEvent>, EngineError> {
         self.receiver
             .lock()

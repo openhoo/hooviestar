@@ -40,8 +40,8 @@ use windows::{
 };
 
 pub use super::analysis::{
-    BROWSER_FREQUENCY_HZ, BgraFrame, Marker, SignalMetrics, TONE_FREQUENCY_HZ, analyze_signal,
-    runtime_audio_process_id,
+    BROWSER_FREQUENCY_HZ, BgraFrame, Marker, MotionMetrics, SignalMetrics, TONE_FREQUENCY_HZ,
+    analyze_signal, quiet_enough, runtime_audio_process_id, summarize_motion,
 };
 
 pub const BROWSER_TITLE: &str = "Hooviestar Browser Video Fixture";
@@ -124,6 +124,23 @@ impl TestWindow {
             )
         }
         .map_err(|error| format!("Program could not release topmost state: {error}"))
+    }
+
+    pub fn move_onscreen(&self) -> Result<(), String> {
+        let virtual_left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+        let virtual_top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+        unsafe {
+            SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOPMOST),
+                virtual_left,
+                virtual_top,
+                0,
+                0,
+                SWP_NOSIZE | SWP_SHOWWINDOW,
+            )
+        }
+        .map_err(|error| format!("Program could not move onscreen: {error}"))
     }
 
     pub fn assert_discord_captureable_offscreen(&self) -> Result<(), String> {
@@ -301,6 +318,57 @@ pub fn wait_for_marker(
     Err(format!(
         "marker {expected:?} not observed within {timeout:?}; last={last:?}"
     ))
+}
+
+pub fn measure_marker_motion(
+    capture: &WindowCapture,
+    device: &D3d11Device,
+    expected: Marker,
+    frame_pairs: usize,
+    interval: Duration,
+) -> Result<(BgraFrame, MotionMetrics), String> {
+    let mut previous = wait_for_marker(capture, device, expected, Duration::from_secs(10))?;
+    let first = previous.clone();
+    let mut ratios = Vec::with_capacity(frame_pairs);
+    for _ in 0..frame_pairs {
+        thread::sleep(interval);
+        let next = wait_for_marker(capture, device, expected, Duration::from_secs(3))?;
+        ratios.push(previous.motion_ratio(&next));
+        previous = next;
+    }
+    Ok((first, summarize_motion(&ratios, 0.0002)))
+}
+
+pub fn measure_capture_cadence(capture: &WindowCapture, duration: Duration) -> f64 {
+    let _ = capture.take_latest();
+    let started = Instant::now();
+    let mut frames = 0usize;
+    while started.elapsed() < duration {
+        if capture.take_latest().is_some() {
+            frames += 1;
+        } else {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    frames as f64 / started.elapsed().as_secs_f64()
+}
+
+pub fn marker_absent_for(
+    capture: &WindowCapture,
+    device: &D3d11Device,
+    marker: Marker,
+    duration: Duration,
+) -> Result<bool, String> {
+    let deadline = Instant::now() + duration;
+    let mut observed_frames = 0usize;
+    while Instant::now() < deadline {
+        let frame = wait_for_frame(capture, device, Duration::from_secs(2))?;
+        observed_frames += 1;
+        if frame.marker() == Some(marker) {
+            return Ok(false);
+        }
+    }
+    Ok(observed_frames >= 3)
 }
 
 pub fn start_window_capture(
@@ -486,4 +554,56 @@ pub fn measure_process_audio(
         }
     }
     analyze_signal(&mono, frequencies)
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StereoSignalMetrics {
+    pub sample_count: usize,
+    pub left: SignalMetrics,
+    pub right: SignalMetrics,
+}
+
+pub fn measure_process_audio_stereo(
+    capture: &ProcessAudioCapture,
+    duration: Duration,
+    frequencies: &[f64],
+) -> StereoSignalMetrics {
+    capture.clear();
+    let frames = (duration.as_secs_f64() * f64::from(SAMPLE_RATE)).round() as usize;
+    let mut left = Vec::with_capacity(frames);
+    let mut right = Vec::with_capacity(frames);
+    let deadline = Instant::now() + duration + Duration::from_secs(3);
+    while left.len() < frames {
+        let mut received = false;
+        while left.len() < frames {
+            let Some(frame) = capture.try_pop() else {
+                break;
+            };
+            received = true;
+            left.push(f64::from(frame[0]));
+            right.push(f64::from(frame[1]));
+        }
+        if left.len() == frames {
+            break;
+        }
+        if Instant::now() >= deadline {
+            eprintln!(
+                "stereo process audio measurement timed out after {}/{} captured frames",
+                left.len(),
+                frames
+            );
+            left.clear();
+            right.clear();
+            break;
+        }
+        if !received {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    StereoSignalMetrics {
+        sample_count: left.len(),
+        left: analyze_signal(&left, frequencies),
+        right: analyze_signal(&right, frequencies),
+    }
 }

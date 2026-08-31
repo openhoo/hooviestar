@@ -10,21 +10,32 @@ if (!['publisher', 'receiver', 'receiver-muted', 'stop', 'status'].includes(comm
 }
 
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
-const targets = await fetch(`http://127.0.0.1:${port}/json/list`).then((response) => response.json());
+const targetsResponse = await fetch(`http://127.0.0.1:${port}/json/list`, {
+    signal: AbortSignal.timeout(10_000),
+});
+if (!targetsResponse.ok) throw new Error(`CDP target list returned HTTP ${targetsResponse.status}`);
+const targets = await targetsResponse.json();
 const target = targets.find((entry) => entry.type === 'page' && entry.url.includes('127.0.0.1:3016'));
 if (!target) throw new Error(`No MiroTalk page target on CDP port ${port}`);
 
 const socket = new WebSocket(target.webSocketDebuggerUrl);
-await new Promise((resolve, reject) => {
-    socket.addEventListener('open', resolve, { once: true });
-    socket.addEventListener('error', reject, { once: true });
-});
+let openTimeout;
+try {
+    await new Promise((resolve, reject) => {
+        openTimeout = setTimeout(() => reject(new Error('CDP WebSocket open timed out')), 10_000);
+        socket.addEventListener('open', resolve, { once: true });
+        socket.addEventListener('error', reject, { once: true });
+    });
+} finally {
+    clearTimeout(openTimeout);
+}
 let sequence = 0;
 const pending = new Map();
 socket.addEventListener('message', (event) => {
     const message = JSON.parse(event.data);
     if (!message.id || !pending.has(message.id)) return;
-    const { resolve, reject } = pending.get(message.id);
+    const { resolve, reject, timeout } = pending.get(message.id);
+    clearTimeout(timeout);
     pending.delete(message.id);
     if (message.error) reject(new Error(message.error.message));
     else resolve(message.result);
@@ -33,9 +44,16 @@ socket.addEventListener('message', (event) => {
 function send(method, params = {}) {
     const id = ++sequence;
     socket.send(JSON.stringify({ id, method, params }));
-    return new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
+    return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+            pending.delete(id);
+            reject(new Error(`CDP command timed out: ${method}`));
+        }, 15_000);
+        pending.set(id, { resolve, reject, timeout });
+    });
 }
 
+try {
 let receiverContextId;
 let receiverFrameUrl;
 if (target.url.includes('/viewer')) {
@@ -102,12 +120,15 @@ if (command === 'publisher') {
         document.title = 'Hooviestar MiroTalk Publisher';
         window.__hooviestarClickCount = 0;
         window.__hooviestarErrors = [];
-        document.querySelector('#screenShareStart').addEventListener('click', () => window.__hooviestarClickCount++);
-        const originalError = console.error.bind(console);
-        console.error = (...values) => {
-            window.__hooviestarErrors.push(values.map((value) => String(value)).join(' '));
-            originalError(...values);
-        };
+        if (!window.__hooviestarInstrumentationInstalled) {
+            document.querySelector('#screenShareStart').addEventListener('click', () => window.__hooviestarClickCount++);
+            const originalError = console.error.bind(console);
+            console.error = (...values) => {
+                window.__hooviestarErrors.push(values.map((value) => String(value)).join(' '));
+                originalError(...values);
+            };
+            window.__hooviestarInstrumentationInstalled = true;
+        }
         document.querySelector('.swal2-confirm')?.click();
     })()`);
     await evaluate(`document.querySelector('#screenShareStart').click()`, true);
@@ -140,6 +161,7 @@ const status = await evaluate(`(() => {
     const selector = location.pathname.includes('broadcast') ? 'video' : '#mainVideo';
     const video = document.querySelector(selector);
     const stream = video?.srcObject;
+    const allTracks = stream ? stream.getTracks() : [];
     const describe = (track) => ({
         kind: track.kind,
         label: track.label,
@@ -158,15 +180,32 @@ const status = await evaluate(`(() => {
         screenButtonBox: document.querySelector('#screenShareStart')?.getBoundingClientRect().toJSON() ?? null,
         qualificationClickCount: window.__hooviestarClickCount ?? null,
         qualificationErrors: window.__hooviestarErrors ?? [],
+        peerConnectionStates: typeof peerConnections === 'object'
+            ? Object.values(peerConnections).map((connection) => ({
+                connectionState: connection.connectionState,
+                iceConnectionState: connection.iceConnectionState,
+                signalingState: connection.signalingState,
+            }))
+            : [],
         readyState: video?.readyState ?? -1,
         paused: video?.paused ?? true,
         muted: video?.muted ?? true,
         width: video?.videoWidth ?? 0,
         height: video?.videoHeight ?? 0,
-        tracks: stream ? stream.getTracks().map(describe) : [],
+        tracks: allTracks.map(describe),
+        trackCounts: {
+            audio: allTracks.filter((track) => track.kind === 'audio').length,
+            video: allTracks.filter((track) => track.kind === 'video').length,
+        },
+        liveTrackCounts: {
+            audio: allTracks.filter((track) => track.kind === 'audio' && track.readyState === 'live').length,
+            video: allTracks.filter((track) => track.kind === 'video' && track.readyState === 'live').length,
+        },
     };
 })()`);
 status.cdpTargetUrl = target.url;
 if (receiverFrameUrl) status.cdpFrameUrl = receiverFrameUrl;
-socket.close();
 console.log(JSON.stringify(status, null, 2));
+} finally {
+    socket.close();
+}

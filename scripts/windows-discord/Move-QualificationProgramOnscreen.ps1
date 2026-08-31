@@ -45,6 +45,12 @@ public static class HooviestarQualificationWindow {
     [DllImport("user32.dll")]
     public static extern bool SetForegroundWindow(IntPtr window);
 
+    [DllImport("user32.dll")]
+    public static extern bool IsIconic(IntPtr window);
+
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindowAsync(IntPtr window, int command);
+
     public delegate bool EnumWindowsCallback(IntPtr window, IntPtr parameter);
 
     [DllImport("user32.dll")]
@@ -115,17 +121,36 @@ if ($window -eq [IntPtr]::Zero) {
 }
 
 $insertAfter = if ($NotTopmost) { [IntPtr]::new(-2) } else { [IntPtr]::new(-1) }
-$showWindowAsync = [uint32](0x0040 -bor 0x4000)
-if (-not [HooviestarQualificationWindow]::SetWindowPos($window, $insertAfter, 0, 0, 1280, 720, $showWindowAsync)) {
+if ([HooviestarQualificationWindow]::IsIconic($window)) {
+    # The return value reports the previous visibility state, not operation success.
+    [void][HooviestarQualificationWindow]::ShowWindowAsync($window, 9)
+    Start-Sleep -Milliseconds 250
+}
+$showWindow = [uint32]0x0040
+if (-not [HooviestarQualificationWindow]::SetWindowPos($window, $insertAfter, 0, 0, 1280, 720, $showWindow)) {
     throw "SetWindowPos failed."
 }
 if ($Foreground -and -not [HooviestarQualificationWindow]::SetForegroundWindow($window)) {
     throw "SetForegroundWindow failed."
 }
 
-$rectangle = New-Object HooviestarQualificationWindow+Rect
-if (-not [HooviestarQualificationWindow]::GetWindowRect($window, [ref]$rectangle)) {
-    throw "GetWindowRect failed."
+$rectangleDeadline = (Get-Date).AddSeconds([Math]::Min($TimeoutSeconds, 10))
+do {
+    $rectangle = New-Object HooviestarQualificationWindow+Rect
+    if (-not [HooviestarQualificationWindow]::GetWindowRect($window, [ref]$rectangle)) {
+        throw "GetWindowRect failed."
+    }
+    if ($rectangle.Left -ge -1000 -and $rectangle.Top -ge -1000 -and
+        ($rectangle.Right - $rectangle.Left) -eq 1280 -and
+        ($rectangle.Bottom - $rectangle.Top) -eq 720) {
+        break
+    }
+    Start-Sleep -Milliseconds 100
+} while ((Get-Date) -lt $rectangleDeadline)
+if ($rectangle.Left -lt -1000 -or $rectangle.Top -lt -1000 -or
+    ($rectangle.Right - $rectangle.Left) -ne 1280 -or
+    ($rectangle.Bottom - $rectangle.Top) -ne 720) {
+    throw "Program window did not restore to the expected 1280x720 onscreen rectangle."
 }
 
 [ordered]@{

@@ -5,6 +5,9 @@ param(
 
     [string]$ReportPath,
 
+    [ValidatePattern("^[A-Za-z0-9._-]+$")]
+    [string]$RunId,
+
     [switch]$NativeOnly,
 
     [ValidatePattern("^[A-Za-z0-9._-]+$")]
@@ -23,8 +26,19 @@ $fixture = (Resolve-Path (Join-Path $repo "tests\windows-discord\browser-video-f
 if (-not $ReportPath) {
     $ReportPath = Join-Path $qualificationRoot "publisher-native.json"
 }
-
+if (-not $RunId) {
+    $RunId = [Guid]::NewGuid().ToString("D")
+}
 New-Item -ItemType Directory -Force -Path $qualificationRoot, $runRoot, $browserProfile, $appData | Out-Null
+
+[ordered]@{
+    schemaVersion = 1
+    qualificationRunId = $RunId
+    started = (Get-Date).ToUniversalTime().ToString("o")
+    transport = $TransportName
+    nativeOnly = [bool]$NativeOnly
+    reportPath = $ReportPath
+} | ConvertTo-Json | Set-Content (Join-Path $qualificationRoot "active-run.json") -Encoding UTF8
 
 $browserCandidates = @(
     (Join-Path ${env:ProgramFiles(x86)} "Microsoft\Edge\Application\msedge.exe"),
@@ -49,7 +63,10 @@ Push-Location $repo
 $tone = $null
 $browser = $null
 try {
-    cargo build -p hooviestar-engine --example tone_session --example qualify_windows_pipeline
+    # FPS-, Mixing- und Transport-SLAs gegen optimierte Produktbinaries
+    # messen. Debug-Code kann im softwaregerenderten Windows-VM-Adapter das
+    # 1080p60-Preset künstlich unter die Qualifikationsgrenze drücken.
+    cargo build --release -p hooviestar-engine --example tone_session --example qualify_windows_pipeline
     if ($LASTEXITCODE -ne 0) { throw "Windows qualification examples did not build." }
 
     $fixtureUri = [Uri]::new($fixture).AbsoluteUri
@@ -58,6 +75,8 @@ try {
         "--autoplay-policy=no-user-gesture-required",
         "--disable-background-timer-throttling",
         "--disable-renderer-backgrounding",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-features=CalculateNativeWinOcclusion",
         "--app=`"$fixtureUri`""
     ) -join " "
     $browser = Start-Process `
@@ -67,7 +86,7 @@ try {
         -RedirectStandardError (Join-Path $qualificationRoot "browser-fixture.stderr.log") `
         -PassThru
 
-    $toneExecutable = Join-Path $repo "target\debug\examples\tone_session.exe"
+    $toneExecutable = Join-Path $repo "target\release\examples\tone_session.exe"
     $toneDuration = [Math]::Max($HoldSeconds + 180, 300)
     $tone = Start-Process `
         -FilePath $toneExecutable `
@@ -87,11 +106,11 @@ try {
         Write-Host "Keep browser fixture visible. Receiver must keep the transported stream visible and audible."
     }
 
-    $publisherExecutable = Join-Path $repo "target\debug\examples\qualify_windows_pipeline.exe"
+    $publisherExecutable = Join-Path $repo "target\release\examples\qualify_windows_pipeline.exe"
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $publisherExecutable
     $startInfo.UseShellExecute = $false
-    $publisherArguments = "--tone-pid $($tone.Id) --hold-seconds $effectiveHold --transport-label $TransportName --report `"$ReportPath`""
+    $publisherArguments = "--tone-pid $($tone.Id) --hold-seconds $effectiveHold --transport-label $TransportName --run-id $RunId --report `"$ReportPath`""
     if ($TransportName -eq "MiroTalk" -and -not $NativeOnly) {
         $topmostGate = Join-Path $qualificationRoot "share-picker-open.gate"
         $publisherArguments += " --program-onscreen --system-audio-transport --program-topmost-gate `"$topmostGate`""

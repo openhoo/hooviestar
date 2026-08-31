@@ -8,7 +8,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread::{self, JoinHandle},
@@ -347,7 +347,10 @@ impl SwapChainTarget {
     }
 
     fn present(&self) -> Result<(), WindowsVideoError> {
-        unsafe { self.swap_chain.Present(1, DXGI_PRESENT(0)) }
+        // Der Render-Thread taktet selbst auf output.fps. Zwei serielle
+        // VSync-Presents (Program + Preview) halbieren sonst bei 60-Hz-DWM
+        // das 1080p60-Preset effektiv auf etwa 30 fps.
+        unsafe { self.swap_chain.Present(0, DXGI_PRESENT(0)) }
             .ok()
             .map_err(|error| WindowsVideoError::SwapChain(error.to_string()))
     }
@@ -362,6 +365,14 @@ pub struct TextDraw<'a> {
     pub background_color: &'a str,
     pub align: &'a TextAlign,
     pub transform: &'a Transform,
+}
+
+pub enum SceneDraw<'a> {
+    Texture {
+        texture: &'a ID3D11Texture2D,
+        transform: &'a Transform,
+    },
+    Text(TextDraw<'a>),
 }
 
 pub struct D3d11Compositor {
@@ -497,15 +508,13 @@ impl D3d11Compositor {
         Ok(())
     }
 
-    pub fn render_scene<'a, I, J>(
+    pub fn render_scene<'a, I>(
         &mut self,
         color: [f32; 4],
-        items: I,
-        texts: J,
+        draws: I,
     ) -> Result<(), WindowsVideoError>
     where
-        I: IntoIterator<Item = (&'a ID3D11Texture2D, &'a Transform)>,
-        J: IntoIterator<Item = TextDraw<'a>>,
+        I: IntoIterator<Item = SceneDraw<'a>>,
     {
         let clear = D2D1_COLOR_F {
             r: color[0],
@@ -517,98 +526,102 @@ impl D3d11Compositor {
             self.d2d_context.BeginDraw();
             self.d2d_context.Clear(Some(&clear));
         }
-        for (texture, transform) in items {
-            let bitmap = self.bitmap_for(texture)?;
-            let mut description = D3D11_TEXTURE2D_DESC::default();
-            unsafe { texture.GetDesc(&mut description) };
-            let destination = D2D_RECT_F {
-                left: transform.x,
-                top: transform.y,
-                right: transform.x + transform.width,
-                bottom: transform.y + transform.height,
-            };
-            let source = D2D_RECT_F {
-                left: transform.crop_left,
-                top: transform.crop_top,
-                right: description.Width as f32 - transform.crop_right,
-                bottom: description.Height as f32 - transform.crop_bottom,
-            };
-            let radians = transform.rotation_degrees.to_radians();
-            let (sine, cosine) = radians.sin_cos();
-            let center_x = transform.x + transform.width * 0.5;
-            let center_y = transform.y + transform.height * 0.5;
-            let matrix = Matrix3x2 {
-                M11: cosine,
-                M12: sine,
-                M21: -sine,
-                M22: cosine,
-                M31: center_x - cosine * center_x + sine * center_y,
-                M32: center_y - sine * center_x - cosine * center_y,
-            };
-            unsafe {
-                self.d2d_context.SetTransform(&matrix);
-                self.d2d_context.DrawBitmap(
-                    &bitmap,
-                    Some(&destination),
-                    transform.opacity,
-                    D2D1_INTERPOLATION_MODE_LINEAR,
-                    Some(&source),
-                    None,
-                );
-            }
-        }
         let mut rendered_texts: HashSet<&str> = HashSet::new();
-        for text in texts {
-            let destination = D2D_RECT_F {
-                left: text.transform.x,
-                top: text.transform.y,
-                right: text.transform.x + text.transform.width,
-                bottom: text.transform.y + text.transform.height,
-            };
-            let radians = text.transform.rotation_degrees.to_radians();
-            let (sine, cosine) = radians.sin_cos();
-            let center_x = text.transform.x + text.transform.width * 0.5;
-            let center_y = text.transform.y + text.transform.height * 0.5;
-            let matrix = Matrix3x2 {
-                M11: cosine,
-                M12: sine,
-                M21: -sine,
-                M22: cosine,
-                M31: center_x - cosine * center_x + sine * center_y,
-                M32: center_y - sine * center_x - cosine * center_y,
-            };
-            let background = self.brush_for(text.background_color)?;
-            let foreground = self.brush_for(text.color)?;
-            let format = self.text_format_for(
-                text.font_family,
-                text.font_size,
-                text.font_weight,
-                text.align,
-            )?;
-            unsafe {
-                background.SetOpacity(text.transform.opacity);
-                foreground.SetOpacity(text.transform.opacity);
-                self.d2d_context.SetTransform(&matrix);
-                self.d2d_context.FillRectangle(&destination, &background);
-            }
-            rendered_texts.insert(text.text);
-            if !self.text_buffers.contains_key(text.text) {
-                self.text_buffers
-                    .insert(text.text.to_string(), text.text.encode_utf16().collect());
-            }
-            let buffer = self
-                .text_buffers
-                .get_mut(text.text)
-                .expect("text buffer was inserted above");
-            unsafe {
-                self.d2d_context.DrawText(
-                    buffer,
-                    &format,
-                    &destination,
-                    &foreground,
-                    D2D1_DRAW_TEXT_OPTIONS_NONE,
-                    DWRITE_MEASURING_MODE_NATURAL,
-                );
+        for draw in draws {
+            match draw {
+                SceneDraw::Texture { texture, transform } => {
+                    let bitmap = self.bitmap_for(texture)?;
+                    let mut description = D3D11_TEXTURE2D_DESC::default();
+                    unsafe { texture.GetDesc(&mut description) };
+                    let destination = D2D_RECT_F {
+                        left: transform.x,
+                        top: transform.y,
+                        right: transform.x + transform.width,
+                        bottom: transform.y + transform.height,
+                    };
+                    let source = D2D_RECT_F {
+                        left: transform.crop_left,
+                        top: transform.crop_top,
+                        right: description.Width as f32 - transform.crop_right,
+                        bottom: description.Height as f32 - transform.crop_bottom,
+                    };
+                    let radians = transform.rotation_degrees.to_radians();
+                    let (sine, cosine) = radians.sin_cos();
+                    let center_x = transform.x + transform.width * 0.5;
+                    let center_y = transform.y + transform.height * 0.5;
+                    let matrix = Matrix3x2 {
+                        M11: cosine,
+                        M12: sine,
+                        M21: -sine,
+                        M22: cosine,
+                        M31: center_x - cosine * center_x + sine * center_y,
+                        M32: center_y - sine * center_x - cosine * center_y,
+                    };
+                    unsafe {
+                        self.d2d_context.SetTransform(&matrix);
+                        self.d2d_context.DrawBitmap(
+                            &bitmap,
+                            Some(&destination),
+                            transform.opacity,
+                            D2D1_INTERPOLATION_MODE_LINEAR,
+                            Some(&source),
+                            None,
+                        );
+                    }
+                }
+                SceneDraw::Text(text) => {
+                    let destination = D2D_RECT_F {
+                        left: text.transform.x,
+                        top: text.transform.y,
+                        right: text.transform.x + text.transform.width,
+                        bottom: text.transform.y + text.transform.height,
+                    };
+                    let radians = text.transform.rotation_degrees.to_radians();
+                    let (sine, cosine) = radians.sin_cos();
+                    let center_x = text.transform.x + text.transform.width * 0.5;
+                    let center_y = text.transform.y + text.transform.height * 0.5;
+                    let matrix = Matrix3x2 {
+                        M11: cosine,
+                        M12: sine,
+                        M21: -sine,
+                        M22: cosine,
+                        M31: center_x - cosine * center_x + sine * center_y,
+                        M32: center_y - sine * center_x - cosine * center_y,
+                    };
+                    let background = self.brush_for(text.background_color)?;
+                    let foreground = self.brush_for(text.color)?;
+                    let format = self.text_format_for(
+                        text.font_family,
+                        text.font_size,
+                        text.font_weight,
+                        text.align,
+                    )?;
+                    unsafe {
+                        background.SetOpacity(text.transform.opacity);
+                        foreground.SetOpacity(text.transform.opacity);
+                        self.d2d_context.SetTransform(&matrix);
+                        self.d2d_context.FillRectangle(&destination, &background);
+                    }
+                    rendered_texts.insert(text.text);
+                    if !self.text_buffers.contains_key(text.text) {
+                        self.text_buffers
+                            .insert(text.text.to_string(), text.text.encode_utf16().collect());
+                    }
+                    let buffer = self
+                        .text_buffers
+                        .get_mut(text.text)
+                        .expect("text buffer was inserted above");
+                    unsafe {
+                        self.d2d_context.DrawText(
+                            buffer,
+                            &format,
+                            &destination,
+                            &foreground,
+                            D2D1_DRAW_TEXT_OPTIONS_NONE,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+                    }
+                }
             }
         }
 
@@ -887,6 +900,7 @@ fn build_windows_render_stack(
 
 pub struct RenderRuntime {
     stop: Arc<AtomicBool>,
+    rendered_frames: Arc<AtomicU64>,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -905,6 +919,8 @@ impl RenderRuntime {
         }
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
+        let rendered_frames = Arc::new(AtomicU64::new(0));
+        let thread_rendered_frames = rendered_frames.clone();
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("d3d11-render".into())
@@ -1062,62 +1078,7 @@ impl RenderRuntime {
                         &events,
                     );
 
-                    let items = active_scene.into_iter().flat_map(|scene| {
-                        scene.items.iter().filter_map(|item| {
-                            if !item.visible {
-                                return None;
-                            }
-                            if let Some(frame) = frames.get(&item.source_id) {
-                                return Some((&frame.texture, &item.transform));
-                            }
-                            if let Some(texture) = media_sources
-                                .get(&item.source_id)
-                                .and_then(|(_, media)| media.texture())
-                            {
-                                return Some((texture, &item.transform));
-                            }
-                            if let Some(texture) = display_captures
-                                .get(&item.source_id)
-                                .and_then(DisplayCapture::texture)
-                            {
-                                return Some((texture, &item.transform));
-                            }
-                            image_textures
-                                .get(&item.source_id)
-                                .map(|(_, texture)| (texture, &item.transform))
-                        })
-                    });
-                    let texts = active_scene.into_iter().flat_map(|scene| {
-                        scene.items.iter().filter_map(|item| {
-                            if !item.visible {
-                                return None;
-                            }
-                            snapshot.sources.iter().find_map(|source| match source {
-                                Source::Text {
-                                    id,
-                                    text,
-                                    font_family,
-                                    font_size_px,
-                                    font_weight,
-                                    color,
-                                    background_color,
-                                    align,
-                                    ..
-                                } if *id == item.source_id => Some(TextDraw {
-                                    text,
-                                    font_family,
-                                    font_size: *font_size_px,
-                                    font_weight: *font_weight,
-                                    color,
-                                    background_color,
-                                    align,
-                                    transform: &item.transform,
-                                }),
-                                _ => None,
-                            })
-                        })
-                    });
-                    let mut unavailable = Vec::new();
+                    let mut unavailable = HashMap::new();
                     if let Some(scene) = active_scene {
                         for item in scene.items.iter().filter(|item| item.visible) {
                             let has_texture = frames.contains_key(&item.source_id)
@@ -1151,29 +1112,94 @@ impl RenderRuntime {
                                     Source::Text { .. } | Source::ApplicationAudio { .. }
                                 )
                             {
-                                unavailable.push((
+                                unavailable.insert(
+                                    item.source_id,
                                     format!("Quelle nicht verfügbar: {}", source_name(source)),
-                                    item.transform,
-                                ));
+                                );
                             }
                         }
                     }
                     let offline_alignment = TextAlign::Center;
-                    let offline_texts = unavailable.iter().map(|(text, transform)| TextDraw {
-                        text,
-                        font_family: "Segoe UI",
-                        font_size: 28.0,
-                        font_weight: 600,
-                        color: "#ffffff",
-                        background_color: "#202736",
-                        align: &offline_alignment,
-                        transform,
+                    let draws = active_scene.into_iter().flat_map(|scene| {
+                        scene.items.iter().filter_map(|item| {
+                            if !item.visible {
+                                return None;
+                            }
+                            if let Some(frame) = frames.get(&item.source_id) {
+                                return Some(SceneDraw::Texture {
+                                    texture: &frame.texture,
+                                    transform: &item.transform,
+                                });
+                            }
+                            if let Some(texture) = media_sources
+                                .get(&item.source_id)
+                                .and_then(|(_, media)| media.texture())
+                            {
+                                return Some(SceneDraw::Texture {
+                                    texture,
+                                    transform: &item.transform,
+                                });
+                            }
+                            if let Some(texture) = display_captures
+                                .get(&item.source_id)
+                                .and_then(DisplayCapture::texture)
+                            {
+                                return Some(SceneDraw::Texture {
+                                    texture,
+                                    transform: &item.transform,
+                                });
+                            }
+                            if let Some((_, texture)) = image_textures.get(&item.source_id) {
+                                return Some(SceneDraw::Texture {
+                                    texture,
+                                    transform: &item.transform,
+                                });
+                            }
+                            if let Some(text) =
+                                snapshot.sources.iter().find_map(|source| match source {
+                                    Source::Text {
+                                        id,
+                                        text,
+                                        font_family,
+                                        font_size_px,
+                                        font_weight,
+                                        color,
+                                        background_color,
+                                        align,
+                                        ..
+                                    } if *id == item.source_id => Some(TextDraw {
+                                        text,
+                                        font_family,
+                                        font_size: *font_size_px,
+                                        font_weight: *font_weight,
+                                        color,
+                                        background_color,
+                                        align,
+                                        transform: &item.transform,
+                                    }),
+                                    _ => None,
+                                })
+                            {
+                                return Some(SceneDraw::Text(text));
+                            }
+                            unavailable.get(&item.source_id).map(|text| {
+                                SceneDraw::Text(TextDraw {
+                                    text,
+                                    font_family: "Segoe UI",
+                                    font_size: 28.0,
+                                    font_weight: 600,
+                                    color: "#ffffff",
+                                    background_color: "#202736",
+                                    align: &offline_alignment,
+                                    transform: &item.transform,
+                                })
+                            })
+                        })
                     });
-                    if let Err(error) = stack.compositor.render_scene(
-                        parse_hex_color(&output.background),
-                        items,
-                        texts.chain(offline_texts),
-                    ) {
+                    if let Err(error) = stack
+                        .compositor
+                        .render_scene(parse_hex_color(&output.background), draws)
+                    {
                         if recover_after_render_error(
                             &error,
                             RenderRecoveryContext {
@@ -1215,6 +1241,7 @@ impl RenderRuntime {
                             rendered_frames_since_recovery = 0;
                         }
                     }
+                    thread_rendered_frames.fetch_add(1, Ordering::Relaxed);
                     let frame_time = Duration::from_secs_f64(1.0 / f64::from(output.fps.max(1)));
                     deadline += frame_time;
                     let now = Instant::now();
@@ -1229,6 +1256,7 @@ impl RenderRuntime {
         match ready_receiver.recv_timeout(Duration::from_secs(10)) {
             Ok(Ok(())) => Ok(Self {
                 stop,
+                rendered_frames,
                 thread: Mutex::new(Some(thread)),
             }),
             Ok(Err(message)) => {
@@ -1249,6 +1277,10 @@ impl RenderRuntime {
         if let Some(thread) = thread {
             let _ = thread.join();
         }
+    }
+
+    pub fn rendered_frame_count(&self) -> u64 {
+        self.rendered_frames.load(Ordering::Relaxed)
     }
 }
 

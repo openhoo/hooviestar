@@ -11,6 +11,7 @@
     "build": "tsc -b && vite build",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:windows-qualification": "node --test scripts/windows-discord/*.test-node.mjs",
     "release:check": "node scripts/release/check-config.mjs",
     "release:prepare": "node scripts/release/set-version.mjs",
     "release:test": "node --test scripts/release/*.test-node.mjs",

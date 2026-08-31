@@ -8,6 +8,9 @@ param(
     [string]$ReportPath,
 
     [ValidatePattern("^[A-Za-z0-9._-]+$")]
+    [string]$RunId,
+
+    [ValidatePattern("^[A-Za-z0-9._-]+$")]
     [string]$TransportName = "Discord"
 )
 
@@ -20,6 +23,11 @@ if (-not $ReportPath) {
     $ReportPath = Join-Path $qualificationRoot "discord-receiver.json"
 }
 New-Item -ItemType Directory -Force -Path $qualificationRoot | Out-Null
+if (-not $RunId) {
+    $activeRunPath = Join-Path $qualificationRoot "active-run.json"
+    if (-not (Test-Path $activeRunPath)) { throw "No active qualification run. Pass -RunId." }
+    $RunId = [string](Get-Content $activeRunPath -Raw | ConvertFrom-Json).qualificationRunId
+}
 
 Push-Location $repo
 try {
@@ -33,6 +41,7 @@ try {
         --window-title-contains $WindowTitleContains `
         --transport $TransportName `
         --duration $DurationSeconds `
+        --run-id $RunId `
         --report $ReportPath
     if ($LASTEXITCODE -ne 0) {
         throw "Discord receiver qualification failed. Inspect $ReportPath."
