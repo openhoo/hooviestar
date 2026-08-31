@@ -60,16 +60,26 @@ try {
         "--disable-renderer-backgrounding",
         "--app=`"$fixtureUri`""
     ) -join " "
-    $browser = Start-Process -FilePath $browserExecutable -ArgumentList $browserArguments -PassThru
+    $browser = Start-Process `
+        -FilePath $browserExecutable `
+        -ArgumentList $browserArguments `
+        -RedirectStandardOutput (Join-Path $qualificationRoot "browser-fixture.stdout.log") `
+        -RedirectStandardError (Join-Path $qualificationRoot "browser-fixture.stderr.log") `
+        -PassThru
 
     $toneExecutable = Join-Path $repo "target\debug\examples\tone_session.exe"
     $toneDuration = [Math]::Max($HoldSeconds + 180, 300)
-    $tone = Start-Process -FilePath $toneExecutable -ArgumentList @(
-        "--frequency", "440",
-        "--amplitude", "0.20",
-        "--duration", $toneDuration,
-        "--grouping", "48564f4f-5649-4553-5441-52544f4e4502"
-    ) -PassThru
+    $tone = Start-Process `
+        -FilePath $toneExecutable `
+        -ArgumentList @(
+            "--frequency", "440",
+            "--amplitude", "0.20",
+            "--duration", $toneDuration,
+            "--grouping", "48564f4f-5649-4553-5441-52544f4e4502"
+        ) `
+        -RedirectStandardOutput (Join-Path $qualificationRoot "tone-session.stdout.log") `
+        -RedirectStandardError (Join-Path $qualificationRoot "tone-session.stderr.log") `
+        -PassThru
 
     $effectiveHold = if ($NativeOnly) { 0 } else { $HoldSeconds }
     if (-not $NativeOnly) {
@@ -81,7 +91,12 @@ try {
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $publisherExecutable
     $startInfo.UseShellExecute = $false
-    $startInfo.Arguments = "--tone-pid $($tone.Id) --hold-seconds $effectiveHold --transport-label $TransportName --report `"$ReportPath`""
+    $publisherArguments = "--tone-pid $($tone.Id) --hold-seconds $effectiveHold --transport-label $TransportName --report `"$ReportPath`""
+    if ($TransportName -eq "MiroTalk" -and -not $NativeOnly) {
+        $topmostGate = Join-Path $qualificationRoot "share-picker-open.gate"
+        $publisherArguments += " --program-onscreen --system-audio-transport --program-topmost-gate `"$topmostGate`""
+    }
+    $startInfo.Arguments = $publisherArguments
     $startInfo.EnvironmentVariables["APPDATA"] = $appData
     $startInfo.EnvironmentVariables["HOOVIESTAR_QUALIFICATION_FAILURE_FRAME"] = Join-Path $qualificationRoot "last-failed-frame.ppm"
     $publisher = [System.Diagnostics.Process]::Start($startInfo)

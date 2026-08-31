@@ -179,6 +179,19 @@ impl ProcessAudioCapture {
         self.ring.lock().pop()
     }
 
+    /// Returns the next captured frame without synthesizing an underrun frame.
+    /// Qualification consumers use this to preserve the producer's sample
+    /// clock instead of assuming Windows wakes a sleeping thread every 10 ms.
+    pub fn try_pop(&self) -> Option<[f32; 2]> {
+        let mut ring = self.ring.lock();
+        (ring.filled_frames() > 0).then(|| ring.pop())
+    }
+
+    /// Discards buffered history while retaining capture and diagnostics.
+    pub fn clear(&self) {
+        self.ring.lock().clear();
+    }
+
     /// Grund des Fehlers, falls der Capture-Thread unerwartet geendet hat.
     pub fn failure_reason(&self) -> Option<String> {
         self.failure.lock().clone()

@@ -30,9 +30,10 @@ use windows::{
         },
         UI::WindowsAndMessaging::{
             CreateWindowExW, DestroyWindow, GetSystemMetrics, GetWindowRect,
-            GetWindowThreadProcessId, IsIconic, IsWindowVisible, SM_CXVIRTUALSCREEN,
-            SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WINDOW_EX_STYLE,
-            WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_POPUP, WS_VISIBLE,
+            GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOPMOST, IsIconic, IsWindowVisible,
+            SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+            SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowPos, WINDOW_EX_STYLE, WS_CLIPCHILDREN,
+            WS_CLIPSIBLINGS, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
         },
     },
     core::{PCWSTR, w},
@@ -58,13 +59,22 @@ impl TestWindow {
         let x = if offscreen {
             virtual_left.saturating_sub(width).saturating_sub(128)
         } else {
-            virtual_left.saturating_add(64)
+            virtual_left
         };
-        let y = virtual_top.saturating_add(64);
+        let y = if offscreen {
+            virtual_top.saturating_add(64)
+        } else {
+            virtual_top
+        };
+        let extended_style = if offscreen {
+            WINDOW_EX_STYLE::default()
+        } else {
+            WS_EX_TOPMOST
+        };
         let title: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
         let hwnd = unsafe {
             CreateWindowExW(
-                WINDOW_EX_STYLE::default(),
+                extended_style,
                 w!("STATIC"),
                 PCWSTR(title.as_ptr()),
                 WS_POPUP | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
@@ -86,6 +96,36 @@ impl TestWindow {
         self.hwnd.0 as usize
     }
 
+    pub fn raise_topmost(&self) -> Result<(), String> {
+        unsafe {
+            SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            )
+        }
+        .map_err(|error| format!("Program could not be raised: {error}"))
+    }
+
+    pub fn release_topmost(&self) -> Result<(), String> {
+        unsafe {
+            SetWindowPos(
+                self.hwnd,
+                Some(HWND_NOTOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            )
+        }
+        .map_err(|error| format!("Program could not release topmost state: {error}"))
+    }
+
     pub fn assert_discord_captureable_offscreen(&self) -> Result<(), String> {
         if !unsafe { IsWindowVisible(self.hwnd) }.as_bool() {
             return Err("Program window is not mapped/visible to capture APIs".into());
@@ -100,6 +140,25 @@ impl TestWindow {
         if rectangles_intersect(window, desktop) {
             return Err(format!(
                 "Program window intersects physical desktop: window={window:?}, desktop={desktop:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn assert_captureable_onscreen(&self) -> Result<(), String> {
+        if !unsafe { IsWindowVisible(self.hwnd) }.as_bool() {
+            return Err("Program window is not mapped/visible to capture APIs".into());
+        }
+        if unsafe { IsIconic(self.hwnd) }.as_bool() {
+            return Err("Program window is minimized".into());
+        }
+        let mut window = RECT::default();
+        unsafe { GetWindowRect(self.hwnd, &mut window) }
+            .map_err(|error| format!("Program rectangle unavailable: {error}"))?;
+        let desktop = virtual_desktop_rect()?;
+        if !rectangles_intersect(window, desktop) {
+            return Err(format!(
+                "Program window does not intersect physical desktop: window={window:?}, desktop={desktop:?}"
             ));
         }
         Ok(())
@@ -392,19 +451,38 @@ pub fn measure_process_audio(
     duration: Duration,
     frequencies: &[f64],
 ) -> SignalMetrics {
-    // Drain the bounded 100-ms ring so every stage measures samples produced
-    // after its volume/mute command settled.
-    for _ in 0..SAMPLE_RATE / 10 {
-        let _ = capture.pop();
-    }
+    // Discard bounded history so every stage starts after its settled command.
+    // Consume only frames the WASAPI producer actually supplied: Windows timer
+    // wakeups are not guaranteed to occur at exact 10-ms boundaries, and
+    // counting synthetic underrun zeros or dropping a fixed 480 frames per
+    // wakeup changes the apparent tone frequency.
+    capture.clear();
     let frames = (duration.as_secs_f64() * f64::from(SAMPLE_RATE)).round() as usize;
     let mut mono = Vec::with_capacity(frames);
-    let chunk = 480usize;
+    let deadline = std::time::Instant::now() + duration + Duration::from_secs(3);
     while mono.len() < frames {
-        thread::sleep(Duration::from_millis(10));
-        for _ in 0..chunk.min(frames - mono.len()) {
-            let frame = capture.pop();
+        let mut received = false;
+        while mono.len() < frames {
+            let Some(frame) = capture.try_pop() else {
+                break;
+            };
+            received = true;
             mono.push((f64::from(frame[0]) + f64::from(frame[1])) * 0.5);
+        }
+        if mono.len() == frames {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            eprintln!(
+                "process audio measurement timed out after {}/{} captured frames",
+                mono.len(),
+                frames
+            );
+            mono.clear();
+            break;
+        }
+        if !received {
+            thread::sleep(Duration::from_millis(1));
         }
     }
     analyze_signal(&mono, frequencies)

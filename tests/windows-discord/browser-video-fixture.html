@@ -64,12 +64,14 @@
         const audio = new AudioContext({ sampleRate: 48000 });
         const oscillator = new OscillatorNode(audio, { type: "sine", frequency: 660 });
         const gain = new GainNode(audio, { gain: 0.12 });
-        const audioStream = new MediaStreamAudioDestinationNode(audio);
-        oscillator.connect(gain).connect(audioStream);
+        // Render directly through Chromium's application-audio session. Feeding
+        // the oscillator through MediaStreamAudioDestinationNode and then back
+        // through <video> intermittently produced a silent Windows render
+        // session even though the video track kept advancing.
+        oscillator.connect(gain).connect(audio.destination);
         oscillator.start();
 
         const stream = canvas.captureStream(30);
-        stream.addTrack(audioStream.stream.getAudioTracks()[0]);
         video.srcObject = stream;
         await audio.resume();
         await video.play();

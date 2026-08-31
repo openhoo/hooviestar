@@ -44,21 +44,21 @@ $encodedRoom = [Uri]::EscapeDataString($Room)
 $encodedName = [Uri]::EscapeDataString(("Hooviestar " + $Role))
 $page = if ($Role -eq "Publisher") { "broadcast" } else { "viewer" }
 $url = "$ServerOrigin/views/$page.html?id=$encodedRoom&name=$encodedName"
+$autoplayPolicy = if ($Role -eq "Receiver") {
+    "document-user-activation-required"
+} else {
+    "no-user-gesture-required"
+}
 $arguments = @(
     "--user-data-dir=`"$profile`"",
     "--remote-debugging-address=127.0.0.1",
     "--remote-debugging-port=$CdpPort",
-    "--autoplay-policy=no-user-gesture-required",
+    "--autoplay-policy=$autoplayPolicy",
     "--no-first-run",
     "--no-default-browser-check",
     "--disable-background-timer-throttling",
     "--disable-renderer-backgrounding"
 )
-if ($Role -eq "Publisher") {
-    # Browser WebRTC cannot isolate a native application's audio. Capture the
-    # qualification monitor and map Program onto it for the transport stage.
-    $arguments += '--auto-select-desktop-capture-source="Entire screen"'
-}
 $arguments += "--app=`"$url`""
 
 $process = Start-Process -FilePath $browserExecutable -ArgumentList ($arguments -join " ") -PassThru

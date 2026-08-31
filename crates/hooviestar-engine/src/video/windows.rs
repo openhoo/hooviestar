@@ -63,7 +63,7 @@ use windows::{
                     DXGI_FORMAT_R16G16B16A16_FLOAT as FLOAT16_FORMAT, DXGI_SAMPLE_DESC,
                 },
                 DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_PRESENT,
-                DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
+                DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
                 DXGI_SWAP_EFFECT_FLIP_DISCARD as FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 IDXGIAdapter, IDXGIDevice, IDXGIFactory2, IDXGIOutput, IDXGIOutput5,
                 IDXGIOutputDuplication, IDXGIResource, IDXGISurface, IDXGISwapChain1,
@@ -75,9 +75,10 @@ use windows::{
             },
         },
         Media::MediaFoundation::{
-            IMFDXGIBuffer, IMFDXGIDeviceManager, IMFSourceReader, MF_MT_AUDIO_BITS_PER_SAMPLE,
-            MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_MAJOR_TYPE,
-            MF_MT_SUBTYPE, MF_SOURCE_READER_D3D_MANAGER, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
+            IMFDXGIBuffer, IMFDXGIDeviceManager, IMFSourceReader, MF_MT_AUDIO_AVG_BYTES_PER_SECOND,
+            MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_BLOCK_ALIGNMENT, MF_MT_AUDIO_NUM_CHANNELS,
+            MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
+            MF_SOURCE_READER_D3D_MANAGER, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
             MF_SOURCE_READER_FIRST_AUDIO_STREAM, MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_VERSION,
             MFAudioFormat_Float, MFCreateAttributes, MFCreateDXGIDeviceManager, MFCreateMediaType,
             MFCreateSourceReaderFromURL, MFMediaType_Audio, MFMediaType_Video, MFSTARTUP_FULL,
@@ -263,7 +264,7 @@ impl D3d11Device {
 }
 pub struct SwapChainTarget {
     swap_chain: IDXGISwapChain1,
-    back_buffer: ID3D11Texture2D,
+    back_buffer: Option<ID3D11Texture2D>,
 }
 
 impl SwapChainTarget {
@@ -309,8 +310,40 @@ impl SwapChainTarget {
             .map_err(|error| WindowsVideoError::SwapChain(error.to_string()))?;
         Ok(Self {
             swap_chain,
-            back_buffer,
+            back_buffer: Some(back_buffer),
         })
+    }
+
+    fn resize(&mut self, width: u32, height: u32) -> Result<(), WindowsVideoError> {
+        // ResizeBuffers verlangt, dass alle Referenzen auf den aktuellen
+        // Backbuffer freigegeben sind. Insbesondere darf nicht parallel eine
+        // zweite Flip-Swapchain fuer dasselbe HWND erzeugt werden: DXGI lehnt
+        // das mit E_ACCESSDENIED ab.
+        drop(self.back_buffer.take());
+        let resized = unsafe {
+            self.swap_chain
+                .ResizeBuffers(0, width, height, FLOAT16_FORMAT, DXGI_SWAP_CHAIN_FLAG(0))
+        };
+        let reacquired = unsafe { self.swap_chain.GetBuffer::<ID3D11Texture2D>(0) };
+        match (resized, reacquired) {
+            (Ok(()), Ok(back_buffer)) => {
+                self.back_buffer = Some(back_buffer);
+                Ok(())
+            }
+            (Err(resize_error), Ok(back_buffer)) => {
+                self.back_buffer = Some(back_buffer);
+                Err(WindowsVideoError::SwapChain(resize_error.to_string()))
+            }
+            (_, Err(buffer_error)) => Err(WindowsVideoError::SwapChain(format!(
+                "DXGI resize left no usable backbuffer: {buffer_error}"
+            ))),
+        }
+    }
+
+    fn back_buffer(&self) -> Result<&ID3D11Texture2D, WindowsVideoError> {
+        self.back_buffer
+            .as_ref()
+            .ok_or_else(|| WindowsVideoError::SwapChain("DXGI swapchain has no backbuffer".into()))
     }
 
     fn present(&self) -> Result<(), WindowsVideoError> {
@@ -335,7 +368,7 @@ pub struct D3d11Compositor {
     pub device: D3d11Device,
     scene_texture: ID3D11Texture2D,
     d2d_context: ID2D1DeviceContext,
-    _scene_bitmap: ID2D1Bitmap1,
+    scene_bitmap: ID2D1Bitmap1,
     source_bitmaps: HashMap<usize, (u64, ID2D1Bitmap1)>,
     bitmap_cache_tick: u64,
     dwrite_factory: IDWriteFactory,
@@ -344,6 +377,8 @@ pub struct D3d11Compositor {
     text_buffers: HashMap<String, Vec<u16>>,
     program: SwapChainTarget,
     preview: SwapChainTarget,
+    width: u32,
+    height: u32,
 }
 
 impl D3d11Compositor {
@@ -396,7 +431,7 @@ impl D3d11Compositor {
             device,
             scene_texture,
             d2d_context,
-            _scene_bitmap: scene_bitmap,
+            scene_bitmap,
             source_bitmaps: HashMap::new(),
             bitmap_cache_tick: 0,
             program,
@@ -405,7 +440,61 @@ impl D3d11Compositor {
             brushes: HashMap::new(),
             text_buffers: HashMap::new(),
             preview,
+            width,
+            height,
         })
+    }
+
+    fn resize(&mut self, width: u32, height: u32) -> Result<(), WindowsVideoError> {
+        if width == 0 || height == 0 {
+            return Err(WindowsVideoError::InvalidSceneTexture);
+        }
+        if width == self.width && height == self.height {
+            return Ok(());
+        }
+
+        // Alle erst nach den falliblen Creates/Resizes austauschen. So bleibt
+        // der bisherige D2D-Target bei einem fruehen Fehler verwendbar.
+        let scene_texture = self
+            .device
+            .create_scene_texture(SceneTextureDescriptor::float16(width, height))?;
+        let scene_surface = scene_texture
+            .cast::<IDXGISurface>()
+            .map_err(|error| WindowsVideoError::DeviceCreation(error.to_string()))?;
+        let scene_properties = D2D1_BITMAP_PROPERTIES1 {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: FLOAT16_FORMAT,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+            bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+            ..Default::default()
+        };
+        let scene_bitmap = unsafe {
+            self.d2d_context
+                .CreateBitmapFromDxgiSurface(&scene_surface, Some(&scene_properties))
+        }
+        .map_err(|error| WindowsVideoError::DeviceCreation(error.to_string()))?;
+
+        let old_width = self.width;
+        let old_height = self.height;
+        self.program.resize(width, height)?;
+        if let Err(preview_error) = self.preview.resize(width, height) {
+            if let Err(rollback_error) = self.program.resize(old_width, old_height) {
+                return Err(WindowsVideoError::SwapChain(format!(
+                    "preview resize failed ({preview_error}); program rollback failed ({rollback_error})"
+                )));
+            }
+            return Err(preview_error);
+        }
+
+        unsafe { self.d2d_context.SetTarget(&scene_bitmap) };
+        self.scene_texture = scene_texture;
+        self.scene_bitmap = scene_bitmap;
+        self.width = width;
+        self.height = height;
+        Ok(())
     }
 
     pub fn render_scene<'a, I, J>(
@@ -536,10 +625,10 @@ impl D3d11Compositor {
         unsafe {
             self.device
                 .immediate_context
-                .CopyResource(&self.program.back_buffer, &self.scene_texture);
+                .CopyResource(self.program.back_buffer()?, &self.scene_texture);
             self.device
                 .immediate_context
-                .CopyResource(&self.preview.back_buffer, &self.scene_texture);
+                .CopyResource(self.preview.back_buffer()?, &self.scene_texture);
         }
         self.program.present()?;
         self.preview.present()
@@ -847,22 +936,8 @@ impl RenderRuntime {
                     try_resize_compositor(
                         next_output,
                         ResizeCompositorContext {
-                            surfaces,
                             output: &mut output,
                             stack: &mut stack,
-                            device_state: DeviceTiedState {
-                                media_sources: &mut media_sources,
-                                last_media_state: &mut media_pump.last_media_state,
-                                last_failures: &mut last_failures,
-                                read_backoff: &mut media_pump.read_backoff,
-                                captures: &mut captures,
-                                frames: &mut frames,
-                                stale_windows: &mut stale_windows,
-                                display_captures: &mut display_captures,
-                                image_textures: &mut image_textures,
-                                previous_visible: &mut media_pump.previous_visible,
-                            },
-                            last_source_sync: &mut last_source_sync,
                             retry_failures: &mut resize_retry_failures,
                             next_attempt: &mut next_resize_attempt,
                             events: &events,
@@ -1242,11 +1317,8 @@ impl DeviceTiedState<'_> {
 }
 
 struct ResizeCompositorContext<'a> {
-    surfaces: NativeSurfaces,
     output: &'a mut OutputConfig,
     stack: &'a mut WindowsRenderStack,
-    device_state: DeviceTiedState<'a>,
-    last_source_sync: &'a mut Instant,
     retry_failures: &'a mut u32,
     next_attempt: &'a mut Instant,
     events: &'a mpsc::Sender<EngineEvent>,
@@ -1257,11 +1329,8 @@ struct ResizeCompositorContext<'a> {
 /// nicht das fatale Recovery-Budget.
 fn try_resize_compositor(next_output: OutputConfig, context: ResizeCompositorContext<'_>) {
     let ResizeCompositorContext {
-        surfaces,
         output,
         stack,
-        mut device_state,
-        last_source_sync,
         retry_failures,
         next_attempt,
         events,
@@ -1282,27 +1351,12 @@ fn try_resize_compositor(next_output: OutputConfig, context: ResizeCompositorCon
                 phase: DeviceRecoveryPhase::Started,
                 detail: None,
             });
-            match D3d11Compositor::create(
-                surfaces.program,
-                surfaces.preview,
-                next_output.width,
-                next_output.height,
-            ) {
-                Ok(recreated) => {
-                    // Geraeteabhaengiger Zustand erst nach
-                    // erfolgreichem Create verwerfen:
-                    // scheitert das Create, bleibt der alte
-                    // Kompositor mit allen Quellen
-                    // weiter lauffaehig.
-                    device_state.clear(&mut stack.media_context);
-                    stack.compositor = recreated;
-                    restart_media_context(
-                        &mut stack.media_context,
-                        &mut stack.mf_last_error,
-                        &stack.compositor.device,
-                    );
+            match stack
+                .compositor
+                .resize(next_output.width, next_output.height)
+            {
+                Ok(()) => {
                     *output = next_output;
-                    *last_source_sync = Instant::now() - Duration::from_secs(2);
                     *retry_failures = 0;
                     *next_attempt = Instant::now();
                     let _ = events.send(EngineEvent::DeviceRecovery {
@@ -1920,18 +1974,21 @@ fn synchronize_media(
             continue;
         }
         *creations += 1;
-        let ring = media_audio
-            .lock()
-            .entry(source_id)
-            .or_insert_with(|| Arc::new(Mutex::new(PcmRing::new(SAMPLE_RATE as usize * 2))))
-            .clone();
+        // Publish the ring only after Media Foundation opened the source.
+        // Otherwise the audio runtime can announce SourceAvailable and bind a
+        // permanently empty ring while the media-open retry is still pending.
+        let ring = Arc::new(Mutex::new(PcmRing::new(SAMPLE_RATE as usize * 2)));
         match context.open_video(Path::new(path), ring) {
             Ok(source) => {
+                media_audio
+                    .lock()
+                    .insert(source_id, source.audio_ring.clone());
                 sources.insert(source_id, (path.to_string(), source));
                 failures.remove(&(source_id, FailureKind::MediaOpen));
                 let _ = events.send(EngineEvent::SourceAvailable { source_id });
             }
             Err(error) => {
+                media_audio.lock().remove(&source_id);
                 let reason = error.to_string();
                 if should_report_failure(failures, source_id, FailureKind::MediaOpen, &reason) {
                     let _ = events.send(EngineEvent::UnsupportedMedia { source_id, reason });
@@ -2478,51 +2535,117 @@ impl MediaFoundationContext {
         audio_ring: Arc<Mutex<PcmRing>>,
     ) -> Result<MediaVideoSource, WindowsVideoError> {
         let mut attributes = None;
-        unsafe { MFCreateAttributes(&mut attributes, 3) }
-            .map_err(|error| WindowsVideoError::UnsupportedMedia(error.to_string()))?;
+        unsafe { MFCreateAttributes(&mut attributes, 3) }.map_err(|error| {
+            WindowsVideoError::UnsupportedMedia(format!("MFCreateAttributes failed: {error}"))
+        })?;
         let attributes = attributes.ok_or_else(|| {
             WindowsVideoError::UnsupportedMedia("Media Foundation returned no attributes".into())
         })?;
-        unsafe { attributes.SetUnknown(&MF_SOURCE_READER_D3D_MANAGER, &self.manager) }
-            .map_err(|error| WindowsVideoError::UnsupportedMedia(error.to_string()))?;
-        unsafe { attributes.SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1) }
-            .map_err(|error| WindowsVideoError::UnsupportedMedia(error.to_string()))?;
+        unsafe { attributes.SetUnknown(&MF_SOURCE_READER_D3D_MANAGER, &self.manager) }.map_err(
+            |error| {
+                WindowsVideoError::UnsupportedMedia(format!(
+                    "setting Source Reader D3D manager failed: {error}"
+                ))
+            },
+        )?;
+        unsafe { attributes.SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1) }.map_err(
+            |error| {
+                WindowsVideoError::UnsupportedMedia(format!(
+                    "enabling Source Reader video processing failed: {error}"
+                ))
+            },
+        )?;
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-        let reader = unsafe { MFCreateSourceReaderFromURL(PCWSTR(wide.as_ptr()), &attributes) }
-            .map_err(|error| WindowsVideoError::UnsupportedMedia(error.to_string()))?;
-        let video_enabled = (|| -> windows::core::Result<()> {
-            let media_type = unsafe { MFCreateMediaType() }?;
-            unsafe {
-                media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-                media_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_ARGB32)?;
-                reader.SetCurrentMediaType(
-                    MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32,
-                    None,
-                    &media_type,
-                )
+        let (reader, video_capable) = match unsafe {
+            MFCreateSourceReaderFromURL(PCWSTR(wide.as_ptr()), &attributes)
+        } {
+            Ok(reader) => (reader, true),
+            Err(d3d_error) => {
+                // A Source Reader carrying a D3D manager can reject a
+                // pure audio file with E_INVALIDARG. Retry without video
+                // attributes, but accept that fallback only when it has
+                // no native video stream; video must never silently lose
+                // its zero-copy/DXGI contract.
+                let fallback = unsafe {
+                        MFCreateSourceReaderFromURL(
+                            PCWSTR(wide.as_ptr()),
+                            None::<&windows::Win32::Media::MediaFoundation::IMFAttributes>,
+                        )
+                    }
+                    .map_err(|audio_error| {
+                        WindowsVideoError::UnsupportedMedia(format!(
+                            "MFCreateSourceReaderFromURL failed with D3D ({d3d_error}) and without D3D ({audio_error})"
+                        ))
+                    })?;
+                if unsafe {
+                    fallback.GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32, 0)
+                }
+                .is_ok()
+                {
+                    return Err(WindowsVideoError::UnsupportedMedia(format!(
+                        "D3D Source Reader creation failed for media containing video: {d3d_error}"
+                    )));
+                }
+                (fallback, false)
             }
-        })()
-        .is_ok();
-        let audio_enabled = (|| -> windows::core::Result<()> {
+        };
+        let video_result = if video_capable {
+            (|| -> windows::core::Result<()> {
+                let media_type = unsafe { MFCreateMediaType() }?;
+                unsafe {
+                    media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+                    media_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_ARGB32)?;
+                    reader.SetCurrentMediaType(
+                        MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32,
+                        None,
+                        &media_type,
+                    )
+                }
+            })()
+        } else {
+            Err(windows::core::Error::new(
+                windows::core::HRESULT(0x8000_4002u32 as i32),
+                "audio-only Source Reader has no video stream",
+            ))
+        };
+        let audio_result = (|| -> windows::core::Result<()> {
             let audio_type = unsafe { MFCreateMediaType() }?;
             unsafe {
                 audio_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
                 audio_type.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_Float)?;
-                audio_type.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, 2)?;
-                audio_type.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, SAMPLE_RATE)?;
-                audio_type.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 32)?;
                 reader.SetCurrentMediaType(
                     MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32,
                     None,
                     &audio_type,
-                )
+                )?;
+                // Source Reader output negotiation accepts a partial type.
+                // Validate its resolved PCM layout before read_audio treats
+                // the buffer as interleaved stereo f32 samples.
+                let resolved =
+                    reader.GetCurrentMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32)?;
+                if resolved.GetGUID(&MF_MT_SUBTYPE)? != MFAudioFormat_Float
+                    || resolved.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS)? != 2
+                    || resolved.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND)? != SAMPLE_RATE
+                    || resolved.GetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE)? != 32
+                    || resolved.GetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT)? != 8
+                    || resolved.GetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND)? != SAMPLE_RATE * 8
+                {
+                    return Err(windows::core::Error::new(
+                        windows::core::HRESULT(0x8000_FFFFu32 as i32),
+                        "Media Foundation resolved an unsupported audio layout",
+                    ));
+                }
+                Ok(())
             }
-        })()
-        .is_ok();
+        })();
+        let video_enabled = video_result.is_ok();
+        let audio_enabled = audio_result.is_ok();
         if !video_enabled && !audio_enabled {
-            return Err(WindowsVideoError::UnsupportedMedia(
-                "Media Foundation found no supported audio or video stream".into(),
-            ));
+            return Err(WindowsVideoError::UnsupportedMedia(format!(
+                "Media Foundation found no supported stream; video negotiation: {}; audio negotiation: {}",
+                video_result.expect_err("disabled video stream must have an error"),
+                audio_result.expect_err("disabled audio stream must have an error")
+            )));
         }
         Ok(MediaVideoSource {
             reader,
@@ -2725,16 +2848,20 @@ impl MediaVideoSource {
                 Some(&mut sample),
             )
         }
-        .map_err(|error| WindowsVideoError::UnsupportedMedia(error.to_string()))?;
+        .map_err(|error| {
+            WindowsVideoError::UnsupportedMedia(format!("audio ReadSample failed: {error}"))
+        })?;
         let Some(sample) = sample else {
             return Ok(None);
         };
-        let buffer = unsafe { sample.ConvertToContiguousBuffer() }
-            .map_err(|error| WindowsVideoError::UnsupportedMedia(error.to_string()))?;
+        let buffer = unsafe { sample.ConvertToContiguousBuffer() }.map_err(|error| {
+            WindowsVideoError::UnsupportedMedia(format!("audio buffer conversion failed: {error}"))
+        })?;
         let mut data = std::ptr::null_mut();
         let mut length = 0;
-        unsafe { buffer.Lock(&mut data, None, Some(&mut length)) }
-            .map_err(|error| WindowsVideoError::UnsupportedMedia(error.to_string()))?;
+        unsafe { buffer.Lock(&mut data, None, Some(&mut length)) }.map_err(|error| {
+            WindowsVideoError::UnsupportedMedia(format!("audio buffer lock failed: {error}"))
+        })?;
         let frames = if !data.is_null() && length >= 8 {
             let samples =
                 unsafe { std::slice::from_raw_parts(data.cast::<f32>(), length as usize / 4) };
@@ -2744,8 +2871,9 @@ impl MediaVideoSource {
         } else {
             0
         };
-        unsafe { buffer.Unlock() }
-            .map_err(|error| WindowsVideoError::UnsupportedMedia(error.to_string()))?;
+        unsafe { buffer.Unlock() }.map_err(|error| {
+            WindowsVideoError::UnsupportedMedia(format!("audio buffer unlock failed: {error}"))
+        })?;
         Ok(Some(frames))
     }
 
@@ -2763,8 +2891,11 @@ impl MediaVideoSource {
             },
         };
         let format = windows::core::GUID::zeroed();
-        unsafe { self.reader.SetCurrentPosition(&format, &position) }
-            .map_err(|error| WindowsVideoError::UnsupportedMedia(error.to_string()))?;
+        unsafe { self.reader.SetCurrentPosition(&format, &position) }.map_err(|error| {
+            WindowsVideoError::UnsupportedMedia(format!(
+                "media seek SetCurrentPosition failed: {error}"
+            ))
+        })?;
         if self.video_enabled {
             let _ = unsafe {
                 self.reader

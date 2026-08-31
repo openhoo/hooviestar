@@ -1,11 +1,11 @@
-# Windows and Discord qualification
+# Windows screen-share qualification
 
-This qualification uses real Windows capture/audio APIs and an actual Discord screen share. It has two measured layers:
+This qualification uses real Windows capture/audio APIs and either local MiroTalk BRO or Discord screen sharing. It has two measured layers:
 
 1. Publisher native qualification proves Hooviestar before transport.
-2. Receiver qualification proves motion, scene markers, and mixed sound after Discord encoding and playback.
+2. Receiver qualification proves motion, scene markers, and mixed sound after WebRTC encoding and playback.
 
-Discord login and starting/viewing the share remain operator actions. No account credentials, user tokens, or unstable private Discord APIs enter the harness.
+MiroTalk is the deterministic no-account default. Discord login and starting/viewing its share remain operator actions. No account credentials, user tokens, or unstable private Discord APIs enter the harness.
 
 ## What is measured
 
@@ -16,18 +16,19 @@ Publisher probe fails unless all checks pass:
 - Four scenes switch to distinct magenta, cyan, yellow, and blue render markers.
 - Browser video keeps changing through full-screen, cropped, and picture-in-picture transforms.
 - Program and Preview both deliver D3D11-composited frames.
-- Renderer keeps delivering output after 1280×720/30 to 1920×1080/60 reconfiguration and back.
+- Renderer emits successful resize events for 1280×720/30 to 1920×1080/60 and back, and keeps delivering marked frames through both changes.
 - WASAPI process loopback captures browser audio and an independent 440 Hz process.
 - Per-source volume and mute isolate both tones, mixed stage contains both, output limiter stays below its ceiling, and muted stage approaches silence.
 
-Receiver probe watches the visible Discord client window and captures its process audio. It recognizes the same four color markers, measures motion during every video scene, and runs frequency analysis on received 660 Hz/440 Hz audio. This makes a passing report evidence of Discord transport, not only local rendering.
+The MiroTalk receiver probe analyzes the remote browser `MediaStream` directly. The Discord receiver probe watches the visible client and captures its process audio. Both recognize the same markers, motion, and 660 Hz/440 Hz mix after transport.
 
 ## Requirements
 
 - Windows 11 in an interactive logged-in desktop session.
 - Hardware D3D11 device and working default playback endpoint.
 - Microsoft Edge or Google Chrome.
-- Discord desktop, signed in and joined to a voice channel.
+- For local transport: Node.js and official MiroTalk BRO pinned to the reviewed qualification commit.
+- For Discord transport: Discord desktop, signed in and joined to a voice channel.
 - For full transport proof, a second Discord account in the same voice channel. It may run on a second Windows desktop, or in regular Microsoft Edge on the same qualification VM while Discord desktop publishes.
 - Rust toolchain matching this repository.
 
@@ -43,7 +44,54 @@ pwsh -File .\scripts\windows-discord\Start-Publisher.ps1 -NativeOnly
 
 Result: `target\windows-discord\publisher-native.json`. Exit code is non-zero if any scene, frame-motion, output-resize, audio-isolation, mix, mute, or limiter assertion fails.
 
-## 2. Real Discord publisher
+## 2. Local MiroTalk BRO E2E
+
+MiroTalk BRO is used from its [official repository](https://github.com/miroslavpejic85/mirotalkbro), pinned to commit `d932edddf9cf04ac96a305af753ef27a021630db` (`1.3.77`, AGPLv3). Prepare the isolated checkout through the qualification skill helper, then start it only on loopback:
+
+```bash
+/home/wakemeup/.codex/skills/hooviestar-windows-discord-qualification/scripts/prepare-mirotalk-bro.sh
+npm --prefix /home/wakemeup/.local/share/hooviestar-windows-discord-qualification/mirotalkbro start
+```
+
+Forward guest `127.0.0.1:3016` back to that server. Forward guest CDP ports `9223` and `9224` to host loopback ports `19223` and `19224`. Start two interactive Edge app windows in the VM:
+
+```powershell
+.\scripts\windows-discord\Start-MiroTalkClient.ps1 -Role Publisher -CdpPort 9223
+.\scripts\windows-discord\Start-MiroTalkClient.ps1 -Role Receiver -CdpPort 9224
+```
+
+Create `target\windows-discord\share-picker-open.gate`, then run the publisher task with at least a 300-second hold. Native assertions and `system-audio-fixtures\preflight.json` must pass before opening the share picker. While the gate exists, Program releases topmost state so the trusted Edge picker stays visible.
+
+Trigger the picker through publisher CDP:
+
+```bash
+node scripts/windows-discord/Control-MiroTalkCdp.mjs publisher 19223
+```
+
+Bring the picker forward by clicking the publisher's taskbar icon if Program still covers it. Select `Entire Screen`, select the display, enable system audio, and click `Share with Audio`. Coordinate-based QMP input is allowed only after a fresh screenshot confirms the 1280x800 picker layout. Send pointer movement, button-down, and button-up as separate QMP calls, with at least 80 ms between down and up; one combined event batch moves the pointer but can lose the click on this VM. Publisher status must show live `System Audio` at 48 kHz and live `screen:0:0` monitor video. Remove the gate after that check; Program becomes topmost again at the next stage.
+
+Prevent local feedback without destroying the received audio track, then run the direct-stream oracle:
+
+```bash
+node scripts/windows-discord/Control-MiroTalkCdp.mjs receiver-muted 19224
+node scripts/windows-discord/Qualify-MiroTalkReceiver.mjs \
+  --port 19224 \
+  --duration 112 \
+  --report target/windows-discord/mirotalk-receiver.json
+```
+
+Do not start Edge with global `--mute-audio`; that makes Web Audio return zeros. The controller mutes only `#mainVideo`, while the oracle analyzes its live remote audio track. Pass requires four markers, motion in three video stages, isolated 660 Hz and 440 Hz stages, both in the mix, quiet mute, live tracks, and nonzero dimensions.
+
+Full MiroTalk evidence requires:
+
+- publisher scheduled-task result `0` and task status `exitCode: 0`;
+- `publisher-mirotalk-native.json` with `passed: true`;
+- `system-audio-fixtures\preflight.json` with `passed: true`;
+- publisher CDP status with live display and system-audio tracks;
+- `mirotalk-receiver.json` with `passed: true`;
+- no remaining `source-session-restore.json` after clean publisher teardown.
+
+## 3. Real Discord publisher
 
 Start Discord first. Then on publisher host:
 
@@ -65,7 +113,7 @@ Program window intentionally never appears on a monitor. It remains mapped offsc
 - yellow: browser picture-in-picture plus both sources at 50%;
 - blue: muted audio reference.
 
-## 3. Discord receiver measurement
+## 4. Discord receiver measurement
 
 On receiver host, open the publisher stream inside Discord, keep it visible, maximize the stream area, and leave stream sound unmuted. Then run:
 
@@ -95,7 +143,7 @@ Keep voice chat quiet and disable unrelated notification sounds during receiver 
 - High muted RMS: unrelated Discord audio, source-session leak, or mixer mute failure.
 - Publisher passes but receiver fails: local Hooviestar path works; failure lies in Discord selection, share-sound configuration, transport, or receiver playback/capture.
 
-Both JSON files are required evidence for a full Windows-with-Discord qualification. A green CI run alone is not equivalent.
+The full report chain is required evidence. A green CI run alone is not equivalent.
 
 ## One-VM transport layout
 

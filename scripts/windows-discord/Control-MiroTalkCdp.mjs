@@ -2,8 +2,10 @@
 
 const [command, portText] = process.argv.slice(2);
 const port = Number(portText);
-if (!['publisher', 'receiver', 'status'].includes(command) || !Number.isInteger(port)) {
-    console.error('usage: node Control-MiroTalkCdp.mjs <publisher|receiver|status> <port>');
+if (!['publisher', 'receiver', 'receiver-muted', 'stop', 'status'].includes(command) || !Number.isInteger(port)) {
+    console.error(
+        'usage: node Control-MiroTalkCdp.mjs <publisher|receiver|receiver-muted|stop|status> <port>',
+    );
     process.exit(2);
 }
 
@@ -34,12 +36,35 @@ function send(method, params = {}) {
     return new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
 }
 
+let receiverContextId;
+let receiverFrameUrl;
+if (target.url.includes('/viewer')) {
+    const frameTree = await send('Page.getFrameTree');
+    const findReceiverFrame = (tree) => {
+        if (tree.frame.url.includes('/viewer')) return tree.frame;
+        for (const child of tree.childFrames ?? []) {
+            const match = findReceiverFrame(child);
+            if (match) return match;
+        }
+        return undefined;
+    };
+    const receiverFrame = findReceiverFrame(frameTree.frameTree) ?? frameTree.frameTree.frame;
+    receiverFrameUrl = receiverFrame.url;
+    const world = await send('Page.createIsolatedWorld', {
+        frameId: receiverFrame.id,
+        worldName: 'hooviestar-receiver-control',
+        grantUniveralAccess: true,
+    });
+    receiverContextId = world.executionContextId;
+}
+
 async function evaluate(expression, userGesture = false) {
     const result = await send('Runtime.evaluate', {
         expression,
         awaitPromise: true,
         returnByValue: true,
         userGesture,
+        ...(receiverContextId ? { contextId: receiverContextId } : {}),
     });
     if (result.exceptionDetails) throw new Error(result.exceptionDetails.text);
     return result.result.value;
@@ -83,6 +108,7 @@ if (command === 'publisher') {
             window.__hooviestarErrors.push(values.map((value) => String(value)).join(' '));
             originalError(...values);
         };
+        document.querySelector('.swal2-confirm')?.click();
     })()`);
     await evaluate(`document.querySelector('#screenShareStart').click()`, true);
     await delay(3_000);
@@ -96,6 +122,18 @@ if (command === 'publisher') {
         return video.play().catch(() => undefined);
     })()`);
     await delay(3_000);
+} else if (command === 'receiver-muted') {
+    await evaluate(`(() => {
+        document.title = 'Hooviestar MiroTalk Receiver';
+        const video = document.querySelector('#mainVideo');
+        video.muted = true;
+        video.volume = 0;
+        return video.play().catch(() => undefined);
+    })()`);
+    await delay(1_000);
+} else if (command === 'stop') {
+    await evaluate(`document.querySelector('#screenShareStop')?.click()`, true);
+    await delay(1_000);
 }
 
 const status = await evaluate(`(() => {
@@ -128,5 +166,7 @@ const status = await evaluate(`(() => {
         tracks: stream ? stream.getTracks().map(describe) : [],
     };
 })()`);
+status.cdpTargetUrl = target.url;
+if (receiverFrameUrl) status.cdpFrameUrl = receiverFrameUrl;
 socket.close();
 console.log(JSON.stringify(status, null, 2));
