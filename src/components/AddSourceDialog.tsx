@@ -24,29 +24,42 @@ function AddSourceDialogImpl({
 }: AddSourceDialogProps) {
   const [candidates, setCandidates] = useState<SourceCandidate[]>([]);
   const [portalRequired, setPortalRequired] = useState(false);
-  const [sourceLoading, setSourceLoading] = useState(false);
+  const [discoveryLoading, setDiscoveryLoading] = useState(false);
+  const [selectionBusy, setSelectionBusy] = useState(false);
   const [actionBusy, setActionBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const [messageIsError, setMessageIsError] = useState(false);
   const operationBusyRef = useRef(false);
-  const messageIsError = message != null && /nicht verfügbar|fehlgeschlagen|fehler/i.test(message);
+  const operationBusy = selectionBusy || actionBusy;
+  const progressMessage = actionBusy
+    ? "Quelle wird hinzugefügt …"
+    : selectionBusy
+      ? "Auswahl wird geöffnet …"
+      : discoveryLoading
+        ? "Laufende Quellen werden gesucht …"
+        : null;
 
   // Nur beim Mount enumerieren: das Dialog wird bei jeder Öffnung frisch
   // gerendert, daher genügt ein leerer Abhängigkeitsarray.
   useEffect(() => {
     let cancelled = false;
-    setSourceLoading(true);
+    setDiscoveryLoading(true);
     onEnumerate()
       .then((result) => {
         if (cancelled) return;
         setCandidates(result.candidates);
         setPortalRequired(result.portalSelectionRequired);
         setMessage(result.message);
+        setMessageIsError(result.message != null && /nicht verfügbar|fehlgeschlagen|fehler/i.test(result.message));
       })
       .catch((error: unknown) => {
-        if (!cancelled) setMessage(String(error));
+        if (!cancelled) {
+          setMessage(String(error));
+          setMessageIsError(true);
+        }
       })
       .finally(() => {
-        if (!cancelled) setSourceLoading(false);
+        if (!cancelled) setDiscoveryLoading(false);
       });
     return () => {
       cancelled = true;
@@ -61,7 +74,10 @@ function AddSourceDialogImpl({
       if (operationBusyRef.current) return;
       operationBusyRef.current = true;
       setActionBusy(true);
-      void runGuarded(flow, setMessage).finally(() => {
+      void runGuarded(flow, (nextMessage) => {
+        setMessage(nextMessage);
+        setMessageIsError(nextMessage != null);
+      }).finally(() => {
         operationBusyRef.current = false;
         setActionBusy(false);
       });
@@ -71,22 +87,24 @@ function AddSourceDialogImpl({
   async function selectPortalSources() {
     if (operationBusyRef.current) return;
     operationBusyRef.current = true;
-    setSourceLoading(true);
+    setSelectionBusy(true);
     try {
       const result = await onSelectPortal();
       setCandidates(result.candidates);
       setMessage(result.message);
+      setMessageIsError(result.message != null && /nicht verfügbar|fehlgeschlagen|fehler/i.test(result.message));
       setPortalRequired(result.portalSelectionRequired);
     } catch (error) {
       setMessage(String(error));
+      setMessageIsError(true);
     } finally {
       operationBusyRef.current = false;
-      setSourceLoading(false);
+      setSelectionBusy(false);
     }
   }
 
   return (
-    <Dialog open onOpenChange={(open) => !open && !actionBusy && onClose()}>
+    <Dialog open onOpenChange={(open) => !open && !operationBusy && onClose()}>
       <DialogContent className="source-dialog" aria-describedby="add-source-description">
         <header className="modal-header">
           <div>
@@ -99,7 +117,7 @@ function AddSourceDialogImpl({
             type="button"
             className="modal-close"
             aria-label="Quelle hinzufügen schließen"
-            disabled={actionBusy}
+            disabled={operationBusy}
             onClick={onClose}
           >
             ×
@@ -110,13 +128,13 @@ function AddSourceDialogImpl({
           <section className="source-picker-section" aria-labelledby="content-source-heading">
             <h3 id="content-source-heading">Inhalt</h3>
             <div className="source-options">
-              <button type="button" disabled={sourceLoading || actionBusy} onClick={guarded(onAddText)}>
+              <button type="button" autoFocus disabled={operationBusy} onClick={guarded(onAddText)}>
                 <strong>Text</strong><span>Beschriftung direkt in Hooviestar</span>
               </button>
-              <button type="button" disabled={sourceLoading || actionBusy} onClick={guarded(onAddImage)}>
+              <button type="button" disabled={operationBusy} onClick={guarded(onAddImage)}>
                 <strong>Bild</strong><span>PNG, JPEG oder BMP</span>
               </button>
-              <button type="button" disabled={sourceLoading || actionBusy} onClick={guarded(onAddMedia)}>
+              <button type="button" disabled={operationBusy} onClick={guarded(onAddMedia)}>
                 <strong>Medium</strong><span>Video oder Audio aus MP4, MP3, WAV</span>
               </button>
             </div>
@@ -125,19 +143,18 @@ function AddSourceDialogImpl({
           <section className="source-picker-section" aria-labelledby="capture-source-heading">
             <div className="section-heading-row">
               <h3 id="capture-source-heading">Bildschirm &amp; Audio</h3>
-              {sourceLoading && <span role="status">Quellen werden gesucht …</span>}
-              {actionBusy && <span role="status">Wird hinzugefügt …</span>}
+              {progressMessage && <span role="status">{progressMessage}</span>}
             </div>
             <div className="source-options source-options-runtime">
               {portalRequired && (
-                <button type="button" disabled={sourceLoading || actionBusy} onClick={() => void selectPortalSources()}>
+                <button type="button" disabled={discoveryLoading || operationBusy} onClick={() => void selectPortalSources()}>
                   <strong>Fenster oder Monitor auswählen</strong><span>Desktop-Portal öffnen</span>
                 </button>
               )}
               {candidates.map((candidate) => (
                 <button
                   type="button"
-                  disabled={sourceLoading || actionBusy}
+                  disabled={discoveryLoading || operationBusy}
                   key={`${candidate.type}:${candidate.runtimeId}`}
                   onClick={guarded(() => onAddCandidate(candidate))}
                 >
@@ -145,7 +162,7 @@ function AddSourceDialogImpl({
                   <span>{candidate.type === "window" ? "Fenster" : candidate.type === "display" ? "Monitor" : "Anwendungs-Audio"}</span>
                 </button>
               ))}
-              {!sourceLoading && !portalRequired && candidates.length === 0 && (
+              {!discoveryLoading && !portalRequired && candidates.length === 0 && (
                 <p className="source-picker-empty">Keine laufenden Quellen gefunden.</p>
               )}
             </div>
@@ -159,7 +176,7 @@ function AddSourceDialogImpl({
         </div>
 
         <footer className="modal-actions">
-          <button type="button" disabled={actionBusy} onClick={onClose}>Abbrechen</button>
+          <button type="button" disabled={operationBusy} onClick={onClose}>Abbrechen</button>
         </footer>
       </DialogContent>
     </Dialog>

@@ -20,6 +20,9 @@ vi.mock("@tauri-apps/api/core", () => ({
     invokedCommands.push({ command, args });
     if (command === rejectedInvokeCommand) throw new Error("invoke failed");
     if (command === "get_snapshot") return structuredClone(fixture);
+    if (command === "enumerate_sources") {
+      return { candidates: [], portalSelectionRequired: false, message: null };
+    }
     if (command === "dispatch") {
       const dispatched = (args?.command ?? {}) as Record<string, unknown>;
       dispatchedCommands.push(dispatched);
@@ -138,6 +141,18 @@ describe("studio shell", () => {
     await waitFor(() => expect(document.activeElement).toBe(opener));
   });
 
+  it("gibt Fokus nach dem Quellen-Dialog an seinen tatsächlichen Öffner zurück", async () => {
+    await renderStudio();
+    const opener = screen.getByRole("button", { name: "Einrichtung" });
+    (opener as HTMLButtonElement).focus();
+    fireEvent.click(opener);
+    expect(screen.getByRole("dialog", { name: "Quelle hinzufügen" })).toBeTruthy();
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Quelle hinzufügen" })).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(opener));
+  });
+
   it("blendet die native Windows-Vorschau hinter allen Webview-Dialogen aus", async () => {
     const platform = window.navigator.platform;
     const resizeObserver = globalThis.ResizeObserver;
@@ -227,9 +242,35 @@ describe("studio shell", () => {
       expect(screen.getAllByText(source.name).length).toBeGreaterThan(0);
     }
     const unplaced = project.sources.filter((source) => !placedIds.has(source.id));
-    if (unplaced.length > 0) {
-      expect(screen.getAllByText("Nicht in Szene").length).toBe(unplaced.length);
-    }
+    if (unplaced.length > 0) expect(screen.getByText("Weitere Quellen")).toBeTruthy();
+  });
+
+  it("hält seltene Hotkey-Bearbeitung standardmäßig kompakt", async () => {
+    await renderStudio();
+    const details = screen.getByText("Hotkey bearbeiten").closest("details") as HTMLDetailsElement;
+    expect(details.open).toBe(false);
+    fireEvent.click(screen.getByText("Hotkey bearbeiten"));
+    expect(details.open).toBe(true);
+    expect(screen.getByLabelText(`Hotkey für ${project.scenes[0]!.name}`)).toBeTruthy();
+  });
+
+  it("benennt die ausgewählte Quelle direkt im Eigenschaften-Dock um", async () => {
+    await renderStudio();
+    const source = placedSource();
+    fireEvent.click(placedSourceRowButton());
+    const name = screen.getByRole("textbox", { name: "Quellenname" });
+    fireEvent.change(name, { target: { value: "   " } });
+    fireEvent.blur(name);
+    expect(screen.getByText("Quellenname darf nicht leer sein.")).toBeTruthy();
+    expect(dispatchedCommands.filter((command) => command.type === "update_source")).toHaveLength(0);
+
+    fireEvent.change(name, { target: { value: "Gameplay" } });
+    fireEvent.blur(name);
+
+    await waitFor(() => expect(dispatchedCommands).toContainEqual({
+      type: "update_source",
+      source: { ...source, name: "Gameplay" },
+    }));
   });
 
   it("bietet Szenenumbenennung als sichtbare Tastaturaktion an", async () => {

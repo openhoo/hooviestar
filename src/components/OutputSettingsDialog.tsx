@@ -90,6 +90,7 @@ export function OutputSettingsDialog({ open, output, onOpenChange, onApply }: Ou
               <span>Auflösung</span>
               <select
                 id="output-resolution"
+                autoFocus
                 value={outputResolutionValue(draft)}
                 onChange={(event) => changeResolution(event.currentTarget.value)}
               >

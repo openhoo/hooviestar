@@ -135,22 +135,28 @@ function ScenesPanelImpl({
           </li>
         ))}
       </ol>
-      <form className="hotkey-editor" onSubmit={onSaveHotkey}>
-        <label htmlFor="scene-hotkey">Szenenhotkey · {activeScene.name}</label>
-        <div>
-          <input
-            id="scene-hotkey"
-            name="hotkey"
-            key={`${activeScene.id}:${activeScene.hotkey ?? ""}`}
-            defaultValue={activeScene.hotkey ?? ""}
-            placeholder="Ctrl+Alt+1"
-            autoComplete="off"
-          />
-          <button type="submit">Setzen</button>
-        </div>
-        {hotkeyMessage && <p role="alert">{hotkeyMessage}</p>}
-      </form>
-      {sceneError && <p role="alert">{sceneError}</p>}
+      <details className="hotkey-settings" key={activeScene.id}>
+        <summary>
+          <span>Hotkey bearbeiten</span>
+          <kbd>{activeScene.hotkey ?? "Nicht gesetzt"}</kbd>
+        </summary>
+        <form className="hotkey-editor" onSubmit={onSaveHotkey}>
+          <label htmlFor="scene-hotkey">Hotkey für {activeScene.name}</label>
+          <div>
+            <input
+              id="scene-hotkey"
+              name="hotkey"
+              key={`${activeScene.id}:${activeScene.hotkey ?? ""}`}
+              defaultValue={activeScene.hotkey ?? ""}
+              placeholder="Ctrl+Alt+1"
+              autoComplete="off"
+            />
+            <button type="submit">Setzen</button>
+          </div>
+          {hotkeyMessage && <p role="alert">{hotkeyMessage}</p>}
+        </form>
+      </details>
+      {sceneError && <p className="dock-message" role="alert">{sceneError}</p>}
     </nav>
   );
 }

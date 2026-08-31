@@ -93,6 +93,18 @@ button:disabled {
   background: #6d63f280;
 }
 
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .loading {
   height: 100vh;
   height: 100dvh;
@@ -488,13 +500,57 @@ kbd {
   box-shadow: 0 0 0 2px var(--accent-soft);
 }
 
-.hotkey-editor {
+.hotkey-settings {
   flex: none;
+  background: #0f1216;
+  border-top: 1px solid var(--border);
+}
+
+.hotkey-settings summary {
+  min-height: 34px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 8px;
+  color: var(--subtle);
+  cursor: pointer;
+  font-size: 10px;
+  list-style: none;
+}
+
+.hotkey-settings summary::-webkit-details-marker {
+  display: none;
+}
+
+.hotkey-settings summary::after {
+  content: "⌄";
+  color: var(--subtle);
+  font-size: 12px;
+  transform: translateY(-1px);
+}
+
+.hotkey-settings[open] summary {
+  border-bottom: 1px solid var(--border);
+}
+
+.hotkey-settings[open] summary::after {
+  transform: rotate(180deg) translateY(-1px);
+}
+
+.hotkey-settings summary:hover {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+
+.hotkey-settings summary kbd {
+  max-width: 90px;
+}
+
+.hotkey-editor {
   display: grid;
   gap: 5px;
   padding: 8px;
-  background: #0f1216;
-  border-top: 1px solid var(--border);
 }
 
 .hotkey-editor label {
@@ -546,6 +602,25 @@ kbd {
   display: flex;
   flex-direction: column;
   gap: 2px;
+}
+
+.source-list-divider {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 5px 4px 2px;
+  padding: 7px 4px 2px;
+  color: var(--subtle);
+  border-top: 1px solid var(--border);
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.source-list-divider span:last-child {
+  font-variant-numeric: tabular-nums;
 }
 
 .source-row {
@@ -625,7 +700,6 @@ kbd {
   min-height: 25px;
 }
 
-.badge,
 .placement-badge,
 .output-badge {
   flex: none;
@@ -634,15 +708,6 @@ kbd {
   border: 1px solid var(--border-strong);
   border-radius: 999px;
   white-space: nowrap;
-}
-
-.badge {
-  max-width: 88px;
-  margin-right: 6px;
-  overflow: hidden;
-  padding: 2px 6px;
-  font-size: 9px;
-  text-overflow: ellipsis;
 }
 
 .dock-message {
@@ -963,13 +1028,32 @@ input.fader,
   min-width: 0;
 }
 
-.source-summary h3 {
-  margin: 0 0 2px;
+.source-name-field {
+  display: block;
+}
+
+.source-name-input {
+  height: 26px;
+  margin: -4px 0 0 -5px;
+  padding: 3px 5px !important;
   overflow: hidden;
+  color: var(--text) !important;
+  background: transparent !important;
+  border-color: transparent !important;
   font-size: 12px;
   font-weight: 650;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.source-name-input:hover,
+.source-name-input:focus-visible {
+  background: var(--bg) !important;
+  border-color: var(--border-strong) !important;
+}
+
+.source-name-input[aria-invalid="true"] {
+  border-color: var(--danger) !important;
 }
 
 .source-summary p {
@@ -1010,6 +1094,34 @@ input.fader,
   font-weight: 750;
   letter-spacing: 0.09em;
   text-transform: uppercase;
+}
+
+.source-details {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+}
+
+.source-details > div {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 68px minmax(0, 1fr);
+  gap: 8px;
+}
+
+.source-details dt {
+  color: var(--subtle);
+  font-size: 9px;
+}
+
+.source-details dd {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .properties label,

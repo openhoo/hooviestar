@@ -21,6 +21,7 @@ describe("OutputSettingsDialog", () => {
     render(<OutputSettingsDialog open output={initial} onApply={onApply} onOpenChange={onOpenChange} />);
 
     expect(screen.getByRole("dialog", { name: "Ausgabe-Einstellungen" })).toBeTruthy();
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByLabelText("Auflösung")));
     expect((screen.getByRole("button", { name: "Anwenden" }) as HTMLButtonElement).disabled).toBe(true);
 
     fireEvent.change(screen.getByLabelText("Auflösung"), { target: { value: "1920x1080" } });

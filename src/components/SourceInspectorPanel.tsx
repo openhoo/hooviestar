@@ -1,4 +1,4 @@
-import { memo } from "react";
+import { memo, useEffect, useState } from "react";
 import type { MediaRuntimeState, SceneItem, Source, TextSource } from "../types";
 import { MediaInspector } from "./MediaInspector";
 
@@ -27,6 +27,41 @@ const SOURCE_TYPE_LABELS: Record<Source["type"], string> = {
   application_audio: "Anwendungs-Audio",
 };
 
+interface SourceDetail {
+  label: string;
+  value: string;
+  title?: string;
+}
+
+function fileName(path: string): string {
+  return path.split(/[\\/]/).pop() || path;
+}
+
+function sourceDetails(source: Source): SourceDetail[] {
+  switch (source.type) {
+    case "window":
+      return [
+        { label: "Fenster", value: source.binding.windowTitle },
+        { label: "Anwendung", value: fileName(source.binding.processPath), title: source.binding.processPath },
+      ];
+    case "display":
+      return [
+        { label: "Output-ID", value: String(source.binding.outputId) },
+        { label: "Adapter", value: source.binding.adapterLuid },
+      ];
+    case "image":
+    case "media":
+      return [{ label: "Datei", value: fileName(source.path), title: source.path }];
+    case "application_audio":
+      return [
+        { label: "Anwendung", value: fileName(source.binding.processPath), title: source.binding.processPath },
+        { label: "Sitzung", value: source.binding.sessionGroupingId },
+      ];
+    case "text":
+      return [];
+  }
+}
+
 function SourceInspectorPanelImpl({
   selectedSource,
   selectedItem,
@@ -39,6 +74,32 @@ function SourceInspectorPanelImpl({
   onSeek,
   onSetPlaying,
 }: SourceInspectorPanelProps) {
+  const [sourceNameError, setSourceNameError] = useState<string | null>(null);
+  const details = selectedSource ? sourceDetails(selectedSource) : [];
+
+  useEffect(() => setSourceNameError(null), [selectedSource?.id]);
+
+  function commitSourceName(event: React.FocusEvent<HTMLInputElement>) {
+    if (!selectedSource) return;
+    const input = event.currentTarget;
+    const name = input.value.trim();
+    setSourceNameError(null);
+    if (!name) {
+      input.value = selectedSource.name;
+      setSourceNameError("Quellenname darf nicht leer sein.");
+      return;
+    }
+    if (name === selectedSource.name) {
+      input.value = selectedSource.name;
+      return;
+    }
+    void onUpdateSource(selectedSource.id, { name }).catch((error: unknown) => {
+      if (!input.isConnected) return;
+      input.value = selectedSource.name;
+      setSourceNameError(`Quellenname konnte nicht gespeichert werden: ${String(error)}`);
+    });
+  }
+
   return (
     <aside className="dock inspector-dock" aria-label="Eigenschaften">
       <div className="dock-title">
@@ -49,13 +110,48 @@ function SourceInspectorPanelImpl({
           <header className="source-summary">
             <span className="source-avatar" aria-hidden="true">{selectedSource.name.slice(0, 1).toUpperCase()}</span>
             <div>
-              <h3 title={selectedSource.name}>{selectedSource.name}</h3>
+              <label className="source-name-field">
+                <span className="sr-only">Quellenname</span>
+                <input
+                  key={`${selectedSource.id}:${selectedSource.name}`}
+                  className="source-name-input"
+                  defaultValue={selectedSource.name}
+                  aria-label="Quellenname"
+                  aria-invalid={sourceNameError ? true : undefined}
+                  aria-describedby={sourceNameError ? "source-name-error" : undefined}
+                  onBlur={commitSourceName}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      event.currentTarget.blur();
+                    } else if (event.key === "Escape") {
+                      event.preventDefault();
+                      event.currentTarget.value = selectedSource.name;
+                      event.currentTarget.blur();
+                    }
+                  }}
+                />
+              </label>
               <p>{SOURCE_TYPE_LABELS[selectedSource.type]}</p>
             </div>
             <span className={selectedItem ? "placement-badge" : "placement-badge detached"}>
               {selectedItem ? "In Szene" : "Nicht in Szene"}
             </span>
           </header>
+          {sourceNameError && <p id="source-name-error" className="source-message" role="alert">{sourceNameError}</p>}
+          {details.length > 0 && (
+            <section className="property-group">
+              <h3>Quelle</h3>
+              <dl className="source-details">
+                {details.map((detail) => (
+                  <div key={detail.label}>
+                    <dt>{detail.label}</dt>
+                    <dd title={detail.title}>{detail.value}</dd>
+                  </div>
+                ))}
+              </dl>
+            </section>
+          )}
           {selectedSource.type === "text" && (
             <section className="property-group">
               <h3>Inhalt</h3>

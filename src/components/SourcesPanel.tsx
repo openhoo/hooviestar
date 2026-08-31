@@ -1,4 +1,4 @@
-import { memo, useMemo, useRef } from "react";
+import { Fragment, memo, useMemo, useRef } from "react";
 import type { SceneItem, Source } from "../types";
 import type { ItemAction } from "./SourceInspectorPanel";
 import { useArmedConfirm } from "../hooks/useArmedConfirm";
@@ -98,6 +98,9 @@ function SourcesPanelImpl({
 
   const removeClassName = armed ? "icon-button armed" : "icon-button";
   const removeTitle = armed ? "Erneut klicken zum Entfernen" : "Ausgewählte Quelle entfernen";
+  const firstUnplacedIndex = rows.findIndex((row) => !row.itemId);
+  const placedCount = firstUnplacedIndex === -1 ? rows.length : firstUnplacedIndex;
+  const unplacedCount = rows.length - placedCount;
 
   return (
     <section className="dock sources-dock" aria-label="Quellen">
@@ -134,26 +137,33 @@ function SourcesPanelImpl({
         <p className="empty">Keine Quellen in dieser Szene.</p>
       ) : (
         <ul className="sources-list">
-          {rows.map((row) => {
+          {rows.map((row, index) => {
             const { source, itemId, visible, locked, canMoveUp, canMoveDown } = row;
             const selected = source.id === selectedSourceId;
             return (
-              <li key={row.key}>
-                <div className={selected ? "source-row selected" : "source-row"}>
-                  <button
-                    type="button"
-                    className="source-main"
-                    aria-current={selected ? "true" : undefined}
-                    onClick={() => onSelectSource(source.id)}
-                  >
-                    <span className="source-glyph">
-                      <SourceGlyph />
-                    </span>
-                    <span className="source-name" title={source.name}>
-                      {source.name}
-                    </span>
-                  </button>
-                  {itemId ? (
+              <Fragment key={row.key}>
+                {index === firstUnplacedIndex && (
+                  <li className="source-list-divider">
+                    <span>{placedCount > 0 ? "Weitere Quellen" : "Nicht in dieser Szene"}</span>
+                    <span>{unplacedCount}</span>
+                  </li>
+                )}
+                <li>
+                  <div className={selected ? "source-row selected" : "source-row"}>
+                    <button
+                      type="button"
+                      className="source-main"
+                      aria-current={selected ? "true" : undefined}
+                      onClick={() => onSelectSource(source.id)}
+                    >
+                      <span className="source-glyph">
+                        <SourceGlyph />
+                      </span>
+                      <span className="source-name" title={source.name}>
+                        {source.name}
+                      </span>
+                    </button>
+                    {itemId && (
                     <span className="row-actions">
                       <button
                         type="button"
@@ -194,11 +204,10 @@ function SourcesPanelImpl({
                         <ArrowDownIcon />
                       </button>
                     </span>
-                  ) : (
-                    <span className="badge">Nicht in Szene</span>
-                  )}
-                </div>
-              </li>
+                    )}
+                  </div>
+                </li>
+              </Fragment>
             );
           })}
         </ul>

@@ -99,6 +99,7 @@ export default function App() {
   } = useAudioFieldBridge(pendingSourceFieldsRef, sourceMutationQueueRef.current);
   const [textError, setTextError] = useState<string | null>(null);
   const addButton = useRef<HTMLButtonElement>(null);
+  const addDialogTriggerRef = useRef<HTMLElement | null>(null);
   // Native-Vorschau: das Element überlebt Projekt-Updates; Beobachter und
   // Meldung werden genau einmal eingerichtet (siehe attachPreviewBounds).
   const previewNodeRef = useRef<HTMLDivElement | null>(null);
@@ -433,22 +434,30 @@ export default function App() {
     [],
   );
 
-  const closeDialog = useCallback(() => {
-    setAddOpen(false);
-    requestAnimationFrame(() => addButton.current?.focus());
-  }, []);
-
   const dismissOnboarding = useCallback(() => {
     onboardingDismissedRef.current = true;
     setOnboarding(false);
   }, []);
 
+  const openAddDialog = useCallback(() => {
+    const activeElement = document.activeElement;
+    addDialogTriggerRef.current = activeElement instanceof HTMLElement ? activeElement : null;
+    setAddOpen(true);
+  }, []);
+
+  const closeDialog = useCallback(() => {
+    const trigger = addDialogTriggerRef.current;
+    addDialogTriggerRef.current = null;
+    setAddOpen(false);
+    requestAnimationFrame(() => {
+      (trigger?.isConnected ? trigger : addButton.current)?.focus();
+    });
+  }, []);
+
   const startOnboarding = useCallback(() => {
     dismissOnboarding();
-    setAddOpen(true);
-  }, [dismissOnboarding]);
-
-  const openAddDialog = useCallback(() => setAddOpen(true), []);
+    openAddDialog();
+  }, [dismissOnboarding, openAddDialog]);
 
   // Auswahl wechselt die Quelle und verwirft alte Fehlermeldungen der
   // vorherigen Auswahl, damit sie nicht dem neuen Kontext zugeordnet werden.
