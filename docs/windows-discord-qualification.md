@@ -16,7 +16,7 @@ Publisher probe fails unless all checks pass:
 - Four scenes switch to distinct magenta, cyan, yellow, and blue render markers. Geometry checks distinguish full-screen, cropped, and rotated picture-in-picture layouts.
 - Program and Preview deliver sustained D3D11-composited motion. A single changed frame is insufficient.
 - Live scene commands hide/show the source, reorder text across texture layers, move it into picture-in-picture, and restore the original layout without restarting the renderer.
-- Two complete 1280×720/30 to 1920×1080/60 to 1280×720/30 cycles must emit the exact recovery events and keep rendering. Internal render cadence proves the 60 fps preset scales; external WGC cadence separately proves DWM capture health.
+- Two complete 1280×720/30 to 1920×1080/60 to 1280×720/30 cycles must emit the exact recovery events and keep rendering. The cross-profiles 1280×720/60 and 1920×1080/30 also run with distinct background colors, sustained Program and Preview motion, target-matched internal cadence, and healthy external WGC cadence. This covers every independently selectable output setting.
 - Twenty-four rapid scene/audio transitions must recover to the requested final state.
 - WASAPI process loopback captures browser audio and an independent 440 Hz process. Every measured stage records sample count, RMS, peak, DC offset, clipped-sample ratio, crest factor, and spectral amplitudes.
 - Per-source volume and mute isolate both tones, verify actual 50% gain, contain both tones in the mix, impose an absolute mute ceiling, and recover after mute.

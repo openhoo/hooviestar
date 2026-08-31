@@ -69,7 +69,7 @@ function MediaInspectorImpl({ source, mediaState, onUpdateSource, onSeek, onSetP
 
   return (
     <div className="media-controls">
-      <button onClick={togglePlaying}>{mediaState?.playing === false ? "Wiedergabe" : "Pause"}</button>
+      <button type="button" onClick={togglePlaying}>{mediaState?.playing === false ? "Wiedergabe" : "Pause"}</button>
       <label>Position (Sekunden)<input type="number" min="0" step="1" value={positionEditing ? positionDraft : Math.round(mediaState?.positionSeconds ?? 0)} onFocus={focusPosition} onChange={draftPosition} onKeyDown={submitPositionOnEnter} onBlur={commitPosition} /></label>
       {positionError && <p role="alert" className="source-message">{positionError}</p>}
       {actionError && <p role="alert" className="source-message">{actionError}</p>}

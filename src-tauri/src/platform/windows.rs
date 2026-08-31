@@ -5,9 +5,9 @@ use windows::{
         Foundation::HWND,
         UI::WindowsAndMessaging::{
             CreateWindowExW, DestroyWindow, GetSystemMetrics, HWND_BOTTOM, HWND_TOP,
-            SM_CXVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE,
-            SWP_SHOWWINDOW, SetWindowPos, WINDOW_EX_STYLE, WS_CHILD, WS_CLIPCHILDREN,
-            WS_CLIPSIBLINGS, WS_VISIBLE,
+            SM_CXVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_HIDEWINDOW,
+            SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowPos,
+            WINDOW_EX_STYLE, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
         },
     },
     core::w,
@@ -186,6 +186,26 @@ pub fn set_preview_bounds(
             width,
             height,
             SWP_NOACTIVATE,
+        )
+    }
+    .map_err(|error| error.to_string())
+}
+
+pub fn set_preview_visible(hwnd: usize, visible: bool) -> Result<(), String> {
+    let visibility = if visible {
+        SWP_SHOWWINDOW
+    } else {
+        SWP_HIDEWINDOW
+    };
+    unsafe {
+        SetWindowPos(
+            HWND(hwnd as *mut _),
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | visibility,
         )
     }
     .map_err(|error| error.to_string())

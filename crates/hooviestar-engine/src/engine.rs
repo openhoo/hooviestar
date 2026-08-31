@@ -639,7 +639,7 @@ fn apply(p: &mut ProjectV1, c: EngineCommand) -> Result<(), EngineError> {
             }
             item.transform = transform
         }
-        EngineCommand::SetOutputConfig { output } => p.output = output,
+        EngineCommand::SetOutputConfig { output } => apply_output_config(p, output),
         // Reine Laufzeitbefehle werden in command() vor apply() abgefertigt;
         // dieser Arm bleibt nur fuer die Match-Vollstaendigkeit bestehen.
         EngineCommand::SetMediaPlaying { .. } | EngineCommand::MediaSeek { .. } => {}
@@ -671,6 +671,31 @@ fn apply(p: &mut ProjectV1, c: EngineCommand) -> Result<(), EngineError> {
         }
     }
     Ok(())
+}
+
+/// Output-Abmessungen bilden zugleich das Koordinatensystem aller Szenen.
+/// Ein Wechsel skaliert deshalb jedes Item proportional. Die Mutation bleibt
+/// Teil desselben validierten/persistierten Engine-Commits wie `output` und
+/// greift auch für gesperrte Items, deren Layoutschutz nur Nutzeraktionen gilt.
+fn apply_output_config(project: &mut ProjectV1, output: OutputConfig) {
+    let scale_x = output.width as f32 / project.output.width as f32;
+    let scale_y = output.height as f32 / project.output.height as f32;
+    if output.width != project.output.width || output.height != project.output.height {
+        for scene in &mut project.scenes {
+            for item in &mut scene.items {
+                let transform = &mut item.transform;
+                transform.x *= scale_x;
+                transform.width *= scale_x;
+                transform.crop_left *= scale_x;
+                transform.crop_right *= scale_x;
+                transform.y *= scale_y;
+                transform.height *= scale_y;
+                transform.crop_top *= scale_y;
+                transform.crop_bottom *= scale_y;
+            }
+        }
+    }
+    project.output = output;
 }
 
 #[cfg(test)]
@@ -1883,5 +1908,107 @@ mod tests {
             Err(EngineError::InvalidProject(message))
                 if message == "source has no audio"
         ));
+    }
+
+    #[test]
+    fn output_resize_scales_every_scene_item_and_preserves_non_geometry_fields() {
+        let mut project = ProjectV1::empty();
+        let source_id = Uuid::new_v4();
+        project.sources.push(Source::Image {
+            id: source_id,
+            name: "Bild".into(),
+            path: "/tmp/image.png".into(),
+        });
+        for (index, scene) in project.scenes.iter_mut().enumerate() {
+            scene.items.push(SceneItem {
+                id: Uuid::new_v4(),
+                source_id,
+                visible: index != 1,
+                locked: index == 2,
+                transform: Transform {
+                    x: -20.0,
+                    y: 40.0,
+                    width: 640.0,
+                    height: 360.0,
+                    rotation_degrees: 17.0,
+                    crop_top: 4.0,
+                    crop_right: 8.0,
+                    crop_bottom: 12.0,
+                    crop_left: 16.0,
+                    opacity: 0.75,
+                },
+            });
+        }
+
+        apply(
+            &mut project,
+            EngineCommand::SetOutputConfig {
+                output: OutputConfig {
+                    width: 1920,
+                    height: 1080,
+                    fps: 60,
+                    background: "#223344".into(),
+                },
+            },
+        )
+        .unwrap();
+        project.validate().unwrap();
+
+        assert_eq!(project.output.width, 1920);
+        for (index, scene) in project.scenes.iter().enumerate() {
+            let item = &scene.items[0];
+            assert_eq!((item.visible, item.locked), (index != 1, index == 2));
+            assert_eq!(item.transform.x, -30.0);
+            assert_eq!(item.transform.y, 60.0);
+            assert_eq!(item.transform.width, 960.0);
+            assert_eq!(item.transform.height, 540.0);
+            assert_eq!(item.transform.crop_top, 6.0);
+            assert_eq!(item.transform.crop_right, 12.0);
+            assert_eq!(item.transform.crop_bottom, 18.0);
+            assert_eq!(item.transform.crop_left, 24.0);
+            assert_eq!(item.transform.rotation_degrees, 17.0);
+            assert_eq!(item.transform.opacity, 0.75);
+        }
+    }
+
+    #[test]
+    fn fps_and_background_changes_do_not_move_scene_items() {
+        let mut project = ProjectV1::empty();
+        let source_id = Uuid::new_v4();
+        let transform = Transform {
+            x: 12.5,
+            y: -7.25,
+            width: 500.0,
+            height: 281.25,
+            ..Transform::default()
+        };
+        project.sources.push(Source::Image {
+            id: source_id,
+            name: "Bild".into(),
+            path: "/tmp/image.png".into(),
+        });
+        project.scenes[0].items.push(SceneItem {
+            id: Uuid::new_v4(),
+            source_id,
+            visible: true,
+            locked: false,
+            transform,
+        });
+
+        apply(
+            &mut project,
+            EngineCommand::SetOutputConfig {
+                output: OutputConfig {
+                    width: 1280,
+                    height: 720,
+                    fps: 60,
+                    background: "#abcdef".into(),
+                },
+            },
+        )
+        .unwrap();
+
+        assert_eq!(project.scenes[0].items[0].transform, transform);
+        project.validate().unwrap();
     }
 }

@@ -11,10 +11,14 @@ import fixture from "../contracts/project-v1.json";
 import { parseProjectV1 } from "./types";
 
 const dispatchedCommands: Array<Record<string, unknown>> = [];
+const invokedCommands: Array<{ command: string; args?: Record<string, unknown> }> = [];
 let rejectedDispatchType: string | null = null;
+let rejectedInvokeCommand: string | null = null;
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(async (command: string, args?: Record<string, unknown>) => {
+    invokedCommands.push({ command, args });
+    if (command === rejectedInvokeCommand) throw new Error("invoke failed");
     if (command === "get_snapshot") return structuredClone(fixture);
     if (command === "dispatch") {
       const dispatched = (args?.command ?? {}) as Record<string, unknown>;
@@ -73,20 +77,123 @@ function placedSourceRowButton(): HTMLButtonElement {
 describe("studio shell", () => {
   beforeEach(() => {
     dispatchedCommands.length = 0;
+    invokedCommands.length = 0;
     rejectedDispatchType = null;
+    rejectedInvokeCommand = null;
   });
   afterEach(cleanup);
 
-  it("rendert die OBS-Docks Szenen, Quellen, Audio-Mixer, Eigenschaften und Steuerpult", async () => {
+  it("ordnet Szenen und Quellen links, Program und Mixer mittig sowie Eigenschaften rechts an", async () => {
     await renderStudio();
-    for (const dock of ["Szenen", "Quellen", "Audio-Mixer", "Eigenschaften", "Steuerpult"]) {
+    for (const dock of ["Szenen", "Quellen", "Audio-Mixer", "Eigenschaften", project.scenes[0]!.name]) {
       expect(screen.getByRole("heading", { name: dock })).toBeTruthy();
     }
+    expect(screen.queryByRole("heading", { name: "Steuerpult" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Studio beenden" })).toBeTruthy();
     const counts = screen.getByText((_, element) =>
       element?.classList.contains("status-item") === true &&
       /\b\d+ (Szene|Szenen) · \d+ (Quelle|Quellen)\b/.test(element.textContent ?? ""),
     );
     expect(counts).toBeTruthy();
+  });
+
+  it("öffnet Ausgabe-Einstellungen und dispatcht die vollständige Auswahl genau einmal", async () => {
+    await renderStudio();
+    fireEvent.click(screen.getByRole("button", { name: "Ausgabe-Einstellungen öffnen" }));
+    expect(screen.getByRole("dialog", { name: "Ausgabe-Einstellungen" })).toBeTruthy();
+
+    fireEvent.change(screen.getByLabelText("Auflösung"), { target: { value: "1920x1080" } });
+    fireEvent.change(screen.getByLabelText("Bildrate"), { target: { value: "60" } });
+    fireEvent.change(screen.getByLabelText("Hintergrundfarbe"), { target: { value: "#224466" } });
+    fireEvent.click(screen.getByRole("button", { name: "Anwenden" }));
+
+    await waitFor(() => expect(dispatchedCommands.filter((command) => command.type === "set_output_config")).toEqual([
+      {
+        type: "set_output_config",
+        output: { width: 1920, height: 1080, fps: 60, background: "#224466" },
+      },
+    ]));
+  });
+
+  it("zeigt einen fehlgeschlagenen Output-Commit im offenen Dialog", async () => {
+    await renderStudio();
+    rejectedDispatchType = "set_output_config";
+    fireEvent.click(screen.getByRole("button", { name: "Ausgabe-Einstellungen öffnen" }));
+    fireEvent.change(screen.getByLabelText("Bildrate"), { target: { value: "60" } });
+    fireEvent.click(screen.getByRole("button", { name: "Anwenden" }));
+
+    expect(await screen.findByText(/Einstellungen konnten nicht angewendet werden: Error: dispatch failed/)).toBeTruthy();
+    expect(screen.getByRole("dialog", { name: "Ausgabe-Einstellungen" })).toBeTruthy();
+  });
+
+  it("schließt Settings per Escape und gibt Fokus an den Öffner zurück", async () => {
+    await renderStudio();
+    const opener = screen.getByRole("button", { name: "Ausgabe-Einstellungen öffnen" });
+    (opener as HTMLButtonElement).focus();
+    fireEvent.click(opener);
+    expect(screen.getByRole("dialog", { name: "Ausgabe-Einstellungen" })).toBeTruthy();
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Ausgabe-Einstellungen" })).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(opener));
+  });
+
+  it("blendet die native Windows-Vorschau hinter allen Webview-Dialogen aus", async () => {
+    const platform = window.navigator.platform;
+    const resizeObserver = globalThis.ResizeObserver;
+    Object.defineProperty(window.navigator, "platform", { configurable: true, value: "Win32" });
+    globalThis.ResizeObserver = class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    } as unknown as typeof ResizeObserver;
+    try {
+      await renderStudio();
+      fireEvent.click(screen.getByRole("button", { name: "Ausgabe-Einstellungen öffnen" }));
+      await waitFor(() => expect(invokedCommands).toContainEqual({
+        command: "set_preview_visible",
+        args: { visible: false },
+      }));
+
+      fireEvent.keyDown(document, { key: "Escape" });
+      await waitFor(() => expect(invokedCommands).toContainEqual({
+        command: "set_preview_visible",
+        args: { visible: true },
+      }));
+
+      const hiddenBeforeSourceDialog = invokedCommands.filter(({ command, args }) =>
+        command === "set_preview_visible" && args?.visible === false
+      ).length;
+      fireEvent.click(screen.getByRole("button", { name: "Quelle hinzufügen" }));
+      expect(screen.getByRole("dialog", { name: "Quelle hinzufügen" })).toBeTruthy();
+      await waitFor(() => expect(invokedCommands.filter(({ command, args }) =>
+        command === "set_preview_visible" && args?.visible === false
+      )).toHaveLength(hiddenBeforeSourceDialog + 1));
+    } finally {
+      Object.defineProperty(window.navigator, "platform", { configurable: true, value: platform });
+      if (resizeObserver) globalThis.ResizeObserver = resizeObserver;
+      else delete (globalThis as { ResizeObserver?: typeof ResizeObserver }).ResizeObserver;
+    }
+  });
+
+  it("maskiert einen Windows-Preview-Visibility-Fehler nicht durch erfolgreiche Bounds", async () => {
+    const platform = window.navigator.platform;
+    const resizeObserver = globalThis.ResizeObserver;
+    Object.defineProperty(window.navigator, "platform", { configurable: true, value: "Win32" });
+    globalThis.ResizeObserver = class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    } as unknown as typeof ResizeObserver;
+    rejectedInvokeCommand = "set_preview_visible";
+    try {
+      await renderStudio();
+      expect(await screen.findByText(/Vorschaufehler: Error: invoke failed/)).toBeTruthy();
+    } finally {
+      Object.defineProperty(window.navigator, "platform", { configurable: true, value: platform });
+      if (resizeObserver) globalThis.ResizeObserver = resizeObserver;
+      else delete (globalThis as { ResizeObserver?: typeof ResizeObserver }).ResizeObserver;
+    }
   });
 
   it("wechselt die Szene über das Szenen-Dock per set_active_scene", async () => {
@@ -121,8 +228,22 @@ describe("studio shell", () => {
     }
     const unplaced = project.sources.filter((source) => !placedIds.has(source.id));
     if (unplaced.length > 0) {
-      expect(screen.getAllByText("außerhalb der Szene").length).toBe(unplaced.length);
+      expect(screen.getAllByText("Nicht in Szene").length).toBe(unplaced.length);
     }
+  });
+
+  it("bietet Szenenumbenennung als sichtbare Tastaturaktion an", async () => {
+    await renderStudio();
+    const scene = project.scenes[0]!;
+    fireEvent.click(screen.getByRole("button", { name: `Szene „${scene.name}“ umbenennen` }));
+    const input = screen.getByRole("textbox", { name: `Szene „${scene.name}“ umbenennen` });
+    fireEvent.change(input, { target: { value: "Neue Szene" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(dispatchedCommands).toContainEqual({
+      type: "rename_scene",
+      sceneId: scene.id,
+      name: "Neue Szene",
+    }));
   });
 
   it("armiert die Quellen-Entfernung und entschärft bei pointerdown außerhalb", async () => {

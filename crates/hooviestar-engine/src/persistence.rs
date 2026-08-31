@@ -361,6 +361,22 @@ mod tests {
     }
 
     #[test]
+    fn user_output_settings_survive_atomic_save_and_reload() {
+        let (_directory, path) = temp_project_path();
+        let mut project = ProjectV1::empty();
+        project.output.width = 1920;
+        project.output.height = 1080;
+        project.output.fps = 30;
+        project.output.background = "#224466".into();
+
+        save_atomic(&path, &project).unwrap();
+        let (loaded, corrupt_backup) = load_or_default(&path).unwrap();
+
+        assert_eq!(loaded.output, project.output);
+        assert!(corrupt_backup.is_none());
+    }
+
+    #[test]
     fn debounce_flushes_latest_project() {
         let (_directory, path) = temp_project_path();
         let (store, _, _) = ProjectStore::start(path.clone()).unwrap();

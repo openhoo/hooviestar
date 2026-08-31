@@ -1,6 +1,7 @@
 import { memo, useEffect, useRef, useState } from "react";
 import type { SourceCandidate, SourceEnumeration } from "../types";
 import { runGuarded } from "../guarded";
+import { Dialog, DialogContent, DialogDescription, DialogTitle } from "./ui/Dialog";
 
 interface AddSourceDialogProps {
   onAddText: () => Promise<void>;
@@ -26,8 +27,8 @@ function AddSourceDialogImpl({
   const [sourceLoading, setSourceLoading] = useState(false);
   const [actionBusy, setActionBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
-  const dialogRef = useRef<HTMLElement>(null);
   const operationBusyRef = useRef(false);
+  const messageIsError = message != null && /nicht verfügbar|fehlgeschlagen|fehler/i.test(message);
 
   // Nur beim Mount enumerieren: das Dialog wird bei jeder Öffnung frisch
   // gerendert, daher genügt ein leerer Abhängigkeitsarray.
@@ -47,9 +48,6 @@ function AddSourceDialogImpl({
       .finally(() => {
         if (!cancelled) setSourceLoading(false);
       });
-    requestAnimationFrame(() => {
-      dialogRef.current?.querySelector<HTMLElement>("button")?.focus();
-    });
     return () => {
       cancelled = true;
     };
@@ -87,49 +85,84 @@ function AddSourceDialogImpl({
     }
   }
 
-  function trapDialogKeys(event: React.KeyboardEvent<HTMLElement>) {
-    if (event.key === "Escape") {
-      event.preventDefault();
-      onClose();
-      return;
-    }
-    if (event.key !== "Tab") return;
-    const controls = Array.from(
-      event.currentTarget.querySelectorAll<HTMLElement>("button:not(:disabled), input:not(:disabled)"),
-    );
-    if (controls.length === 0) return;
-    const first = controls[0]!;
-    const last = controls[controls.length - 1]!;
-    if (event.shiftKey && document.activeElement === first) {
-      event.preventDefault();
-      last.focus();
-    } else if (!event.shiftKey && document.activeElement === last) {
-      event.preventDefault();
-      first.focus();
-    }
-  }
-
   return (
-    <div className="dialog-backdrop" role="presentation">
-      <section ref={dialogRef} className="dialog" role="dialog" aria-modal="true" aria-labelledby="add-title" onKeyDown={trapDialogKeys}>
-        <div className="panel-title"><h2 id="add-title">Quelle hinzufügen</h2><button aria-label="Schließen" onClick={onClose}>×</button></div>
-        <div className="source-options">
-          <button disabled={sourceLoading || actionBusy} onClick={guarded(onAddText)}><strong>Text</strong><span>GPU-gerenderte Beschriftung</span></button>
-          <button disabled={sourceLoading || actionBusy} onClick={guarded(onAddImage)}><strong>Bild</strong><span>PNG, JPEG oder BMP</span></button>
-          <button disabled={sourceLoading || actionBusy} onClick={guarded(onAddMedia)}><strong>Medium</strong><span>MP4, MP3 oder WAV</span></button>
-          {sourceLoading && <p role="status">Quellen werden gesucht…</p>}
-          {actionBusy && <p role="status">Quelle wird hinzugefügt…</p>}
-          {portalRequired && <button disabled={sourceLoading || actionBusy} onClick={() => void selectPortalSources()}><strong>Fenster oder Monitor auswählen</strong><span>Desktop-Portal öffnen</span></button>}
-          {candidates.map((candidate) => (
-            <button disabled={sourceLoading || actionBusy} key={`${candidate.type}:${candidate.runtimeId}`} onClick={guarded(() => onAddCandidate(candidate))}>
-              <strong>{candidate.name}</strong>
-              <span>{candidate.type === "window" ? "Fenster" : candidate.type === "display" ? "Monitor" : "Anwendungs-Audio"}</span>
-            </button>
-          ))}
-          {message && <p className="source-message">{message}</p>}
+    <Dialog open onOpenChange={(open) => !open && !actionBusy && onClose()}>
+      <DialogContent className="source-dialog" aria-describedby="add-source-description">
+        <header className="modal-header">
+          <div>
+            <DialogTitle>Quelle hinzufügen</DialogTitle>
+            <DialogDescription id="add-source-description">
+              Inhalt erstellen, Datei öffnen oder laufende Quelle erfassen.
+            </DialogDescription>
+          </div>
+          <button
+            type="button"
+            className="modal-close"
+            aria-label="Quelle hinzufügen schließen"
+            disabled={actionBusy}
+            onClick={onClose}
+          >
+            ×
+          </button>
+        </header>
+
+        <div className="source-picker">
+          <section className="source-picker-section" aria-labelledby="content-source-heading">
+            <h3 id="content-source-heading">Inhalt</h3>
+            <div className="source-options">
+              <button type="button" disabled={sourceLoading || actionBusy} onClick={guarded(onAddText)}>
+                <strong>Text</strong><span>Beschriftung direkt in Hooviestar</span>
+              </button>
+              <button type="button" disabled={sourceLoading || actionBusy} onClick={guarded(onAddImage)}>
+                <strong>Bild</strong><span>PNG, JPEG oder BMP</span>
+              </button>
+              <button type="button" disabled={sourceLoading || actionBusy} onClick={guarded(onAddMedia)}>
+                <strong>Medium</strong><span>Video oder Audio aus MP4, MP3, WAV</span>
+              </button>
+            </div>
+          </section>
+
+          <section className="source-picker-section" aria-labelledby="capture-source-heading">
+            <div className="section-heading-row">
+              <h3 id="capture-source-heading">Bildschirm &amp; Audio</h3>
+              {sourceLoading && <span role="status">Quellen werden gesucht …</span>}
+              {actionBusy && <span role="status">Wird hinzugefügt …</span>}
+            </div>
+            <div className="source-options source-options-runtime">
+              {portalRequired && (
+                <button type="button" disabled={sourceLoading || actionBusy} onClick={() => void selectPortalSources()}>
+                  <strong>Fenster oder Monitor auswählen</strong><span>Desktop-Portal öffnen</span>
+                </button>
+              )}
+              {candidates.map((candidate) => (
+                <button
+                  type="button"
+                  disabled={sourceLoading || actionBusy}
+                  key={`${candidate.type}:${candidate.runtimeId}`}
+                  onClick={guarded(() => onAddCandidate(candidate))}
+                >
+                  <strong>{candidate.name}</strong>
+                  <span>{candidate.type === "window" ? "Fenster" : candidate.type === "display" ? "Monitor" : "Anwendungs-Audio"}</span>
+                </button>
+              ))}
+              {!sourceLoading && !portalRequired && candidates.length === 0 && (
+                <p className="source-picker-empty">Keine laufenden Quellen gefunden.</p>
+              )}
+            </div>
+          </section>
+
+          {message && (
+            <p className={messageIsError ? "source-message" : "source-note"} role={messageIsError ? "alert" : "status"}>
+              {message}
+            </p>
+          )}
         </div>
-      </section>
-    </div>
+
+        <footer className="modal-actions">
+          <button type="button" disabled={actionBusy} onClick={onClose}>Abbrechen</button>
+        </footer>
+      </DialogContent>
+    </Dialog>
   );
 }
 

@@ -5,7 +5,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { engineStore } from "./engineStore";
 import { pipTransform } from "./types";
-import type { EngineCommand, ProjectV1, Scene, Source, SourceCandidate, TextSource, Transform } from "./types";
+import type { EngineCommand, OutputConfig, ProjectV1, Scene, Source, SourceCandidate, TextSource, Transform } from "./types";
 import { runGuarded } from "./guarded";
 import { SerialQueue } from "./serialQueue";
 import { useAudioFieldBridge } from "./hooks/useAudioFieldBridge";
@@ -17,10 +17,10 @@ import { SourceInspectorPanel } from "./components/SourceInspectorPanel";
 import type { ItemAction } from "./components/SourceInspectorPanel";
 import { AudioMixerPanel } from "./components/AudioMixerPanel";
 import { OnboardingBanner } from "./components/OnboardingBanner";
-import { SourcesPanel } from "./components/SourcesPanel";
-import type { SourceRow } from "./components/SourcesPanel";
-import { ControlsDock } from "./components/ControlsDock";
+import { SourcesPanel, sourceRowsFor } from "./components/SourcesPanel";
 import { StatusBar } from "./components/StatusBar";
+import { OutputSettingsDialog } from "./components/OutputSettingsDialog";
+import { PowerIcon, SettingsIcon, SparkleIcon } from "./components/icons";
 import { updateStatusMessage } from "./updateStatus";
 import type { UpdateStatusEvent } from "./updateStatus";
 
@@ -70,9 +70,12 @@ export default function App() {
   const [hotkeyMessage, setHotkeyMessage] = useState<string | null>(null);
   const [sceneError, setSceneError] = useState<string | null>(null);
   const [itemError, setItemError] = useState<string | null>(null);
-  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [previewBoundsError, setPreviewBoundsError] = useState<string | null>(null);
+  const [previewVisibilityError, setPreviewVisibilityError] = useState<string | null>(null);
   const [windowError, setWindowError] = useState<string | null>(null);
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const settingsButton = useRef<HTMLButtonElement>(null);
   const onboardingDismissedRef = useRef(false);
   // Optimistische Feld-Deltas je Quelle: überbrückt das Snapshot-Event-Lag, damit
   // aufeinanderfolgende update_source-Aufrufe nicht gegenseitig Felder zurücksetzen.
@@ -101,6 +104,7 @@ export default function App() {
   const previewNodeRef = useRef<HTMLDivElement | null>(null);
   const previewObserverRef = useRef<ResizeObserver | null>(null);
   const previewRequestRef = useRef(0);
+  const previewVisibilityRequestRef = useRef(0);
 
   useEffect(() => {
     void engineStore.start();
@@ -164,15 +168,33 @@ export default function App() {
       height: bounds.height,
     }).then(
       () => {
-        if (previewRequestRef.current === request) setPreviewError(null);
+        if (previewRequestRef.current === request) setPreviewBoundsError(null);
       },
       (error: unknown) => {
         if (previewRequestRef.current === request) {
-          setPreviewError(`Vorschaufehler: ${String(error)}`);
+          setPreviewBoundsError(`Vorschaufehler: ${String(error)}`);
         }
       },
     );
   }, []);
+
+  const nativePreviewObscured = settingsOpen || addOpen;
+  useEffect(() => {
+    if (!isWindowsPlatform()) return;
+    const request = ++previewVisibilityRequestRef.current;
+    void invoke("set_preview_visible", { visible: !nativePreviewObscured }).then(
+      () => {
+        if (previewVisibilityRequestRef.current !== request) return;
+        setPreviewVisibilityError(null);
+        if (!nativePreviewObscured) reportPreviewBounds();
+      },
+      (error: unknown) => {
+        if (previewVisibilityRequestRef.current === request) {
+          setPreviewVisibilityError(`Vorschaufehler: ${String(error)}`);
+        }
+      },
+    );
+  }, [nativePreviewObscured, reportPreviewBounds]);
 
   // Ref-Callback statt Effect: das Element wird beim Einhängen beobachtet,
   // der Beobachter entsteht höchstens einmal und hängt nicht an `project`.
@@ -504,6 +526,16 @@ export default function App() {
     });
   }, []);
 
+  const applyOutputSettings = useCallback(
+    (output: OutputConfig) => engineStore.dispatch({ type: "set_output_config", output }),
+    [],
+  );
+
+  const changeSettingsOpen = useCallback((open: boolean) => {
+    setSettingsOpen(open);
+    if (!open) requestAnimationFrame(() => settingsButton.current?.focus());
+  }, []);
+
   if (!project) {
     return (
       <main className="loading">
@@ -522,14 +554,7 @@ export default function App() {
   const selectedMediaState =
     selectedSource?.type === "media" ? (mediaStates[selectedSource.id] ?? null) : null;
 
-  // Zeilen für das Quellen-Dock: Items der aktiven Szene mit Sichtbarkeits-
-  // und Sperrzustand; übrige Quellen erscheinen als „außerhalb der Szene“.
-  const sourceRows: SourceRow[] = project.sources.map((source) => {
-    const item = activeScene.items.find((entry) => entry.sourceId === source.id);
-    return item
-      ? { key: item.id, source, itemId: item.id, visible: item.visible, locked: item.locked }
-      : { key: source.id, source };
-  });
+  const sourceRows = sourceRowsFor(project.sources, activeScene.items);
 
   // Audiokanäle mit Pending-Overlay, damit Slider-Optimistik im Mixer ankommt.
   const mixerChannels = project.sources
@@ -587,60 +612,104 @@ export default function App() {
     <main className="studio">
       <header className="topbar">
         <div className="brand">
-          <h1>Hooviestar</h1>
-          <p>Discord-Szenenstudio für Windows und Linux</p>
+          <span className="brand-mark" aria-hidden="true"><i /><i /></span>
+          <div className="brand-copy">
+            <h1>Hooviestar</h1>
+            <p>Discord-Szenenstudio</p>
+          </div>
+        </div>
+        <div className="topbar-actions">
+          <button type="button" className="utility-button" title="Einrichtung starten" onClick={startOnboarding}>
+            <SparkleIcon />
+            <span>Einrichtung</span>
+          </button>
+          <button
+            ref={settingsButton}
+            type="button"
+            className="utility-button"
+            aria-label="Ausgabe-Einstellungen öffnen"
+            title="Ausgabe-Einstellungen"
+            onClick={() => changeSettingsOpen(true)}
+          >
+            <SettingsIcon />
+            <span>Ausgabe</span>
+          </button>
+          <span className="topbar-divider" aria-hidden="true" />
+          <button
+            type="button"
+            className="header-icon-button quit-button"
+            aria-label="Studio beenden"
+            title="Studio beenden"
+            onClick={quitStudio}
+          >
+            <PowerIcon />
+          </button>
         </div>
       </header>
 
-      <section className="center-band">
-        <PreviewPanel
-          output={project.output}
-          activeSceneName={activeScene.name}
-          onAttachBounds={attachPreviewBounds}
-        />
-        <div className="preview-strip">
-          <span className="strip-label">
-            {selectedSource ? selectedSource.name : "Keine Quelle ausgewählt"}
-          </span>
-          <span className="strip-hint">Discord: App „Hooviestar – Program“ wählen · Ausgabe bleibt unsichtbar</span>
+      <div className="studio-workspace">
+        <div className="left-workspace">
+          <ScenesPanel
+            scenes={project.scenes}
+            activeScene={activeScene}
+            sceneError={sceneError}
+            hotkeyMessage={hotkeyMessage}
+            onAddScene={handleAddScene}
+            onSwitchScene={handleSwitchScene}
+            onSaveHotkey={handleSaveHotkey}
+            onRemoveScene={removeScene}
+            onRenameScene={renameScene}
+          />
+          <SourcesPanel
+            rows={sourceRows}
+            selectedSourceId={selectedSourceId}
+            itemError={itemError}
+            addButtonRef={addButton}
+            onSelectSource={selectSource}
+            onAddClick={openAddDialog}
+            onRemoveSource={removeSource}
+            onItemAction={runItemAction}
+          />
         </div>
-      </section>
 
-      <div className="dock-row">
-        <ScenesPanel
-          scenes={project.scenes}
-          activeScene={activeScene}
-          sceneError={sceneError}
-          hotkeyMessage={hotkeyMessage}
-          onAddScene={handleAddScene}
-          onSwitchScene={handleSwitchScene}
-          onSaveHotkey={handleSaveHotkey}
-          onRemoveScene={removeScene}
-          onRenameScene={renameScene}
-        />
-        <SourcesPanel
-          rows={sourceRows}
-          selectedSourceId={selectedSourceId}
-          addButtonRef={addButton}
-          onSelectSource={selectSource}
-          onAddClick={openAddDialog}
-          onRemoveSource={removeSource}
-          onItemAction={runItemAction}
-        />
-        <AudioMixerPanel
-          channels={mixerChannels}
-          levels={levels}
-          audioError={audioError}
-          onVolume={setMixerVolume}
-          onToggleMute={toggleMixerMute}
-        />
+        <section className="program-workspace" aria-label="Programmbereich">
+          <section className="program-panel" aria-labelledby="program-heading">
+            <header className="program-header">
+              <div>
+                <span className="eyebrow">Programm</span>
+                <h2 id="program-heading">{activeScene.name}</h2>
+              </div>
+              <span
+                className="output-badge"
+                title={`${project.output.width} × ${project.output.height} · ${project.output.fps} fps`}
+              >
+                {project.output.width} × {project.output.height} · {project.output.fps} fps
+              </span>
+            </header>
+            <PreviewPanel
+              output={project.output}
+              activeSceneName={activeScene.name}
+              onAttachBounds={attachPreviewBounds}
+            />
+            <div className="share-guidance">
+              <span className="share-label">In Discord teilen</span>
+              <span>Unter „Anwendungen“ <strong>Hooviestar – Program</strong> wählen. Studio bleibt privat.</span>
+            </div>
+          </section>
+          <AudioMixerPanel
+            channels={mixerChannels}
+            levels={levels}
+            audioError={audioError}
+            onVolume={setMixerVolume}
+            onToggleMute={toggleMixerMute}
+          />
+        </section>
+
         <SourceInspectorPanel
           selectedSource={selectedSource}
           selectedItem={selectedItem}
           mediaState={selectedMediaState}
-          itemError={itemError}
           textError={textError}
-          onItemAction={runItemAction}
           onTextChange={handleTextChange}
           onAudioField={setAudioField}
           getPendingField={pendingField}
@@ -648,15 +717,10 @@ export default function App() {
           onSeek={seekMedia}
           onSetPlaying={setMediaPlaying}
         />
-        <ControlsDock
-          onAddSource={openAddDialog}
-          onStartOnboarding={startOnboarding}
-          onQuit={quitStudio}
-        />
       </div>
 
       <StatusBar
-        status={windowError ?? previewError ?? updateStatus ?? status}
+        status={windowError ?? previewVisibilityError ?? previewBoundsError ?? updateStatus ?? status}
         output={project.output}
         sceneCount={project.scenes.length}
         sourceCount={project.sources.length}
@@ -677,6 +741,13 @@ export default function App() {
           onClose={closeDialog}
         />
       )}
+
+      <OutputSettingsDialog
+        open={settingsOpen}
+        output={project.output}
+        onOpenChange={changeSettingsOpen}
+        onApply={applyOutputSettings}
+      />
     </main>
   );
 }

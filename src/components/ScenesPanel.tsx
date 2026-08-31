@@ -1,6 +1,6 @@
 import { memo, useMemo, useRef, useState } from "react";
 import type { Scene } from "../types";
-import { MinusIcon, PlusIcon } from "./icons";
+import { MinusIcon, PencilIcon, PlusIcon } from "./icons";
 import { useArmedConfirm } from "../hooks/useArmedConfirm";
 
 interface ScenesPanelProps {
@@ -63,7 +63,10 @@ function ScenesPanelImpl({
   return (
     <nav className="dock scenes-dock" aria-label="Szenen">
       <div className="dock-title">
-        <h2>Szenen</h2>
+        <div className="dock-heading">
+          <h2>Szenen</h2>
+          <span>{scenes.length}</span>
+        </div>
         <div className="dock-toolbar">
           <button type="button" className="icon-button" aria-label="Szene hinzufügen" onClick={onAddScene}>
             <PlusIcon />
@@ -102,26 +105,38 @@ function ScenesPanelImpl({
                 }}
               />
             ) : (
-              <button
-                type="button"
-                className={scene.id === activeScene.id ? "scene-row selected" : "scene-row"}
-                onClick={() => onSwitchScene(scene)}
-              >
-                <span
-                  className="scene-name"
-                  title={`${scene.name} (Doppelklick zum Umbenennen)`}
-                  onDoubleClick={() => startRename(scene)}
+              <div className={scene.id === activeScene.id ? "scene-item selected" : "scene-item"}>
+                <button
+                  type="button"
+                  className="scene-row"
+                  aria-current={scene.id === activeScene.id ? "true" : undefined}
+                  onClick={() => onSwitchScene(scene)}
                 >
-                  {scene.name}
-                </span>
-                <kbd>{scene.hotkey ?? "–"}</kbd>
-              </button>
+                  <span
+                    className="scene-name"
+                    title={`${scene.name} (Doppelklick zum Umbenennen)`}
+                    onDoubleClick={() => startRename(scene)}
+                  >
+                    {scene.name}
+                  </span>
+                  <kbd>{scene.hotkey ?? "–"}</kbd>
+                </button>
+                <button
+                  type="button"
+                  className="icon-button rename-button"
+                  aria-label={`Szene „${scene.name}“ umbenennen`}
+                  title="Szene umbenennen"
+                  onClick={() => startRename(scene)}
+                >
+                  <PencilIcon />
+                </button>
+              </div>
             )}
           </li>
         ))}
       </ol>
       <form className="hotkey-editor" onSubmit={onSaveHotkey}>
-        <label htmlFor="scene-hotkey">Hotkey für {activeScene.name}</label>
+        <label htmlFor="scene-hotkey">Szenenhotkey · {activeScene.name}</label>
         <div>
           <input
             id="scene-hotkey"

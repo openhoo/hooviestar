@@ -73,4 +73,34 @@ describe("engineStore startup lifecycle", () => {
     expect(mocks.listen).toHaveBeenCalledOnce();
     expect(mocks.invoke.mock.calls.filter(([command]) => command === "engine_status")).toHaveLength(1);
   });
+
+  it("keeps output authoritative until a valid snapshot event confirms dispatch", async () => {
+    const engineListeners: Array<(event: { payload: unknown }) => void> = [];
+    mocks.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_snapshot") return structuredClone(fixture);
+      return null;
+    });
+    mocks.listen.mockImplementation(async (_event: string, listener: (event: { payload: unknown }) => void) => {
+      engineListeners.push(listener);
+      return vi.fn();
+    });
+
+    const { engineStore } = await import("./engineStore");
+    await engineStore.start();
+    const requested = { width: 1920, height: 1080, fps: 30, background: "#224466" };
+    await engineStore.dispatch({ type: "set_output_config", output: requested });
+
+    expect(engineStore.getSnapshot().project?.output).toEqual(fixture.output);
+    expect(mocks.invoke).toHaveBeenCalledWith("dispatch", {
+      command: { type: "set_output_config", output: requested },
+    });
+
+    const confirmed = structuredClone(fixture);
+    confirmed.output = requested;
+    expect(engineListeners).toHaveLength(1);
+    engineListeners[0]!({
+      payload: { type: "snapshot", project: confirmed },
+    });
+    expect(engineStore.getSnapshot().project?.output).toEqual(requested);
+  });
 });

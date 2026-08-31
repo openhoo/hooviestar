@@ -388,14 +388,17 @@ export function parseOutputConfig(value: unknown): OutputConfig | null {
   if (!isRecord(value) || !num(value.width) || !num(value.height) || !num(value.fps) || !color(value.background)) {
     return null;
   }
-  // project.rs:220-225 – nur die freigegebenen Presets (1280,720,30)
-  // und (1920,1080,60) sind gültig.
+  // project.rs:220-226 – nur die qualifizierten HD-/Full-HD-Auflösungen
+  // und 30/60 fps sind gültig; Auflösung und Bildrate sind unabhängig.
   const outWidth = value.width as number;
   const outHeight = value.height as number;
   const outFps = value.fps as number;
   if (
-    !(outWidth === 1280 && outHeight === 720 && outFps === 30) &&
-    !(outWidth === 1920 && outHeight === 1080 && outFps === 60)
+    !(
+      (outWidth === 1280 && outHeight === 720) ||
+      (outWidth === 1920 && outHeight === 1080)
+    ) ||
+    !(outFps === 30 || outFps === 60)
   ) {
     return null;
   }

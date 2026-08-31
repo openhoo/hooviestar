@@ -397,6 +397,15 @@ pub fn cadence_scaled_30_to_60(observed_30: f64, observed_60: f64) -> bool {
         && observed_60 >= observed_30 * 1.5
 }
 
+pub fn cadence_matches_fps(observed: f64, fps: u32) -> bool {
+    observed.is_finite()
+        && match fps {
+            30 => (22.0..=36.0).contains(&observed),
+            60 => (45.0..=72.0).contains(&observed),
+            _ => false,
+        }
+}
+
 pub fn capture_cadence_healthy(observed_30: f64, observed_60: f64) -> bool {
     observed_30.is_finite()
         && observed_60.is_finite()

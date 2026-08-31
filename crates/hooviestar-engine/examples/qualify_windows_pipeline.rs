@@ -25,7 +25,9 @@ fn windows_main() -> Result<(), String> {
         project::{Source, TextAlign, Transform},
     };
     use serde::Serialize;
-    use support::analysis::{cadence_scaled_30_to_60, capture_cadence_healthy, gain_matches};
+    use support::analysis::{
+        cadence_matches_fps, cadence_scaled_30_to_60, capture_cadence_healthy, gain_matches,
+    };
     use support::windows::{
         BROWSER_FREQUENCY_HZ, BROWSER_TITLE, Marker, PREVIEW_TITLE, PROGRAM_TITLE,
         TONE_FREQUENCY_HZ, TestWindow, audio_binding_for_pid, audio_binding_for_tree,
@@ -62,6 +64,13 @@ fn windows_main() -> Result<(), String> {
         output_60_fps_capture_cadence: f64,
         output_cadence_scaled: bool,
         output_capture_healthy: bool,
+        output_profile_matrix_passed: bool,
+        output_profile_program_motion: bool,
+        output_profile_preview_motion: bool,
+        output_720p_60_render_cadence: f64,
+        output_720p_60_capture_cadence: f64,
+        output_1080p_30_render_cadence: f64,
+        output_1080p_30_capture_cadence: f64,
         rapid_scene_switch_recovered: bool,
     }
 
@@ -462,6 +471,107 @@ fn windows_main() -> Result<(), String> {
         cadence_scaled_30_to_60(output_30_fps_render_cadence, output_60_fps_render_cadence);
     let output_capture_healthy =
         capture_cadence_healthy(output_30_fps_capture_cadence, output_60_fps_capture_cadence);
+
+    // Die UI erlaubt Auflösung und FPS unabhängig. Die beiden Kreuzprofile
+    // laufen zusätzlich zu den wiederholten Endpunkt-Resize-Zyklen durch den
+    // echten D3D11-Kompositor und beide WGC-Ziele. Abweichende Hintergründe
+    // beweisen zugleich, dass die vollständige OutputConfig übernommen wird.
+    let mut output_profile_matrix_passed = true;
+    let mut output_profile_program_motion = true;
+    let mut output_profile_preview_motion = true;
+    let output_720p_60 = OutputConfig {
+        width: 1280,
+        height: 720,
+        fps: 60,
+        background: "#203040".into(),
+    };
+    engine
+        .command(EngineCommand::SetOutputConfig {
+            output: output_720p_60.clone(),
+        })
+        .map_err(|error| error.to_string())?;
+    thread::sleep(Duration::from_millis(300));
+    output_profile_matrix_passed &= engine.snapshot().output == output_720p_60;
+    let (_, program_720p_60_motion) = measure_marker_motion(
+        &program_capture,
+        &program_device,
+        Marker::Mixed,
+        5,
+        Duration::from_millis(100),
+    )?;
+    let (_, preview_720p_60_motion) = measure_marker_motion(
+        &preview_capture,
+        &preview_device,
+        Marker::Mixed,
+        5,
+        Duration::from_millis(100),
+    )?;
+    output_profile_program_motion &= program_720p_60_motion.sustained(5, 0.5, 0.0002, 3);
+    output_profile_preview_motion &= preview_720p_60_motion.sustained(5, 0.5, 0.0002, 3);
+    let rendered_before = engine.rendered_frame_count();
+    let cadence_started = Instant::now();
+    let output_720p_60_capture_cadence =
+        measure_capture_cadence(&program_capture, Duration::from_secs(2));
+    let output_720p_60_render_cadence = engine
+        .rendered_frame_count()
+        .saturating_sub(rendered_before) as f64
+        / cadence_started.elapsed().as_secs_f64();
+    output_profile_matrix_passed &= cadence_matches_fps(output_720p_60_render_cadence, 60);
+
+    let output_1080p_30 = OutputConfig {
+        width: 1920,
+        height: 1080,
+        fps: 30,
+        background: "#302010".into(),
+    };
+    drain_engine_events(&engine_events)?;
+    engine
+        .command(EngineCommand::SetOutputConfig {
+            output: output_1080p_30.clone(),
+        })
+        .map_err(|error| error.to_string())?;
+    output_profile_matrix_passed &=
+        wait_for_resize_result(&engine_events, Duration::from_secs(10))?;
+    output_profile_matrix_passed &= engine.snapshot().output == output_1080p_30;
+    let (_, program_1080p_30_motion) = measure_marker_motion(
+        &program_capture,
+        &program_device,
+        Marker::Mixed,
+        5,
+        Duration::from_millis(100),
+    )?;
+    let (_, preview_1080p_30_motion) = measure_marker_motion(
+        &preview_capture,
+        &preview_device,
+        Marker::Mixed,
+        5,
+        Duration::from_millis(100),
+    )?;
+    output_profile_program_motion &= program_1080p_30_motion.sustained(5, 0.5, 0.0002, 3);
+    output_profile_preview_motion &= preview_1080p_30_motion.sustained(5, 0.5, 0.0002, 3);
+    let rendered_before = engine.rendered_frame_count();
+    let cadence_started = Instant::now();
+    let output_1080p_30_capture_cadence =
+        measure_capture_cadence(&program_capture, Duration::from_secs(2));
+    let output_1080p_30_render_cadence = engine
+        .rendered_frame_count()
+        .saturating_sub(rendered_before) as f64
+        / cadence_started.elapsed().as_secs_f64();
+    output_profile_matrix_passed &= cadence_matches_fps(output_1080p_30_render_cadence, 30);
+    output_profile_matrix_passed &= capture_cadence_healthy(
+        output_1080p_30_capture_cadence,
+        output_720p_60_capture_cadence,
+    );
+
+    drain_engine_events(&engine_events)?;
+    engine
+        .command(EngineCommand::SetOutputConfig {
+            output: OutputConfig::default(),
+        })
+        .map_err(|error| error.to_string())?;
+    output_profile_matrix_passed &=
+        wait_for_resize_result(&engine_events, Duration::from_secs(10))?;
+    output_profile_matrix_passed &= engine.snapshot().output == OutputConfig::default();
 
     // The mixer creates the process render session before EngineHandle::start
     // returns. Capturing this process isolates Hooviestar's mixed output from
@@ -961,6 +1071,13 @@ fn windows_main() -> Result<(), String> {
         output_60_fps_capture_cadence,
         output_cadence_scaled,
         output_capture_healthy,
+        output_profile_matrix_passed,
+        output_profile_program_motion,
+        output_profile_preview_motion,
+        output_720p_60_render_cadence,
+        output_720p_60_capture_cadence,
+        output_1080p_30_render_cadence,
+        output_1080p_30_capture_cadence,
         rapid_scene_switch_recovered,
     };
     let browser_amplitude = browser_only.amplitude(BROWSER_FREQUENCY_HZ);
@@ -989,6 +1106,9 @@ fn windows_main() -> Result<(), String> {
         && visual.output_resize_cycles == 2
         && visual.output_cadence_scaled
         && visual.output_capture_healthy
+        && visual.output_profile_matrix_passed
+        && visual.output_profile_program_motion
+        && visual.output_profile_preview_motion
         && visual.rapid_scene_switch_recovered
         && scene_geometry.passed
         && scene_mutations.passed

@@ -300,6 +300,11 @@ fn set_preview_bounds(
     platform::set_preview_bounds(state.inner().preview, x, y, width, height)
 }
 
+#[tauri::command]
+fn set_preview_visible(visible: bool, state: State<'_, AppState>) -> Result<(), String> {
+    platform::set_preview_visible(state.inner().preview, visible)
+}
+
 pub fn run() {
     platform::configure_graphics_backend();
     let resources = Arc::new(RuntimeResources::new());
@@ -318,6 +323,7 @@ pub fn run() {
             select_portal_sources,
             canonicalize_file,
             set_preview_bounds,
+            set_preview_visible,
             updater::updater_status
         ])
         .setup(move |app| {

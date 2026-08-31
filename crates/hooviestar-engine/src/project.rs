@@ -218,9 +218,10 @@ impl ProjectV1 {
             return Err("unsupported project version".into());
         }
         if !matches!(
-            (self.output.width, self.output.height, self.output.fps),
-            (1280, 720, 30) | (1920, 1080, 60)
-        ) {
+            (self.output.width, self.output.height),
+            (1280, 720) | (1920, 1080)
+        ) || !matches!(self.output.fps, 30 | 60)
+        {
             return Err("unsupported output preset".into());
         }
         if !is_color(&self.output.background) {
@@ -364,6 +365,40 @@ mod tests {
         let mut project = ProjectV1::empty();
         project.scenes[1].hotkey = project.scenes[0].hotkey.clone();
         assert_eq!(project.validate(), Err("duplicate scene hotkey".into()));
+    }
+
+    #[test]
+    fn qualified_output_dimensions_and_frame_rates_are_independent() {
+        for (width, height) in [(1280, 720), (1920, 1080)] {
+            for fps in [30, 60] {
+                let mut project = ProjectV1::empty();
+                project.output = OutputConfig {
+                    width,
+                    height,
+                    fps,
+                    background: "#aBc123".into(),
+                };
+                project.validate().unwrap();
+            }
+        }
+        for output in [
+            OutputConfig {
+                width: 2560,
+                height: 1440,
+                fps: 60,
+                background: "#101418".into(),
+            },
+            OutputConfig {
+                width: 1280,
+                height: 720,
+                fps: 24,
+                background: "#101418".into(),
+            },
+        ] {
+            let mut project = ProjectV1::empty();
+            project.output = output;
+            assert_eq!(project.validate(), Err("unsupported output preset".into()));
+        }
     }
 
     #[test]

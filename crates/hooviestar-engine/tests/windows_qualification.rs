@@ -2,8 +2,9 @@
 mod analysis;
 
 use analysis::{
-    BgraFrame, Marker, analyze_signal, cadence_scaled_30_to_60, capture_cadence_healthy,
-    gain_matches, quiet_enough, runtime_audio_process_id, summarize_motion,
+    BgraFrame, Marker, analyze_signal, cadence_matches_fps, cadence_scaled_30_to_60,
+    capture_cadence_healthy, gain_matches, quiet_enough, runtime_audio_process_id,
+    summarize_motion,
 };
 
 fn frame(width: u32, height: u32, color: [u8; 4]) -> BgraFrame {
@@ -63,6 +64,16 @@ fn output_capture_oracle_accepts_vm_compositor_cap_but_not_stalls() {
     assert!(capture_cadence_healthy(28.0, 29.0));
     assert!(!capture_cadence_healthy(28.0, 3.0));
     assert!(!capture_cadence_healthy(f64::INFINITY, 29.0));
+}
+
+#[test]
+fn output_profile_oracle_pins_each_supported_frame_rate() {
+    assert!(cadence_matches_fps(29.0, 30));
+    assert!(cadence_matches_fps(58.0, 60));
+    assert!(!cadence_matches_fps(58.0, 30));
+    assert!(!cadence_matches_fps(29.0, 60));
+    assert!(!cadence_matches_fps(f64::NAN, 30));
+    assert!(!cadence_matches_fps(30.0, 24));
 }
 
 #[test]

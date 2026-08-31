@@ -1,5 +1,5 @@
 import { memo, useMemo, useRef } from "react";
-import type { Source } from "../types";
+import type { SceneItem, Source } from "../types";
 import type { ItemAction } from "./SourceInspectorPanel";
 import { useArmedConfirm } from "../hooks/useArmedConfirm";
 import {
@@ -19,11 +19,37 @@ export interface SourceRow {
   itemId?: string;
   visible?: boolean;
   locked?: boolean;
+  canMoveUp?: boolean;
+  canMoveDown?: boolean;
+}
+
+/** Engine-Reihenfolge unten-nach-oben als bedienbare Layerliste oben-nach-unten. */
+export function sourceRowsFor(sources: Source[], items: SceneItem[]): SourceRow[] {
+  const sourcesById = new Map(sources.map((source) => [source.id, source]));
+  const placedSourceIds = new Set(items.map((item) => item.sourceId));
+  const placed = items.map<SourceRow>((item, index) => {
+    const source = sourcesById.get(item.sourceId);
+    if (!source) throw new Error(`Quelle ${item.sourceId} für Szenenelement fehlt`);
+    return {
+      key: item.id,
+      source,
+      itemId: item.id,
+      visible: item.visible,
+      locked: item.locked,
+      canMoveUp: !item.locked && index < items.length - 1,
+      canMoveDown: !item.locked && index > 0,
+    };
+  });
+  const unplaced: SourceRow[] = sources
+    .filter((source) => !placedSourceIds.has(source.id))
+    .map((source) => ({ key: source.id, source }));
+  return [...placed.reverse(), ...unplaced];
 }
 
 interface SourcesPanelProps {
   rows: SourceRow[];
   selectedSourceId: string | null;
+  itemError: string | null;
   addButtonRef: React.RefObject<HTMLButtonElement | null>;
   onSelectSource: (sourceId: string) => void;
   onAddClick: () => void;
@@ -55,6 +81,7 @@ function SourceGlyph() {
 function SourcesPanelImpl({
   rows,
   selectedSourceId,
+  itemError,
   addButtonRef,
   onSelectSource,
   onAddClick,
@@ -75,12 +102,16 @@ function SourcesPanelImpl({
   return (
     <section className="dock sources-dock" aria-label="Quellen">
       <div className="dock-title">
-        <h2>Quellen</h2>
+        <div className="dock-heading">
+          <h2>Quellen</h2>
+          <span>{rows.length}</span>
+        </div>
         <div className="dock-toolbar">
           <button
             ref={addButtonRef}
             type="button"
             className="icon-button"
+            aria-label="Quelle hinzufügen"
             title="Quelle hinzufügen"
             onClick={onAddClick}
           >
@@ -90,6 +121,7 @@ function SourcesPanelImpl({
             ref={minusButtonRef}
             type="button"
             className={removeClassName}
+            aria-label={removeTitle}
             title={removeTitle}
             disabled={!selectedSourceId}
             onClick={handleRemoveClick}
@@ -103,7 +135,7 @@ function SourcesPanelImpl({
       ) : (
         <ul className="sources-list">
           {rows.map((row) => {
-            const { source, itemId, visible, locked } = row;
+            const { source, itemId, visible, locked, canMoveUp, canMoveDown } = row;
             const selected = source.id === selectedSourceId;
             return (
               <li key={row.key}>
@@ -111,6 +143,7 @@ function SourcesPanelImpl({
                   <button
                     type="button"
                     className="source-main"
+                    aria-current={selected ? "true" : undefined}
                     onClick={() => onSelectSource(source.id)}
                   >
                     <span className="source-glyph">
@@ -144,7 +177,8 @@ function SourcesPanelImpl({
                         type="button"
                         className="icon-button"
                         aria-label="Nach oben"
-                        title="Nach oben"
+                        title={locked ? "Gesperrte Quelle kann nicht verschoben werden" : canMoveUp ? "Nach oben" : "Bereits ganz oben"}
+                        disabled={!canMoveUp}
                         onClick={() => onItemAction(itemId, "moveUp")}
                       >
                         <ArrowUpIcon />
@@ -153,14 +187,15 @@ function SourcesPanelImpl({
                         type="button"
                         className="icon-button"
                         aria-label="Nach unten"
-                        title="Nach unten"
+                        title={locked ? "Gesperrte Quelle kann nicht verschoben werden" : canMoveDown ? "Nach unten" : "Bereits ganz unten"}
+                        disabled={!canMoveDown}
                         onClick={() => onItemAction(itemId, "moveDown")}
                       >
                         <ArrowDownIcon />
                       </button>
                     </span>
                   ) : (
-                    <span className="badge">außerhalb der Szene</span>
+                    <span className="badge">Nicht in Szene</span>
                   )}
                 </div>
               </li>
@@ -168,6 +203,7 @@ function SourcesPanelImpl({
           })}
         </ul>
       )}
+      {itemError && <p className="dock-message" role="alert">{itemError}</p>}
     </section>
   );
 }

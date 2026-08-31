@@ -24,7 +24,10 @@ function AudioMixerPanelImpl({ channels, levels, audioError, onVolume, onToggleM
   return (
     <section className="dock mixer-dock" aria-label="Audio-Mixer">
       <div className="dock-title">
-        <h2>Audio-Mixer</h2>
+        <div className="dock-heading">
+          <h2>Audio-Mixer</h2>
+          <span>{channels.length}</span>
+        </div>
         <span>48 kHz · Stereo</span>
       </div>
       <div className="mixer-channels">
@@ -34,7 +37,7 @@ function AudioMixerPanelImpl({ channels, levels, audioError, onVolume, onToggleM
               <span className="channel-name" title={channel.name}>{channel.name}</span>
               <output className="db-readout">{toDb(channel.volume)}</output>
             </div>
-            <div className="meter horizontal" aria-label={`Pegel ${channel.name}`}>
+            <div className="meter horizontal" aria-hidden="true">
               <i style={{ width: `${levelWidth(levels, channel.sourceId)}%` }} />
             </div>
             <div className="db-scale" aria-hidden="true">
@@ -69,8 +72,14 @@ function AudioMixerPanelImpl({ channels, levels, audioError, onVolume, onToggleM
           </div>
         ))}
       </div>
-      {channels.length === 0 && <p className="empty">Noch keine Audioquelle.</p>}
-      {audioError && <p role="alert">{audioError}</p>}
+      {channels.length === 0 && (
+        <div className="empty-state compact">
+          <span className="empty-state-icon" aria-hidden="true">∿</span>
+          <strong>Noch keine Audioquelle</strong>
+          <p>Medien und Anwendungs-Audio erscheinen automatisch hier.</p>
+        </div>
+      )}
+      {audioError && <p className="dock-message" role="alert">{audioError}</p>}
     </section>
   );
 }

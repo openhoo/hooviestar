@@ -437,6 +437,10 @@ pub fn set_preview_bounds(
     Err("Linux verwendet ein separates natives Preview-Fenster".into())
 }
 
+pub fn set_preview_visible(_pointer: usize, _visible: bool) -> Result<(), String> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{hyprland_cleanup_source, hyprland_rule_source};

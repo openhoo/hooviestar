@@ -8,9 +8,15 @@ interface OnboardingBannerProps {
 function OnboardingBannerImpl({ onStart, onDismiss }: OnboardingBannerProps) {
   return (
     <div className="onboarding-banner" role="region" aria-label="Ersteinrichtung">
-      <div><strong>Spiel, Video und Beides sind vorbereitet.</strong><span>Füge zuerst ein Fenster oder einen Monitor und danach ein Medium hinzu.</span></div>
-      <button onClick={onStart}>Einrichtung starten</button>
-      <button onClick={onDismiss}>Später</button>
+      <span className="onboarding-mark" aria-hidden="true">✦</span>
+      <div className="onboarding-copy">
+        <strong>Dein Studio ist vorbereitet.</strong>
+        <span>Füge ein Fenster oder einen Monitor hinzu. Hooviestar ordnet es den Standardszenen zu.</span>
+      </div>
+      <div className="onboarding-actions">
+        <button type="button" onClick={onDismiss}>Später</button>
+        <button type="button" className="primary" onClick={onStart}>Quelle hinzufügen</button>
+      </div>
     </div>
   );
 }

@@ -9,9 +9,7 @@ interface SourceInspectorPanelProps {
   selectedSource: Source | null;
   selectedItem: SceneItem | null;
   mediaState: MediaRuntimeState | null;
-  itemError: string | null;
   textError: string | null;
-  onItemAction: (itemId: string, action: ItemAction) => void;
   onTextChange: (source: TextSource, event: React.ChangeEvent<HTMLTextAreaElement>) => void;
   onAudioField: (sourceId: string, field: "volume" | "muted", value: number | boolean) => void;
   getPendingField: <T>(sourceId: string, field: string, fallback: T) => T;
@@ -20,13 +18,20 @@ interface SourceInspectorPanelProps {
   onSetPlaying: (sourceId: string, playing: boolean) => Promise<unknown>;
 }
 
+const SOURCE_TYPE_LABELS: Record<Source["type"], string> = {
+  window: "Fensteraufnahme",
+  display: "Monitoraufnahme",
+  image: "Bild",
+  text: "Text",
+  media: "Medium",
+  application_audio: "Anwendungs-Audio",
+};
+
 function SourceInspectorPanelImpl({
   selectedSource,
   selectedItem,
   mediaState,
-  itemError,
   textError,
-  onItemAction,
   onTextChange,
   onAudioField,
   getPendingField,
@@ -38,47 +43,53 @@ function SourceInspectorPanelImpl({
     <aside className="dock inspector-dock" aria-label="Eigenschaften">
       <div className="dock-title">
         <h2>Eigenschaften</h2>
-        <span className="inspected-name">{selectedSource?.name ?? "—"}</span>
       </div>
       {selectedSource ? (
         <div className="properties">
-          <h3>Eigenschaften</h3>
-          <label>Name<input value={selectedSource.name} readOnly /></label>
-          {selectedItem && (
-            <>
-            <div className="property-actions">
-              <button onClick={() => onItemAction(selectedItem.id, "toggleVisible")}>{selectedItem.visible ? "Ausblenden" : "Einblenden"}</button>
-              <button onClick={() => onItemAction(selectedItem.id, "toggleLocked")}>{selectedItem.locked ? "Entsperren" : "Sperren"}</button>
-              {/* Gesperrte Items lehnt die Engine für Neuanordnung ab (apply-Guard). */}
-              <button disabled={selectedItem.locked} title={selectedItem.locked ? "Element ist gesperrt" : undefined} onClick={() => onItemAction(selectedItem.id, "moveUp")}>Nach oben</button>
-              <button disabled={selectedItem.locked} title={selectedItem.locked ? "Element ist gesperrt" : undefined} onClick={() => onItemAction(selectedItem.id, "moveDown")}>Nach unten</button>
+          <header className="source-summary">
+            <span className="source-avatar" aria-hidden="true">{selectedSource.name.slice(0, 1).toUpperCase()}</span>
+            <div>
+              <h3 title={selectedSource.name}>{selectedSource.name}</h3>
+              <p>{SOURCE_TYPE_LABELS[selectedSource.type]}</p>
             </div>
-            {itemError && <p role="alert">{itemError}</p>}
-            </>
-          )}
+            <span className={selectedItem ? "placement-badge" : "placement-badge detached"}>
+              {selectedItem ? "In Szene" : "Nicht in Szene"}
+            </span>
+          </header>
           {selectedSource.type === "text" && (
-            <>
+            <section className="property-group">
+              <h3>Inhalt</h3>
               <label>Text<textarea key={selectedSource.id} defaultValue={getPendingField(selectedSource.id, "text", selectedSource.text)} onChange={(event) => onTextChange(selectedSource, event)} /></label>
               {textError && <p role="alert" className="source-message">{textError}</p>}
-            </>
+            </section>
           )}
           {"volume" in selectedSource && (
-            <>
+            <section className="property-group">
+              <h3>Audio</h3>
               <label>Lautstärke <output>{Math.round(getPendingField(selectedSource.id, "volume", selectedSource.volume) * 100)} %</output><input type="range" min="0" max="1" step="0.01" value={getPendingField(selectedSource.id, "volume", selectedSource.volume)} onChange={(event) => onAudioField(selectedSource.id, "volume", Number(event.currentTarget.value))} /></label>
               <label className="check"><input type="checkbox" checked={getPendingField(selectedSource.id, "muted", selectedSource.muted)} onChange={(event) => onAudioField(selectedSource.id, "muted", event.currentTarget.checked)} /> Stumm</label>
-            </>
+            </section>
           )}
           {selectedSource.type === "media" && (
-            <MediaInspector
-              source={selectedSource}
-              mediaState={mediaState}
-              onUpdateSource={onUpdateSource}
-              onSeek={onSeek}
-              onSetPlaying={onSetPlaying}
-            />
+            <section className="property-group">
+              <h3>Wiedergabe</h3>
+              <MediaInspector
+                source={selectedSource}
+                mediaState={mediaState}
+                onUpdateSource={onUpdateSource}
+                onSeek={onSeek}
+                onSetPlaying={onSetPlaying}
+              />
+            </section>
           )}
         </div>
-      ) : <p className="empty">Quelle auswählen, um Eigenschaften zu bearbeiten.</p>}
+      ) : (
+        <div className="empty-state">
+          <span className="empty-state-icon" aria-hidden="true">◇</span>
+          <strong>Keine Quelle ausgewählt</strong>
+          <p>Quelle links auswählen, um Inhalt, Audio oder Wiedergabe zu bearbeiten.</p>
+        </div>
+      )}
     </aside>
   );
 }

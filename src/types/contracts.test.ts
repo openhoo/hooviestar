@@ -37,6 +37,24 @@ describe("shared engine contract", () => {
     oversizedFontWeight.sources[3]!.fontWeight = 65_536;
     expect(parseProjectV1(oversizedFontWeight)).toBeNull();
   });
+  it("accepts independent qualified output resolution and frame-rate combinations", () => {
+    for (const [width, height] of [[1280, 720], [1920, 1080]] as const) {
+      for (const fps of [30, 60]) {
+        const project = structuredClone(fixture);
+        project.output = { width, height, fps, background: "#aBc123" };
+        expect(parseProjectV1(project)?.output).toEqual(project.output);
+      }
+    }
+    for (const output of [
+      { width: 2560, height: 1440, fps: 60, background: "#101418" },
+      { width: 1280, height: 720, fps: 24, background: "#101418" },
+      { width: 1280.5, height: 720, fps: 30, background: "#101418" },
+    ]) {
+      const project = structuredClone(fixture);
+      project.output = output;
+      expect(parseProjectV1(project)).toBeNull();
+    }
+  });
   it("keeps command and event tags unique", () => {
     expect(new Set(ENGINE_COMMAND_TYPES).size).toBe(ENGINE_COMMAND_TYPES.length);
     expect(new Set(ENGINE_EVENT_TYPES).size).toBe(ENGINE_EVENT_TYPES.length);

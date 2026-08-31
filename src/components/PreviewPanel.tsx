@@ -18,7 +18,10 @@ function PreviewPanelImpl({ output, activeSceneName, onAttachBounds }: PreviewPa
           id="native-preview-bounds"
           ref={onAttachBounds}
           className="preview-frame"
-          style={{ aspectRatio: `${output.width} / ${output.height}` }}
+          style={{
+            aspectRatio: `${output.width} / ${output.height}`,
+            backgroundColor: output.background,
+          }}
           aria-label="Native Szenenvorschau"
         >
           <div className="preview-placeholder">
