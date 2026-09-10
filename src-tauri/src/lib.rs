@@ -2,6 +2,9 @@ mod platform;
 mod taskbar;
 mod updater;
 
+#[cfg(target_os = "windows")]
+use std::sync::atomic::AtomicU64;
+
 use std::{
     sync::{
         Arc, Mutex,
@@ -42,6 +45,10 @@ struct AppState {
     // verworfen), statt sie an noch nicht registrierte Listener zu verlieren.
     events_ready: AtomicBool,
     pending_events: Mutex<Vec<EngineEvent>>,
+    #[cfg(target_os = "windows")]
+    picker_stage_generation: Arc<AtomicU64>,
+    #[cfg(target_os = "windows")]
+    picker_stage_active: Arc<AtomicBool>,
 }
 
 static STUDIO_ACTIVATION_RETRYING: AtomicBool = AtomicBool::new(false);
@@ -305,8 +312,187 @@ fn set_preview_bounds(
 }
 
 #[tauri::command]
+fn set_preview_overlay(
+    visible: bool,
+    output_width: f64,
+    output_height: f64,
+    selection: Option<platform::PreviewOverlaySelection>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let payload = platform::PreviewOverlayPayload {
+        visible,
+        output_width,
+        output_height,
+        selection,
+    };
+    payload.validate()?;
+    platform::set_preview_overlay(state.inner().preview, payload)
+}
+
+#[tauri::command]
 fn set_preview_visible(visible: bool, state: State<'_, AppState>) -> Result<(), String> {
     platform::set_preview_visible(state.inner().preview, visible)
+}
+
+#[cfg(target_os = "windows")]
+fn conceal_program_after_picker(program: &tauri::Window, surface: usize) -> Result<(), String> {
+    if let Err(error) = platform::restore_program_offscreen(surface) {
+        let hide_error = program.hide().err();
+        return Err(match hide_error {
+            Some(hide_error) => format!(
+                "Program konnte weder offscreen noch verborgen werden: {error}; {hide_error}"
+            ),
+            None => format!(
+                "Program konnte nicht offscreen wiederhergestellt werden und wurde verborgen: {error}"
+            ),
+        });
+    }
+    let taskbar_error = program.set_skip_taskbar(true).err();
+    let focusable_error = program.set_focusable(false).err();
+    if taskbar_error.is_some() || focusable_error.is_some() {
+        let hide_error = program.hide().err();
+        let detail = [
+            taskbar_error.map(|error| format!("Taskleiste: {error}")),
+            focusable_error.map(|error| format!("Fokus: {error}")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("; ");
+        return Err(match hide_error {
+            Some(hide_error) => format!(
+                "Program-Nachbereitung scheiterte und Verbergen scheiterte: {detail}; {hide_error}"
+            ),
+            None => format!("Program-Nachbereitung scheiterte; Program wurde verborgen: {detail}"),
+        });
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn prepare_stream_picker(app: AppHandle, state: State<'_, AppState>) -> Result<u64, String> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (app, state);
+        Err("Sichere Fensterauswahl ist derzeit nur unter Windows erforderlich".into())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        const PICKER_SECONDS: u64 = 60;
+        let studio = app
+            .get_webview_window("studio")
+            .ok_or_else(|| "Studio-Fenster nicht verfügbar".to_string())?;
+        let program = app
+            .get_window("program")
+            .ok_or_else(|| "Program-Fenster nicht verfügbar".to_string())?;
+
+        studio.show().map_err(|error| error.to_string())?;
+        studio.unminimize().map_err(|error| error.to_string())?;
+        studio.maximize().map_err(|error| error.to_string())?;
+        studio.set_focus().map_err(|error| error.to_string())?;
+        program.set_focusable(true).map_err(|error| {
+            format!("Program konnte nicht für Fensterauswahl aktiviert werden: {error}")
+        })?;
+        program.set_skip_taskbar(false).map_err(|error| {
+            let registration_error =
+                format!("Program konnte nicht für Fensterauswahl registriert werden: {error}");
+            match conceal_program_after_picker(&program, state.inner().surfaces.program) {
+                Ok(()) => registration_error,
+                Err(conceal_error) => format!("{registration_error}; {conceal_error}"),
+            }
+        })?;
+
+        let stage_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match platform::stage_program_for_picker(
+                state.inner().surfaces.program,
+                state.inner().surfaces.studio,
+            ) {
+                Ok(()) => break,
+                Err(_) if std::time::Instant::now() < stage_deadline => {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => {
+                    return Err(
+                        match conceal_program_after_picker(&program, state.inner().surfaces.program)
+                        {
+                            Ok(()) => error,
+                            Err(conceal_error) => format!("{error}; {conceal_error}"),
+                        },
+                    );
+                }
+            }
+        }
+
+        let generation = state
+            .inner()
+            .picker_stage_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        state
+            .inner()
+            .picker_stage_active
+            .store(true, Ordering::Release);
+        let generation_counter = state.inner().picker_stage_generation.clone();
+        let active = state.inner().picker_stage_active.clone();
+        let surfaces = state.inner().surfaces;
+        let timer_app = app.clone();
+        if let Err(error) = thread::Builder::new()
+            .name("stream-picker-privacy".into())
+            .spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(PICKER_SECONDS);
+                let mut privacy_failure = None;
+                while std::time::Instant::now() < deadline
+                    && generation_counter.load(Ordering::Acquire) == generation
+                {
+                    if let Err(error) =
+                        platform::assert_program_picker_covered(surfaces.program, surfaces.studio)
+                    {
+                        privacy_failure = Some(error);
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+                if generation_counter.load(Ordering::Acquire) != generation {
+                    return;
+                }
+                let restore_error = match timer_app.get_window("program") {
+                    Some(program) => conceal_program_after_picker(&program, surfaces.program).err(),
+                    None => platform::restore_program_offscreen(surfaces.program).err(),
+                };
+                active.store(false, Ordering::Release);
+                let picker_error = match (privacy_failure, restore_error) {
+                    (Some(privacy), Some(restore)) => Some(format!(
+                        "{privacy}; Wiederherstellung fehlgeschlagen: {restore}"
+                    )),
+                    (Some(error), None) | (None, Some(error)) => Some(error),
+                    (None, None) => None,
+                };
+                if let Some(error) = picker_error {
+                    eprintln!("[hooviestar] sichere Fensterauswahl abgebrochen: {error}");
+                    let _ = timer_app.emit("stream-picker-error", error);
+                } else {
+                    let _ = timer_app.emit("stream-picker-restored", ());
+                }
+            })
+        {
+            state
+                .inner()
+                .picker_stage_active
+                .store(false, Ordering::Release);
+            let spawn_error = format!(
+                "Zeitgeber für sichere Fensterauswahl konnte nicht gestartet werden: {error}"
+            );
+            return Err(
+                match conceal_program_after_picker(&program, state.inner().surfaces.program) {
+                    Ok(()) => spawn_error,
+                    Err(conceal_error) => format!("{spawn_error}; {conceal_error}"),
+                },
+            );
+        }
+        Ok(PICKER_SECONDS)
+    }
 }
 
 fn activate_studio(app: &AppHandle) {
@@ -355,6 +541,26 @@ fn try_activate_studio(app: &AppHandle) -> bool {
     true
 }
 
+#[cfg(target_os = "windows")]
+fn show_startup_failure(message: &str) {
+    use windows::{
+        Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW},
+        core::{PCWSTR, w},
+    };
+    let mut text: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let _ = MessageBoxW(
+            None,
+            PCWSTR(text.as_mut_ptr()),
+            w!("Hooviestar konnte nicht gestartet werden"),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn show_startup_failure(_message: &str) {}
+
 pub fn run() {
     platform::configure_graphics_backend();
     let resources = Arc::new(RuntimeResources::new());
@@ -390,10 +596,13 @@ pub fn run() {
             select_portal_sources,
             canonicalize_file,
             set_preview_bounds,
+            set_preview_overlay,
             set_preview_visible,
+            prepare_stream_picker,
             updater::updater_status
         ])
         .setup(move |app| {
+            let setup_result: Result<(), String> = (|| {
             let studio = app
                 .get_webview_window("studio")
                 .ok_or_else(|| "Studio window unavailable".to_string())?;
@@ -409,10 +618,20 @@ pub fn run() {
                 .decorations(false)
                 .focused(false)
                 .focusable(false)
+                .skip_taskbar(true)
                 .visible(output_visibility.initially_visible())
                 .build()
                 .map_err(|error| error.to_string())?;
             output_visibility.show_program(&program)?;
+            #[cfg(target_os = "windows")]
+            {
+                // Keep Tao's visibility state aligned with the raw Win32 mapping.
+                // Without this, picker staging's set_focusable(true) hides the
+                // still-captureable HWND because Tao believes it is invisible.
+                program.show().map_err(|error| {
+                    format!("Program-Fenster konnte nicht angezeigt werden: {error}")
+                })?;
+            }
             spawn_audio_watchdog()?;
             let (preview, surfaces) =
                 NativePreview::create(&studio, &program, &output_visibility)?;
@@ -444,6 +663,10 @@ pub fn run() {
                 initial_events,
                 events_ready: AtomicBool::new(false),
                 pending_events: Mutex::new(Vec::new()),
+                #[cfg(target_os = "windows")]
+                picker_stage_generation: Arc::new(AtomicU64::new(0)),
+                #[cfg(target_os = "windows")]
+                picker_stage_active: Arc::new(AtomicBool::new(false)),
             });
             register_initial_hotkeys(app.handle(), engine.clone());
 
@@ -530,10 +753,28 @@ pub fn run() {
                 .lock()
                 .expect("event thread mutex poisoned") = Some(event_thread);
             updater::spawn(app.handle().clone());
-            Ok(())
+                Ok(())
+            })();
+            if let Err(error) = &setup_result {
+                let message = format!(
+                    "Hooviestar konnte nicht gestartet werden.\n\n{error}\n\n\
+                     Ohne einen initialisierten nativen Renderer wird kein gültiges \
+                     Program-Fenster für die Freigabe angeboten."
+                );
+                show_startup_failure(&message);
+            }
+            setup_result.map_err(Into::into)
         })
         .build(tauri::generate_context!())
-        .expect("Tauri build failed");
+        .unwrap_or_else(|error| {
+            let message = format!(
+                "Hooviestar konnte nicht gestartet werden.\n\n{error}\n\n\
+                 Ohne einen initialisierten nativen Renderer wird kein gültiges \
+                 Program-Fenster für die Freigabe angeboten."
+            );
+            show_startup_failure(&message);
+            panic!("Tauri build failed: {error}");
+        });
     let app_handle = app.handle().clone();
     let run_resources = resources.clone();
     app.run(move |handle, event| match event {
@@ -558,13 +799,21 @@ pub fn run() {
 
 #[cfg(target_os = "windows")]
 fn spawn_audio_watchdog() -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     let journal = hooviestar_engine::audio::journal::default_journal_path()
         .map_err(|error| error.to_string())?;
-    std::process::Command::new(executable)
+    let mut command = std::process::Command::new(executable);
+    command
+        .creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0)
         .arg("--audio-watchdog")
         .arg(std::process::id().to_string())
         .arg(journal)
+        // Keep watchdog diagnostics on the parent's stderr without creating a
+        // console window for this helper process.
+        .stderr(std::process::Stdio::inherit());
+    command
         .spawn()
         .map(|_| ())
         .map_err(|error| error.to_string())

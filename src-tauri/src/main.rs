@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 fn main() {
     let mut arguments = std::env::args_os();
     let _executable = arguments.next();

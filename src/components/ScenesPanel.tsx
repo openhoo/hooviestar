@@ -1,7 +1,20 @@
-import { memo, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import type { Scene } from "../types";
+import { ConfirmDialog } from "./ConfirmDialog";
 import { MinusIcon, PencilIcon, PlusIcon } from "./icons";
-import { useArmedConfirm } from "../hooks/useArmedConfirm";
+
+function allowsDeleteShortcut(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  if (
+    target.isContentEditable ||
+    target.tagName === "INPUT" ||
+    target.tagName === "TEXTAREA" ||
+    target.tagName === "SELECT"
+  ) {
+    return false;
+  }
+  return !target.closest('[role="dialog"], [aria-modal="true"], .modal-dialog');
+}
 
 interface ScenesPanelProps {
   scenes: Scene[];
@@ -13,6 +26,7 @@ interface ScenesPanelProps {
   onSaveHotkey: (event: React.FormEvent<HTMLFormElement>) => void;
   onRemoveScene: (sceneId: string) => void | Promise<void>;
   onRenameScene: (sceneId: string, name: string) => void;
+  onRemoveArmedChange?: (armed: boolean) => void;
 }
 
 function ScenesPanelImpl({
@@ -25,22 +39,87 @@ function ScenesPanelImpl({
   onSaveHotkey,
   onRemoveScene,
   onRenameScene,
+  onRemoveArmedChange,
 }: ScenesPanelProps) {
   const removeButtonRef = useRef<HTMLButtonElement>(null);
-  const removeTriggerRefs = useMemo(() => [removeButtonRef], []);
+  const [removeOpen, setRemoveOpen] = useState(false);
+  const [removeSceneId, setRemoveSceneId] = useState<string | null>(null);
+  const [removeBusy, setRemoveBusy] = useState(false);
+  const removeBusyRef = useRef(false);
+  const [removeError, setRemoveError] = useState<string | null>(null);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
   // Unterscheidet „Escape“ von „Commit über Blur“, da beim Aushängen des
   // Eingabefelds je nach Browser noch ein Blur-Event nachläuft.
   const renameCancelledRef = useRef(false);
 
-  // Geteilte Zwei-Klick-Entfernung: Szenewechsel, Klick außerhalb und Escape
-  // entschärfen; während der Bestätigung werden weitere Klicks ignoriert.
-  const { armed: removeArmed, trigger: triggerRemove } = useArmedConfirm(
-    () => onRemoveScene(activeScene.id),
-    activeScene.id,
-    removeTriggerRefs,
-  );
+  useEffect(() => {
+    onRemoveArmedChange?.(removeOpen);
+  }, [onRemoveArmedChange, removeOpen]);
+  useEffect(() => () => onRemoveArmedChange?.(false), [onRemoveArmedChange]);
+
+  // Ein externer Szenenwechsel darf eine bereits geöffnete Bestätigung nicht
+  // auf eine inzwischen andere aktive Szene anwenden.
+  useEffect(() => {
+    if (removeOpen && removeSceneId !== activeScene.id) {
+      setRemoveOpen(false);
+      setRemoveSceneId(null);
+      setRemoveError(null);
+    }
+  }, [activeScene.id, removeOpen, removeSceneId]);
+
+  function requestRemove() {
+    if (scenes.length <= 1 || removeBusyRef.current) return;
+    setRemoveSceneId(activeScene.id);
+    setRemoveError(null);
+    setRemoveOpen(true);
+  }
+
+  function cancelRemove() {
+    if (removeBusyRef.current) return;
+    setRemoveOpen(false);
+    setRemoveSceneId(null);
+    setRemoveError(null);
+  }
+
+  async function confirmRemove() {
+    if (removeBusyRef.current) return;
+    const targetId = removeSceneId;
+    const target = targetId ? scenes.find((scene) => scene.id === targetId) : undefined;
+    if (!target || target.id !== activeScene.id || scenes.length <= 1) {
+      setRemoveError("Die Szene ist nicht mehr aktiv. Bitte die Entfernung erneut starten.");
+      return;
+    }
+    removeBusyRef.current = true;
+    setRemoveBusy(true);
+    try {
+      await onRemoveScene(target.id);
+      setRemoveOpen(false);
+      setRemoveSceneId(null);
+    } catch (error) {
+      setRemoveError(String(error));
+    } finally {
+      removeBusyRef.current = false;
+      setRemoveBusy(false);
+    }
+  }
+  function handleDockKeyDown(event: React.KeyboardEvent<HTMLElement>) {
+    if (
+      event.defaultPrevented ||
+      (event.key !== "Delete" && event.key !== "Backspace") ||
+      !allowsDeleteShortcut(event.target) ||
+      scenes.length <= 1
+    ) {
+      return;
+    }
+    const target = event.target as HTMLElement;
+    const activeRow = target.closest(".scene-row");
+    const removeControl = target.closest('[data-delete-trigger="scene"]');
+    if (activeRow?.getAttribute("aria-current") !== "true" && !removeControl) return;
+    event.preventDefault();
+    event.stopPropagation();
+    requestRemove();
+  }
 
   const startRename = (scene: Scene) => {
     renameCancelledRef.current = false;
@@ -60,8 +139,12 @@ function ScenesPanelImpl({
     setRenamingId(null);
   };
 
+  const removeTargetName = removeSceneId
+    ? scenes.find((scene) => scene.id === removeSceneId)?.name ?? activeScene.name
+    : activeScene.name;
+
   return (
-    <nav className="dock scenes-dock" aria-label="Szenen">
+    <nav className="dock scenes-dock" aria-label="Szenen" aria-keyshortcuts="Delete" onKeyDown={handleDockKeyDown}>
       <div className="dock-title">
         <div className="dock-heading">
           <h2>Szenen</h2>
@@ -74,11 +157,14 @@ function ScenesPanelImpl({
           <button
             ref={removeButtonRef}
             type="button"
-            className={removeArmed ? "icon-button armed" : "icon-button"}
-            aria-label={removeArmed ? "Erneut klicken zum Entfernen" : "Aktive Szene entfernen"}
-            title={removeArmed ? "Erneut klicken zum Entfernen" : "Aktive Szene entfernen"}
+            className={removeOpen ? "icon-button armed" : "icon-button"}
+            aria-label="Aktive Szene entfernen"
+            aria-keyshortcuts="Delete"
+            aria-expanded={removeOpen}
+            title="Aktive Szene entfernen"
+            data-delete-trigger="scene"
             disabled={scenes.length <= 1}
-            onClick={triggerRemove}
+            onClick={requestRemove}
           >
             <MinusIcon />
           </button>
@@ -111,11 +197,11 @@ function ScenesPanelImpl({
                   className="scene-row"
                   aria-current={scene.id === activeScene.id ? "true" : undefined}
                   onClick={() => onSwitchScene(scene)}
+                  onDoubleClick={() => startRename(scene)}
                 >
                   <span
                     className="scene-name"
                     title={`${scene.name} (Doppelklick zum Umbenennen)`}
-                    onDoubleClick={() => startRename(scene)}
                   >
                     {scene.name}
                   </span>
@@ -157,6 +243,16 @@ function ScenesPanelImpl({
         </form>
       </details>
       {sceneError && <p className="dock-message" role="alert">{sceneError}</p>}
+      <ConfirmDialog
+        open={removeOpen}
+        title={`Szene „${removeTargetName}“ entfernen?`}
+        description="Die aktive Szene wird entfernt. Die erste verbleibende Szene wird anschließend aktiv."
+        error={removeError}
+        busy={removeBusy}
+        onCancel={cancelRemove}
+        onConfirm={confirmRemove}
+        onRestoreFocus={() => removeButtonRef.current?.focus()}
+      />
     </nav>
   );
 }

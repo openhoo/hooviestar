@@ -114,6 +114,27 @@ On first start, Hooviestar creates three scenes:
 
 The default hotkeys also identify these roles when Hooviestar places newly added sources automatically. Scene names may change; keep the three default hotkeys assigned if automatic placement is required.
 
+### Editing scenes and sources
+
+Click a source in the preview or source dock to select it. The selection outline and eight resize handles identify the editable item; drag its body to move it or a handle to resize it. Rotated resizing keeps the opposite handle fixed. Locked items remain selectable but cannot be moved or resized, and their inspector fields are disabled.
+
+| Control | Action |
+| --- | --- |
+| Arrow keys in the preview | Move the selected item by one output pixel |
+| `Shift` + arrow keys | Move by ten output pixels |
+| `Alt` + arrow keys | Change width/height by one output pixel; left/up shrink |
+| `Alt` + `Shift` + arrow keys | Change width/height by ten output pixels |
+| `Escape` during a drag | Cancel without committing the drag |
+| `Delete` or `Backspace` on the active scene/selected source row or its delete button | Open a removal confirmation |
+| `Escape`, Cancel, or an outside click in the confirmation | Cancel and restore focus |
+
+These editing shortcuts do not intercept typing in text/numeric fields or controls inside a dialog. Inspector transform fields commit on blur; failed or stale updates are shown rather than silently overwriting a newer edit.
+
+Scene deletion activates a remaining scene; the final scene cannot be removed. **Source removal is global**: the confirmation lists affected scenes, and confirming also removes that source's scene items. Locking an item's transform does not protect the underlying source from an explicitly confirmed global removal.
+
+On Windows, a separate native preview overlay supplies visible selection guides and mouse input above the GPU child window. It is hidden with the preview when a modal is open and never becomes part of the Program output. Release builds use the Windows GUI subsystem; debug builds retain their console. Native renderer startup failures show a Windows diagnostic instead of silently offering a nonfunctional output.
+
+
 ## Build installers
 
 Install frontend dependencies first with `npm ci`, then build on the target operating system.

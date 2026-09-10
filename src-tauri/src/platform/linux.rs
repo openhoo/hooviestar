@@ -1,5 +1,7 @@
 use std::{os::unix::process::CommandExt, process::Command, sync::Arc};
 
+use super::PreviewOverlayPayload;
+
 use hooviestar_engine::{
     NativeSurfaceKind, NativeSurfaces, SourceCandidate, SourceEnumeration,
     project::{DisplayBinding, WindowBinding},
@@ -435,6 +437,10 @@ pub fn set_preview_bounds(
     _height: i32,
 ) -> Result<(), String> {
     Err("Linux verwendet ein separates natives Preview-Fenster".into())
+}
+
+pub fn set_preview_overlay(_pointer: usize, _payload: PreviewOverlayPayload) -> Result<(), String> {
+    Ok(())
 }
 
 pub fn set_preview_visible(_pointer: usize, _visible: bool) -> Result<(), String> {

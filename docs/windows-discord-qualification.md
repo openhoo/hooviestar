@@ -49,6 +49,7 @@ npm run test:windows-qualification
 
 - Windows 11 in an interactive logged-in desktop session.
 - Hardware D3D11 device and working default playback endpoint.
+- If native D3D11/renderer initialization fails, startup stops before Hooviestar offers a shareable Program surface and shows the exact Windows startup error; it never substitutes a software or black output.
 - Microsoft Edge or Google Chrome.
 - For local transport: Node.js and official MiroTalk BRO pinned to the reviewed qualification commit.
 - For Discord transport: Discord desktop, signed in and joined to a voice channel.
@@ -56,6 +57,17 @@ npm run test:windows-qualification
 - Rust toolchain matching this repository.
 
 Do not run the live qualification as a service or ordinary hosted CI job. Windows Graphics Capture, Discord, and WASAPI need the interactive user desktop and audio endpoint. Existing Windows CI still compiles the probes and runs deterministic Windows unit tests.
+
+### Native editor and startup gate
+
+Frontend browser tests with an IPC fixture prove UI behavior, not Win32 layered-window drawing, pointer capture, mixed-DPI alignment, or Discord's picker. Qualify these separately on the packaged Windows application:
+
+- Launch from Explorer: no application or watchdog console. With a working renderer, prepare the picker and verify **Hooviestar – Program** remains mapped and selectable through the focusability transition.
+- Click an unselected source through the native preview, then move and resize it using edge/corner handles, including a rotated item. Confirm guides stay aligned at different preview sizes and display scaling settings.
+- Release a drag outside the preview, cancel with Escape, and interrupt with Alt-Tab or a modal. Pointer capture must not stick or steal another window's capture.
+- Lock a source and verify movement/resizing cannot change it. Confirm both native preview surfaces hide beneath dialogs and restore afterwards.
+- Capture Program independently: editing guides and dialogs must never appear in the captured scene.
+- Exercise scene/source removal confirmation, cancellation, last-scene protection, and focus restoration; verify startup diagnostics under an actual renderer initialization failure.
 
 ## 1. Native publisher qualification
 

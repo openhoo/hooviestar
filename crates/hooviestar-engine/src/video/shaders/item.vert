@@ -23,7 +23,8 @@ void main() {
     ); // (0,0), (1,0), (0,1), (1,1)
 
     vec2 local = (corner - 0.5) * pc.halfExtent * 2.0;
-    mat2 rot = mat2(pc.cosSin.x, -pc.cosSin.y, pc.cosSin.y, pc.cosSin.x);
+    // GLSL constructors are column-major; positive angles rotate clockwise in +y-down output space.
+    mat2 rot = mat2(pc.cosSin.x, pc.cosSin.y, -pc.cosSin.y, pc.cosSin.x);
     vec2 position = pc.center + rot * local;
 
     gl_Position = vec4(

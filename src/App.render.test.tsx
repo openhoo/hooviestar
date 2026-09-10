@@ -5,7 +5,7 @@
  * Die Tauri-Grenze wird gemockt; das Projekt-Fixture ist dasselbe shared
  * Rust-Fixture wie in contracts.test.ts.
  */
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fixture from "../contracts/project-v1.json";
 import { parseProjectV1 } from "./types";
@@ -14,6 +14,8 @@ const dispatchedCommands: Array<Record<string, unknown>> = [];
 const invokedCommands: Array<{ command: string; args?: Record<string, unknown> }> = [];
 let rejectedDispatchType: string | null = null;
 let rejectedInvokeCommand: string | null = null;
+let deferSetTransformDispatch = false;
+let pendingSetTransformResolve: (() => void) | null = null;
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(async (command: string, args?: Record<string, unknown>) => {
@@ -23,10 +25,17 @@ vi.mock("@tauri-apps/api/core", () => ({
     if (command === "enumerate_sources") {
       return { candidates: [], portalSelectionRequired: false, message: null };
     }
+    if (command === "prepare_stream_picker") return 60;
     if (command === "dispatch") {
       const dispatched = (args?.command ?? {}) as Record<string, unknown>;
       dispatchedCommands.push(dispatched);
       if (dispatched.type === rejectedDispatchType) throw new Error("dispatch failed");
+      if (dispatched.type === "set_transform" && deferSetTransformDispatch) {
+        await new Promise<void>((resolve) => {
+          pendingSetTransformResolve = resolve;
+        });
+        pendingSetTransformResolve = null;
+      }
       return null;
     }
     return null;
@@ -83,6 +92,9 @@ describe("studio shell", () => {
     invokedCommands.length = 0;
     rejectedDispatchType = null;
     rejectedInvokeCommand = null;
+    deferSetTransformDispatch = false;
+    pendingSetTransformResolve?.();
+    pendingSetTransformResolve = null;
   });
   afterEach(cleanup);
 
@@ -98,6 +110,29 @@ describe("studio shell", () => {
       /\b\d+ (Szene|Szenen) · \d+ (Quelle|Quellen)\b/.test(element.textContent ?? ""),
     );
     expect(counts).toBeTruthy();
+  });
+
+  it("bereitet unter Windows die verdeckte Program-Auswahl explizit vor", async () => {
+    const platform = window.navigator.platform;
+    const resizeObserver = globalThis.ResizeObserver;
+    Object.defineProperty(window.navigator, "platform", { configurable: true, value: "Win32" });
+    globalThis.ResizeObserver = class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    } as unknown as typeof ResizeObserver;
+    try {
+      await renderStudio();
+      fireEvent.click(screen.getByRole("button", { name: "Sicher vorbereiten" }));
+      await waitFor(() => expect(invokedCommands).toContainEqual({
+        command: "prepare_stream_picker",
+        args: undefined,
+      }));
+      expect(await screen.findByText(/60 Sekunden im Picker verfügbar/)).toBeTruthy();
+    } finally {
+      Object.defineProperty(window.navigator, "platform", { configurable: true, value: platform });
+      globalThis.ResizeObserver = resizeObserver;
+    }
   });
 
   it("öffnet Ausgabe-Einstellungen und dispatcht die vollständige Auswahl genau einmal", async () => {
@@ -273,6 +308,48 @@ describe("studio shell", () => {
     }));
   });
 
+  it("verwirft einen veralteten Preview-Drag während eine Inspector-Änderung wartet", async () => {
+    await renderStudio();
+    deferSetTransformDispatch = true;
+    try {
+      fireEvent.click(placedSourceRowButton());
+      const xField = screen.getByRole("spinbutton", { name: "X der Quelle" });
+      fireEvent.change(xField, { target: { value: "150" } });
+      fireEvent.blur(xField);
+
+      await waitFor(() => {
+        const transforms = dispatchedCommands.filter((command) => command.type === "set_transform");
+        expect(transforms).toHaveLength(1);
+        expect(transforms[0]).toEqual(expect.objectContaining({
+          transform: expect.objectContaining({ x: 150 }),
+        }));
+      });
+
+      const frame = screen.getByRole("application", { name: "Native Szenenvorschau" });
+      Object.defineProperty(frame, "getBoundingClientRect", {
+        configurable: true,
+        value: () => ({ left: 0, top: 0, width: 1280, height: 720, right: 1280, bottom: 720 }),
+      });
+      const item = frame.querySelector<HTMLElement>("[data-preview-item]");
+      expect(item).toBeTruthy();
+      fireEvent.pointerDown(item!, { button: 0, pointerId: 17, clientX: 640, clientY: 360 });
+      fireEvent.pointerMove(frame, { pointerId: 17, clientX: 650, clientY: 360 });
+      fireEvent.pointerUp(frame, { pointerId: 17, clientX: 650, clientY: 360 });
+
+      await waitFor(() => {
+        expect(screen.getAllByText(/Die Quelle wurde inzwischen geändert/).length).toBeGreaterThan(0);
+      });
+      expect(dispatchedCommands.filter((command) => command.type === "set_transform")).toHaveLength(1);
+
+      expect(pendingSetTransformResolve).toBeTruthy();
+      pendingSetTransformResolve?.();
+      await waitFor(() => expect(pendingSetTransformResolve).toBeNull());
+    } finally {
+      pendingSetTransformResolve?.();
+      deferSetTransformDispatch = false;
+    }
+  });
+
   it("bietet Szenenumbenennung als sichtbare Tastaturaktion an", async () => {
     await renderStudio();
     const scene = project.scenes[0]!;
@@ -287,25 +364,58 @@ describe("studio shell", () => {
     }));
   });
 
-  it("armiert die Quellen-Entfernung und entschärft bei pointerdown außerhalb", async () => {
+  it("bricht die Quellen-Entfernung bei pointerdown außerhalb ab", async () => {
     await renderStudio();
     fireEvent.click(placedSourceRowButton());
-    const removeButton = screen.getByTitle("Ausgewählte Quelle entfernen");
-    fireEvent.click(removeButton);
-    expect(screen.getByTitle("Erneut klicken zum Entfernen")).toBeTruthy();
-    fireEvent.pointerDown(document.body);
-    expect(screen.getByTitle("Ausgewählte Quelle entfernen")).toBeTruthy();
+    fireEvent.click(screen.getByTitle("Ausgewählte Quelle entfernen"));
+    expect(screen.getByRole("alertdialog", { name: /Quelle .* entfernen\?/ })).toBeTruthy();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    fireEvent.pointerDown(document.body, { button: 0 });
+    fireEvent.click(document.body);
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
     expect(dispatchedCommands.filter((command) => command.type === "remove_source")).toHaveLength(0);
   });
 
-  it("entschärft die armierte Quellen-Entfernung bei Escape", async () => {
+  it("zeigt vor der Quellen-Entfernung ein Alertdialog mit allen betroffenen Szenen", async () => {
+    await renderStudio();
+    const source = placedSource();
+    fireEvent.click(placedSourceRowButton());
+    fireEvent.click(screen.getByTitle("Ausgewählte Quelle entfernen"));
+
+    const dialog = screen.getByRole("alertdialog", { name: `Quelle „${source.name}“ entfernen?` });
+    expect(dialog.textContent).toContain("Betroffene Szenen:");
+    expect(dialog.textContent).toContain(project.scenes[0]!.name);
+    fireEvent.click(screen.getByRole("button", { name: "Abbrechen" }));
+    expect(screen.queryByRole("alertdialog", { name: `Quelle „${source.name}“ entfernen?` })).toBeNull();
+    expect(dispatchedCommands.filter((command) => command.type === "remove_source")).toHaveLength(0);
+  });
+
+  it("öffnet die Quellenbestätigung per Delete, aber nicht aus dem editierbaren Inspector", async () => {
+    await renderStudio();
+    fireEvent.click(placedSourceRowButton());
+    fireEvent.keyDown(placedSourceRowButton(), { key: "Delete" });
+    expect(screen.getByRole("alertdialog", { name: /Quelle .* entfernen\?/ })).toBeTruthy();
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+
+    const nameInput = screen.getByRole("textbox", { name: "Quellenname" });
+    fireEvent.keyDown(nameInput, { key: "Delete" });
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(dispatchedCommands.filter((command) => command.type === "remove_source")).toHaveLength(0);
+  });
+
+  it("bricht die Quellen-Entfernung bei Escape ab und gibt Fokus zurück", async () => {
     await renderStudio();
     fireEvent.click(placedSourceRowButton());
     const removeButton = screen.getByTitle("Ausgewählte Quelle entfernen");
+    (removeButton as HTMLButtonElement).focus();
     fireEvent.click(removeButton);
-    expect(screen.getByTitle("Erneut klicken zum Entfernen")).toBeTruthy();
+    expect(screen.getByRole("alertdialog", { name: /Quelle .* entfernen\?/ })).toBeTruthy();
     fireEvent.keyDown(document, { key: "Escape" });
-    expect(screen.getByTitle("Ausgewählte Quelle entfernen")).toBeTruthy();
+    await waitFor(() => {
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+      expect(document.activeElement).toBe(removeButton);
+    });
     expect(dispatchedCommands.filter((command) => command.type === "remove_source")).toHaveLength(0);
   });
 
@@ -313,11 +423,11 @@ describe("studio shell", () => {
     await renderStudio();
     const source = placedSource();
     fireEvent.click(placedSourceRowButton());
-    const removeButton = screen.getByTitle("Ausgewählte Quelle entfernen");
-    fireEvent.click(removeButton);
-    fireEvent.click(removeButton);
-    fireEvent.click(removeButton);
-    fireEvent.click(removeButton);
+    fireEvent.click(screen.getByTitle("Ausgewählte Quelle entfernen"));
+    const confirm = screen.getByRole("button", { name: "Entfernen" });
+    fireEvent.click(confirm);
+    fireEvent.click(confirm);
+    fireEvent.click(confirm);
     await waitFor(() => {
       expect(dispatchedCommands.filter((command) => command.type === "remove_source")).toHaveLength(1);
     });
@@ -326,16 +436,18 @@ describe("studio shell", () => {
     );
   });
 
-  it("behält die Quellenauswahl bei fehlgeschlagener Entfernung", async () => {
+  it("zeigt einen Fehler und behält die Quellenauswahl bei fehlgeschlagener Entfernung", async () => {
     await renderStudio();
     rejectedDispatchType = "remove_source";
     const sourceButton = placedSourceRowButton();
     fireEvent.click(sourceButton);
-    const removeButton = screen.getByTitle("Ausgewählte Quelle entfernen");
-    fireEvent.click(removeButton);
-    fireEvent.click(removeButton);
+    fireEvent.click(screen.getByTitle("Ausgewählte Quelle entfernen"));
+    fireEvent.click(screen.getByRole("button", { name: "Entfernen" }));
 
-    await screen.findByText(/dispatch failed/);
+    await waitFor(() => {
+      const dialog = screen.getByRole("alertdialog");
+      expect(within(dialog).getByRole("alert").textContent).toMatch(/dispatch failed/);
+    });
     expect(sourceButton.closest(".source-row")?.classList.contains("selected")).toBe(true);
   });
 

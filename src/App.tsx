@@ -58,6 +58,19 @@ function activeSceneOf(project: ProjectV1): Scene {
   if (!scene) throw new Error("Aktive Szene fehlt im validierten Projekt");
   return scene;
 }
+function sameTransform(left: Transform, right: Transform): boolean {
+  return Math.fround(left.x) === Math.fround(right.x)
+    && Math.fround(left.y) === Math.fround(right.y)
+    && Math.fround(left.width) === Math.fround(right.width)
+    && Math.fround(left.height) === Math.fround(right.height)
+    && Math.fround(left.rotationDegrees) === Math.fround(right.rotationDegrees)
+    && Math.fround(left.cropTop) === Math.fround(right.cropTop)
+    && Math.fround(left.cropRight) === Math.fround(right.cropRight)
+    && Math.fround(left.cropBottom) === Math.fround(right.cropBottom)
+    && Math.fround(left.cropLeft) === Math.fround(right.cropLeft)
+    && Math.fround(left.opacity) === Math.fround(right.opacity);
+}
+
 
 export default function App() {
   const { project, status, levels, mediaStates } = useSyncExternalStore(
@@ -73,8 +86,20 @@ export default function App() {
   const [previewBoundsError, setPreviewBoundsError] = useState<string | null>(null);
   const [previewVisibilityError, setPreviewVisibilityError] = useState<string | null>(null);
   const [windowError, setWindowError] = useState<string | null>(null);
+  const [pickerMessage, setPickerMessage] = useState<string | null>(null);
+  const [pickerBusy, setPickerBusy] = useState(false);
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [armedRemoveDock, setArmedRemoveDock] = useState<"scene" | "source" | null>(null);
+  // Keep transform submissions as the synchronous optimistic baseline shared
+  // by the preview and inspector until the matching engine snapshot arrives.
+  const latestSubmittedByItemRef = useRef(new Map<string, Transform>());
+  const onSceneRemoveArmedChange = useCallback((armed: boolean) => {
+    setArmedRemoveDock((current) => armed ? "scene" : current === "scene" ? null : current);
+  }, []);
+  const onSourceRemoveArmedChange = useCallback((armed: boolean) => {
+    setArmedRemoveDock((current) => armed ? "source" : current === "source" ? null : current);
+  }, []);
   const settingsButton = useRef<HTMLButtonElement>(null);
   const onboardingDismissedRef = useRef(false);
   // Optimistische Feld-Deltas je Quelle: überbrückt das Snapshot-Event-Lag, damit
@@ -98,6 +123,7 @@ export default function App() {
     prunePendingFields,
   } = useAudioFieldBridge(pendingSourceFieldsRef, sourceMutationQueueRef.current);
   const [textError, setTextError] = useState<string | null>(null);
+  const [transformError, setTransformError] = useState<string | null>(null);
   const addButton = useRef<HTMLButtonElement>(null);
   const addDialogTriggerRef = useRef<HTMLElement | null>(null);
   // Native-Vorschau: das Element überlebt Projekt-Updates; Beobachter und
@@ -108,8 +134,43 @@ export default function App() {
   const previewVisibilityRequestRef = useRef(0);
 
   useEffect(() => {
+    const submitted = latestSubmittedByItemRef.current;
+    if (!project) {
+      submitted.clear();
+      return;
+    }
+    for (const [itemId, transform] of submitted) {
+      let item: Scene["items"][number] | undefined;
+      for (const scene of project.scenes) {
+        item = scene.items.find((entry) => entry.id === itemId);
+        if (item) break;
+      }
+      if (!item || sameTransform(item.transform, transform)) submitted.delete(itemId);
+    }
+  }, [project]);
+
+  useEffect(() => {
     void engineStore.start();
   }, []);
+  useEffect(() => {
+    let active = true;
+    const errorListener = listen<string>("stream-picker-error", ({ payload }) => {
+      if (!active) return;
+      setPickerBusy(false);
+      setWindowError(`Sichere Fensterauswahl abgebrochen: ${payload}`);
+    });
+    const restoredListener = listen("stream-picker-restored", () => {
+      if (!active) return;
+      setPickerBusy(false);
+      setPickerMessage("Program ist wieder vollständig unsichtbar.");
+    });
+    return () => {
+      active = false;
+      void errorListener.then((unlisten) => unlisten());
+      void restoredListener.then((unlisten) => unlisten());
+    };
+  }, []);
+
   useEffect(() => {
     let active = true;
     let clearTimer: ReturnType<typeof setTimeout> | null = null;
@@ -179,7 +240,7 @@ export default function App() {
     );
   }, []);
 
-  const nativePreviewObscured = settingsOpen || addOpen;
+  const nativePreviewObscured = settingsOpen || addOpen || armedRemoveDock !== null;
   useEffect(() => {
     if (!isWindowsPlatform()) return;
     const request = ++previewVisibilityRequestRef.current;
@@ -461,10 +522,11 @@ export default function App() {
 
   // Auswahl wechselt die Quelle und verwirft alte Fehlermeldungen der
   // vorherigen Auswahl, damit sie nicht dem neuen Kontext zugeordnet werden.
-  const selectSource = useCallback((sourceId: string) => {
+  const selectSource = useCallback((sourceId: string | null) => {
     setSelectedSourceId(sourceId);
     setItemError(null);
     setTextError(null);
+    setTransformError(null);
   }, []);
 
   const handleTextChange = useCallback((source: TextSource, event: React.ChangeEvent<HTMLTextAreaElement>) => {
@@ -507,12 +569,50 @@ export default function App() {
     }
     void runGuarded(() => engineStore.dispatch(command), setItemError);
   }, []);
+  const updateTransform = useCallback(async (
+    itemId: string,
+    transform: Transform,
+    expected?: Transform,
+  ) => {
+    setTransformError(null);
+    const snapshot = engineStore.getSnapshot().project;
+    if (!snapshot) throw new Error("Projekt ist noch nicht geladen");
+    const activeScene = activeSceneOf(snapshot);
+    const item = activeScene.items.find((entry) => entry.id === itemId);
+    if (!item) throw new Error("Szenenelement der aktiven Szene fehlt");
+    const submitted = latestSubmittedByItemRef.current;
+    const baseline = submitted.get(itemId) ?? item.transform;
+    if (expected && !sameTransform(baseline, expected)) {
+      const message = "Die Quelle wurde inzwischen geändert; bitte erneut versuchen.";
+      setTransformError(message);
+      throw new Error(message);
+    }
+    submitted.set(itemId, transform);
+    try {
+      await engineStore.dispatch({
+        type: "set_transform",
+        sceneId: activeScene.id,
+        itemId,
+        transform,
+      });
+    } catch (error) {
+      if (submitted.get(itemId) && sameTransform(submitted.get(itemId)!, transform)) {
+        submitted.delete(itemId);
+      }
+      setTransformError(String(error));
+      throw error;
+    }
+  }, []);
 
-  const removeScene = useCallback(
-    (sceneId: string) =>
-      runGuarded(() => engineStore.dispatch({ type: "remove_scene", sceneId }), setSceneError),
-    [],
-  );
+  const removeScene = useCallback(async (sceneId: string) => {
+    setSceneError(null);
+    try {
+      await engineStore.dispatch({ type: "remove_scene", sceneId });
+    } catch (error) {
+      setSceneError(String(error));
+      throw error;
+    }
+  }, []);
 
   const renameScene = useCallback((sceneId: string, name: string) => {
     void runGuarded(() => engineStore.dispatch({ type: "rename_scene", sceneId, name }), setSceneError);
@@ -520,12 +620,33 @@ export default function App() {
 
   // Kaskadierendes Entfernen: die Engine räumt referenzierende Items ab;
   // hier nur die Auswahl und ihre Fehlermeldungen zurücksetzen.
-  const removeSource = useCallback((sourceId: string) => {
-    return runGuarded(async () => {
+  const removeSource = useCallback(async (sourceId: string) => {
+    setItemError(null);
+    try {
       await engineStore.dispatch({ type: "remove_source", sourceId });
       setSelectedSourceId((current) => (current === sourceId ? null : current));
       setTextError(null);
-    }, setItemError);
+      setTransformError(null);
+    } catch (error) {
+      setItemError(String(error));
+      throw error;
+    }
+  }, []);
+  const prepareStreamPicker = useCallback(() => {
+    setPickerBusy(true);
+    setPickerMessage(null);
+    setWindowError(null);
+    void invoke<number>("prepare_stream_picker").then(
+      (seconds) => {
+        setPickerMessage(
+          `Program ist ${seconds} Sekunden im Picker verfügbar, bleibt aber vollständig vom Studio verdeckt. Jetzt Discord öffnen.`,
+        );
+      },
+      (error: unknown) => {
+        setPickerBusy(false);
+        setWindowError(`Sichere Fensterauswahl fehlgeschlagen: ${String(error)}`);
+      },
+    );
   }, []);
 
   const quitStudio = useCallback(() => {
@@ -564,6 +685,11 @@ export default function App() {
     selectedSource?.type === "media" ? (mediaStates[selectedSource.id] ?? null) : null;
 
   const sourceRows = sourceRowsFor(project.sources, activeScene.items);
+  const affectedSceneNames = selectedSourceId
+    ? project.scenes
+        .filter((scene) => scene.items.some((item) => item.sourceId === selectedSourceId))
+        .map((scene) => scene.name)
+    : [];
 
   // Audiokanäle mit Pending-Overlay, damit Slider-Optimistik im Mixer ankommt.
   const mixerChannels = project.sources
@@ -668,16 +794,19 @@ export default function App() {
             onSaveHotkey={handleSaveHotkey}
             onRemoveScene={removeScene}
             onRenameScene={renameScene}
+            onRemoveArmedChange={onSceneRemoveArmedChange}
           />
           <SourcesPanel
             rows={sourceRows}
             selectedSourceId={selectedSourceId}
+            affectedSceneNames={affectedSceneNames}
             itemError={itemError}
             addButtonRef={addButton}
             onSelectSource={selectSource}
             onAddClick={openAddDialog}
             onRemoveSource={removeSource}
             onItemAction={runItemAction}
+            onRemoveArmedChange={onSourceRemoveArmedChange}
           />
         </div>
 
@@ -698,11 +827,30 @@ export default function App() {
             <PreviewPanel
               output={project.output}
               activeSceneName={activeScene.name}
+              scene={activeScene}
+              sources={project.sources}
+              selectedSourceId={selectedSourceId}
+              onSelectSource={selectSource}
+              onTransform={updateTransform}
+              onTransformError={setTransformError}
+              nativeOverlayVisible={!nativePreviewObscured}
               onAttachBounds={attachPreviewBounds}
             />
             <div className="share-guidance">
               <span className="share-label">In Discord teilen</span>
-              <span>Unter „Anwendungen“ <strong>Hooviestar – Program</strong> wählen. Studio bleibt privat.</span>
+              <span className="share-copy">
+                Unter „Anwendungen“ <strong>Hooviestar – Program</strong> wählen. Studio bleibt privat.
+              </span>
+              {isWindowsPlatform() && (
+                <button
+                  className="share-prepare-button"
+                  type="button"
+                  disabled={pickerBusy}
+                  onClick={prepareStreamPicker}
+                >
+                  {pickerBusy ? "Bereit…" : "Sicher vorbereiten"}
+                </button>
+              )}
             </div>
           </section>
           <AudioMixerPanel
@@ -723,13 +871,15 @@ export default function App() {
           onAudioField={setAudioField}
           getPendingField={pendingField}
           onUpdateSource={updateSource}
+          onUpdateTransform={updateTransform}
+          onTransformError={setTransformError}
           onSeek={seekMedia}
           onSetPlaying={setMediaPlaying}
         />
       </div>
 
       <StatusBar
-        status={windowError ?? previewVisibilityError ?? previewBoundsError ?? updateStatus ?? status}
+        status={transformError ?? windowError ?? previewVisibilityError ?? previewBoundsError ?? pickerMessage ?? updateStatus ?? status}
         output={project.output}
         sceneCount={project.scenes.length}
         sourceCount={project.sources.length}

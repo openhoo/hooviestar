@@ -1,7 +1,7 @@
-import { Fragment, memo, useMemo, useRef } from "react";
+import { Fragment, memo, useEffect, useRef, useState } from "react";
 import type { SceneItem, Source } from "../types";
 import type { ItemAction } from "./SourceInspectorPanel";
-import { useArmedConfirm } from "../hooks/useArmedConfirm";
+import { ConfirmDialog } from "./ConfirmDialog";
 import {
   ArrowDownIcon,
   ArrowUpIcon,
@@ -49,12 +49,14 @@ export function sourceRowsFor(sources: Source[], items: SceneItem[]): SourceRow[
 interface SourcesPanelProps {
   rows: SourceRow[];
   selectedSourceId: string | null;
+  affectedSceneNames: readonly string[];
   itemError: string | null;
   addButtonRef: React.RefObject<HTMLButtonElement | null>;
   onSelectSource: (sourceId: string) => void;
   onAddClick: () => void;
   onRemoveSource: (sourceId: string) => void | Promise<void>;
   onItemAction: (itemId: string, action: ItemAction) => void;
+  onRemoveArmedChange?: (armed: boolean) => void;
 }
 
 /** Generisches Quellen-Kästchen (Rechteck + Bildlinien), 16px. */
@@ -81,29 +83,112 @@ function SourceGlyph() {
 function SourcesPanelImpl({
   rows,
   selectedSourceId,
+  affectedSceneNames,
   itemError,
   addButtonRef,
   onSelectSource,
   onAddClick,
   onRemoveSource,
   onItemAction,
+  onRemoveArmedChange,
 }: SourcesPanelProps) {
   const minusButtonRef = useRef<HTMLButtonElement>(null);
-  const removeTriggerRefs = useMemo(() => [minusButtonRef], []);
-  // Geteilte Zwei-Klick-Entfernung: Auswahlwechsel, Klick außerhalb und
-  // Escape entschärfen; während der Bestätigung werden weitere Klicks ignoriert.
-  const { armed, trigger: handleRemoveClick } = useArmedConfirm(() => {
-    if (selectedSourceId) onRemoveSource(selectedSourceId);
-  }, selectedSourceId, removeTriggerRefs);
+  const [removeOpen, setRemoveOpen] = useState(false);
+  const [removeSourceId, setRemoveSourceId] = useState<string | null>(null);
+  const [removeBusy, setRemoveBusy] = useState(false);
+  const removeBusyRef = useRef(false);
+  const [removeError, setRemoveError] = useState<string | null>(null);
 
-  const removeClassName = armed ? "icon-button armed" : "icon-button";
-  const removeTitle = armed ? "Erneut klicken zum Entfernen" : "Ausgewählte Quelle entfernen";
+  useEffect(() => {
+    onRemoveArmedChange?.(removeOpen);
+  }, [onRemoveArmedChange, removeOpen]);
+  useEffect(() => () => onRemoveArmedChange?.(false), [onRemoveArmedChange]);
+
+  // Eine Auswahländerung darf keine Bestätigung auf eine andere Quelle
+  // übertragen.
+  useEffect(() => {
+    if (removeOpen && removeSourceId !== selectedSourceId) {
+      setRemoveOpen(false);
+      setRemoveSourceId(null);
+      setRemoveError(null);
+    }
+  }, [removeOpen, removeSourceId, selectedSourceId]);
+
+  function requestRemove() {
+    if (!selectedSourceId || removeBusyRef.current) return;
+    setRemoveSourceId(selectedSourceId);
+    setRemoveError(null);
+    setRemoveOpen(true);
+  }
+
+  function cancelRemove() {
+    if (removeBusyRef.current) return;
+    setRemoveOpen(false);
+    setRemoveSourceId(null);
+    setRemoveError(null);
+  }
+
+  async function confirmRemove() {
+    if (removeBusyRef.current) return;
+    const targetId = removeSourceId;
+    if (!targetId || targetId !== selectedSourceId || !rows.some((row) => row.source.id === targetId)) {
+      setRemoveError("Die Quelle ist nicht mehr ausgewählt. Bitte die Entfernung erneut starten.");
+      return;
+    }
+    removeBusyRef.current = true;
+    setRemoveBusy(true);
+    setRemoveError(null);
+    try {
+      await onRemoveSource(targetId);
+      setRemoveOpen(false);
+      setRemoveSourceId(null);
+    } catch (error) {
+      setRemoveError(String(error));
+    } finally {
+      removeBusyRef.current = false;
+      setRemoveBusy(false);
+    }
+  }
+
+  function handleRemoveButtonClick() {
+    if (removeOpen) void confirmRemove();
+    else requestRemove();
+  }
+
+  function handleDockKeyDown(event: React.KeyboardEvent<HTMLElement>) {
+    if (
+      event.defaultPrevented ||
+      (event.key !== "Delete" && event.key !== "Backspace") ||
+      !(event.target instanceof HTMLElement) ||
+      event.target.isContentEditable ||
+      event.target.tagName === "INPUT" ||
+      event.target.tagName === "TEXTAREA" ||
+      event.target.tagName === "SELECT" ||
+      event.target.closest('[role="dialog"], [aria-modal="true"], .modal-dialog') ||
+      !selectedSourceId
+    ) {
+      return;
+    }
+    const target = event.target;
+    const selectedRow = target.closest(".source-row.selected");
+    const removeControl = target.closest('[data-delete-trigger="source"]');
+    if (!selectedRow && !removeControl) return;
+    event.preventDefault();
+    event.stopPropagation();
+    handleRemoveButtonClick();
+  }
+
+  const removeClassName = removeOpen ? "icon-button armed" : "icon-button";
+  const removeTitle = removeOpen ? "Erneut klicken zum Entfernen" : "Ausgewählte Quelle entfernen";
+  const selectedSourceName = rows.find((row) => row.source.id === removeSourceId)?.source.name
+    ?? rows.find((row) => row.source.id === selectedSourceId)?.source.name
+    ?? "Quelle";
   const firstUnplacedIndex = rows.findIndex((row) => !row.itemId);
   const placedCount = firstUnplacedIndex === -1 ? rows.length : firstUnplacedIndex;
   const unplacedCount = rows.length - placedCount;
 
   return (
-    <section className="dock sources-dock" aria-label="Quellen">
+    <section className="dock sources-dock" aria-label="Quellen" aria-keyshortcuts="Delete" onKeyDown={handleDockKeyDown}>
       <div className="dock-title">
         <div className="dock-heading">
           <h2>Quellen</h2>
@@ -125,9 +210,12 @@ function SourcesPanelImpl({
             type="button"
             className={removeClassName}
             aria-label={removeTitle}
+            aria-keyshortcuts="Delete"
+            aria-expanded={removeOpen}
             title={removeTitle}
+            data-delete-trigger="source"
             disabled={!selectedSourceId}
-            onClick={handleRemoveClick}
+            onClick={handleRemoveButtonClick}
           >
             <MinusIcon />
           </button>
@@ -213,6 +301,26 @@ function SourcesPanelImpl({
         </ul>
       )}
       {itemError && <p className="dock-message" role="alert">{itemError}</p>}
+      <ConfirmDialog
+        open={removeOpen}
+        title={`Quelle „${selectedSourceName}“ entfernen?`}
+        description="Die Quelle wird global entfernt und aus allen Szenen gelöscht, in denen sie verwendet wird."
+        details={affectedSceneNames.length > 0 ? (
+          <>
+            <span>Betroffene Szenen:</span>
+            <ul>
+              {affectedSceneNames.map((name, index) => <li key={`${index}:${name}`}>{name}</li>)}
+            </ul>
+          </>
+        ) : (
+          <span>Diese Quelle ist keiner Szene zugeordnet.</span>
+        )}
+        error={removeError}
+        busy={removeBusy}
+        onCancel={cancelRemove}
+        onConfirm={confirmRemove}
+        onRestoreFocus={() => minusButtonRef.current?.focus()}
+      />
     </section>
   );
 }
