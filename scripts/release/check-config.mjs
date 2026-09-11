@@ -59,6 +59,10 @@ expect(
   localBuildTauri.bundle?.createUpdaterArtifacts === false,
   "local unsigned-build updater override is missing",
 );
+expect(
+  packageJson.scripts?.["tauri-appimage"] === "node scripts/release/build-appimage.mjs",
+  "AppImage bootstrap build wrapper is missing",
+);
 for (const target of ["nsis", "appimage", "deb"]) {
   expect(tauri.bundle?.targets?.includes(target), `${target} installer target is missing`);
 }
@@ -205,6 +209,8 @@ expect(releaseWorkflow.includes("gh release verify"), "immutable release verific
 expect(releaseWorkflow.includes("Get-AuthenticodeSignature"), "Authenticode verification is missing");
 expect(releaseWorkflow.includes("TimeStamperCertificate"), "Authenticode timestamp verification is missing");
 expect(releaseWorkflow.includes("7z t $installers[0].FullName"), "NSIS archive verification is missing");
+expect(releaseWorkflow.includes("tauriScript: npm run tauri-appimage"), "Linux AppImage bootstrap wrapper is not used");
+expect(releaseWorkflow.includes("matrix.tauriScript"), "release matrix Tauri script selection is missing");
 expect(releaseWorkflow.includes("--appimage-extract"), "AppImage structure verification is missing");
 expect(releaseWorkflow.includes("dpkg-deb --field"), "Debian package verification is missing");
 expect(releaseWorkflow.includes("releaseDraft: true"), "release is not staged as a draft");

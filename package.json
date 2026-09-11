@@ -1,7 +1,7 @@
 {
   "name": "hooviestar",
   "private": true,
-  "version": "0.1.13",
+  "version": "0.1.14",
   "type": "module",
   "engines": {
     "node": ">=24 <25"
@@ -16,6 +16,7 @@
     "release:prepare": "node scripts/release/set-version.mjs",
     "release:test": "node --test scripts/release/*.test-node.mjs",
     "release:verify-updater-key": "node scripts/release/verify-updater-key.mjs",
+    "tauri-appimage": "node scripts/release/build-appimage.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

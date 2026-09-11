@@ -106,6 +106,7 @@ button:disabled {
 }
 
 .loading {
+  position: relative;
   height: 100vh;
   height: 100dvh;
   display: flex;
@@ -1676,6 +1677,7 @@ input[type="checkbox"] {
 
 .status-bar {
   flex: none;
+  width: 100%;
   height: 28px;
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
@@ -1686,6 +1688,21 @@ input[type="checkbox"] {
   background: #101318;
   border-top: 1px solid var(--border);
   font-size: 9px;
+}
+
+.status-bar.has-update {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr) auto auto;
+}
+
+.status-bar.status-bar-compact {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.loading > .status-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
 }
 
 .status-item {
@@ -1700,6 +1717,74 @@ input[type="checkbox"] {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.status-engine,
+.status-update {
+  min-width: 0;
+}
+
+.status-update-copy {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status-update-message,
+.status-update-local-error {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status-update-message {
+  display: inline;
+  flex: 1 1 auto;
+}
+
+.status-update-local-error {
+  flex: 0 1 auto;
+  color: var(--danger);
+}
+
+.status-update-install {
+  flex: none;
+  min-height: 22px;
+  padding: 2px 8px;
+  color: var(--text);
+  background: var(--accent);
+  border-color: var(--accent);
+  font-size: 9px;
+  line-height: 1.2;
+}
+
+.status-update-install:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+.status-update-warning {
+  color: var(--warning);
+}
+
+.status-update.error {
+  color: var(--danger);
+}
+
+.status-update.error .status-update-message {
+  color: var(--danger);
+}
+
+.status-update-progress {
+  flex: none;
+  width: clamp(64px, 12vw, 112px);
+  height: 7px;
+  accent-color: var(--accent-hover);
 }
 
 .status-counts {
@@ -2113,6 +2198,27 @@ input[type="checkbox"] {
     padding: 0;
   }
 
+  .status-bar {
+    gap: 8px;
+  }
+
+  .status-bar.has-update {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr) auto auto;
+  }
+
+  .status-bar.status-bar-compact {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .status-update-progress {
+    width: clamp(52px, 10vw, 96px);
+  }
+
+  .status-update-install {
+    padding-right: 6px;
+    padding-left: 6px;
+    font-size: 8px;
+  }
   .row-actions .icon-button {
     width: 23px;
   }

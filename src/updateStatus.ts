@@ -2,6 +2,7 @@ export type UpdateStatusEvent =
   | { status: "checking" }
   | { status: "up_to_date" }
   | { status: "available"; version: string }
+  | { status: "ready"; version: string }
   | { status: "downloading"; version: string; progress: number | null }
   | { status: "installing"; version: string }
   | { status: "installed"; version: string }
@@ -15,6 +16,8 @@ export function updateStatusMessage(event: UpdateStatusEvent): string {
       return "Hooviestar ist aktuell";
     case "available":
       return `Aktualisierung ${event.version} gefunden`;
+    case "ready":
+      return `Aktualisierung ${event.version} ist bereit. Änderungen vor dem Neustart anwenden.`;
     case "downloading":
       return event.progress === null
         ? `Aktualisierung ${event.version} wird heruntergeladen …`
@@ -26,4 +29,8 @@ export function updateStatusMessage(event: UpdateStatusEvent): string {
     case "error":
       return `Aktualisierung fehlgeschlagen: ${event.message}`;
   }
+}
+
+export function updateStatusTone(event: UpdateStatusEvent): "ok" | "error" {
+  return event.status === "error" ? "error" : "ok";
 }

@@ -8,7 +8,7 @@ Native GPU scene compositing for a clean Discord screen-share window on Windows 
 
 Hooviestar keeps scene setup, source controls, audio mixing, and preview tooling in one visible studio window. In Discord, select the virtual **Hooviestar – Program** app: it stays mapped for capture but outside the physical desktop, so controls and setup dialogs never become part of the shared output.
 
-> **Status:** Hooviestar is at version 0.1.13 and under active development. Build it from source and expect the project format and platform integration to evolve.
+> **Status:** Hooviestar is at version 0.1.14 and under active development. Build it from source and expect the project format and platform integration to evolve.
 
 ![Hooviestar studio with a text source selected](docs/screenshots/studio-with-source.png)
 
@@ -150,7 +150,7 @@ Linux:
 
 ```sh
 NO_STRIP=1 GSTREAMER_INCLUDE_BAD_PLUGINS=1 \
-  npm run tauri build -- --bundles appimage,deb \
+  npm run tauri-appimage -- --bundles appimage,deb \
   --target x86_64-unknown-linux-gnu \
   --config src-tauri/tauri.local-build.conf.json
 ```
@@ -163,9 +163,11 @@ npm run tauri build -- --bundles nsis --target x86_64-pc-windows-msvc --no-sign 
 
 The local override disables updater artifacts, so ordinary developers do not need the protected release signing key. `NO_STRIP=1` avoids the older `linuxdeploy` strip tool failing on modern `DT_RELR` libraries; `GSTREAMER_INCLUDE_BAD_PLUGINS=1` includes the runtime plugins Hooviestar uses. Windows also uses `--no-sign`; only the tag workflow produces publisher-signed release installers. Bundles are written below `target/<target>/release/bundle/`.
 
-On Linux, the Tauri `beforeBuildCommand` runs `node scripts/release/stage-pipewire-appimage.mjs`. It uses `pkg-config` to resolve the matching PipeWire and SPA directories, fails if required runtime directories or `spa-0.2/support/libspa-support.so`, `pipewire-0.3/libpipewire-module-protocol-native.so`, or `share/pipewire/client.conf` are missing, and stages every `libpipewire-0.3.so*` and `libjack.so*` file (including `libjack.so.0`), the SPA plugins, PipeWire modules, and config under `src-tauri/resources/pipewire`.
+On Linux, `tauri-appimage` runs the normal Tauri build, then preserves linuxdeploy's generated `AppRun.shell` and `AppRun.wrapped`, installs a statically linked native `AppRun` bootstrap, and repackages the AppImage before any updater signature is recreated. The bootstrap clears only inherited `LD_LIBRARY_PATH` before the generated shell interpreter starts, sets `APPDIR` to the actual AppDir, preserves `APPIMAGE` and arguments, and leaves other environment variables unchanged. It requires a C compiler with static libc development files; set `CC` to an architecture-matching compiler when cross-building.
 
-At startup, Linux enables those staged paths only when `APPDIR` points to an AppImage tree containing `usr/lib/spa-0.2`, `usr/lib/pipewire-0.3`, and `usr/share/pipewire/client.conf`; it then sets `SPA_PLUGIN_DIR`, `PIPEWIRE_MODULE_DIR`, and `PIPEWIRE_CONFIG_DIR`. Development and other non-AppImage runs leave the host PipeWire configuration unchanged. The release gate extracts the AppImage and runs `scripts/release/verify-appimage-pipewire.mjs`, which checks the packaged runtime and exercises a PipeWire client-context plus bundled GStreamer-plugin loading probe.
+The Tauri `beforeBuildCommand` still runs `node scripts/release/stage-pipewire-appimage.mjs`. It uses `pkg-config` to resolve the matching PipeWire and SPA directories, fails if required runtime directories or `spa-0.2/support/libspa-support.so`, `pipewire-0.3/libpipewire-module-protocol-native.so`, or `share/pipewire/client.conf` are missing, and stages every `libpipewire-0.3.so*` and `libjack.so*` file (including `libjack.so.0`), the SPA plugins, PipeWire modules, and config under `src-tauri/resources/pipewire`.
+
+At startup, Linux enables those staged paths only when `APPDIR` points to an AppImage tree containing `usr/lib/spa-0.2`, `usr/lib/pipewire-0.3`, and `usr/share/pipewire/client.conf`; it then sets `SPA_PLUGIN_DIR`, `PIPEWIRE_MODULE_DIR`, and `PIPEWIRE_CONFIG_DIR`. Development and other non-AppImage runs leave the host PipeWire configuration unchanged. The release gate extracts the AppImage and runs `scripts/release/verify-appimage-pipewire.mjs`, which verifies the static bootstrap has no ELF interpreter, checks the preserved generated AppRun chain, launches it with a poisoned inherited library path, and exercises a PipeWire client-context plus bundled GStreamer-plugin loading probe.
 
 ## Test and qualify
 
@@ -188,9 +190,8 @@ pwsh -File .\scripts\windows-discord\Start-Publisher.ps1 -NativeOnly
 
 The reusable workflow is versioned as [the Windows/Discord qualification skill](skills/hooviestar-windows-discord-qualification/SKILL.md). Its deterministic negative and harness-contract tests run with `npm run test:windows-qualification`. Full qualification requires fresh same-run publisher and receiver JSON reports; ordinary hosted CI cannot replace the interactive Discord/GPU/audio run.
 
-## Releases and updates
+Version tags produce a Windows NSIS installer, Linux AppImage, and Debian package. The release stays a draft until Windows Authenticode, Tauri updater signatures, an SPDX 2.3 SBOM, SHA-256 checksums, Sigstore signing, GitHub provenance/SBOM attestations, and the cross-platform `latest.json` manifest pass verification. Packaged builds check for signed updates on startup and download a newer signed version to a ready state. Installation is not automatic: the user must explicitly confirm `Installieren und neu starten`. Before installation, Hooviestar applies pending source and mixer changes and saves the project so saved project data survives the restart. Apply changes in open dialogs before confirming the restart.
 
-Version tags produce a Windows NSIS installer, Linux AppImage, and Debian package. The release stays a draft until Windows Authenticode, Tauri updater signatures, an SPDX 2.3 SBOM, SHA-256 checksums, Sigstore signing, GitHub provenance/SBOM attestations, and the cross-platform `latest.json` manifest pass verification. Packaged NSIS, AppImage, and Debian builds then install their matching signed updates automatically on startup.
 
 See [Releasing Hooviestar](docs/releasing.md) for signing-secret setup, version preparation, publication, updater behavior, and independent verification. The [Windows integration review](docs/windows-integration.md) records current bundle metadata and prioritized native Tauri opportunities.
 

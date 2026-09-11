@@ -37,4 +37,29 @@ describe("SerialQueue", () => {
     await expect(next).resolves.toBe("ok");
     expect(afterFailure).toHaveBeenCalledOnce();
   });
+
+  it("waits for every source and propagates a pending rejection", async () => {
+    const queue = new SerialQueue();
+    const gate = deferred();
+    const delayed = queue.enqueue("source-a", async () => {
+      await gate.promise;
+      return "ok";
+    });
+    queue.enqueue("source-b", async () => {
+      throw new Error("failed");
+    });
+
+    const idle = queue.waitForIdle();
+    let settled = false;
+    void idle.then(
+      () => { settled = true; },
+      () => { settled = true; },
+    );
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    gate.resolve();
+    await expect(idle).rejects.toThrow("failed");
+    await expect(delayed).resolves.toBe("ok");
+  });
 });

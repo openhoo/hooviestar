@@ -21,7 +21,6 @@ import { SourcesPanel, sourceRowsFor } from "./components/SourcesPanel";
 import { StatusBar } from "./components/StatusBar";
 import { OutputSettingsDialog } from "./components/OutputSettingsDialog";
 import { PowerIcon, SettingsIcon, SparkleIcon } from "./components/icons";
-import { updateStatusMessage } from "./updateStatus";
 import type { UpdateStatusEvent } from "./updateStatus";
 
 
@@ -88,7 +87,9 @@ export default function App() {
   const [windowError, setWindowError] = useState<string | null>(null);
   const [pickerMessage, setPickerMessage] = useState<string | null>(null);
   const [pickerBusy, setPickerBusy] = useState(false);
-  const [updateStatus, setUpdateStatus] = useState<string | null>(null);
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatusEvent | null>(null);
+  const [installUpdateBusy, setInstallUpdateBusy] = useState(false);
+  const [installUpdateError, setInstallUpdateError] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [armedRemoveDock, setArmedRemoveDock] = useState<"scene" | "source" | null>(null);
   // Keep transform submissions as the synchronous optimistic baseline shared
@@ -121,6 +122,7 @@ export default function App() {
     setMixerVolume,
     pendingField,
     prunePendingFields,
+    flushPendingAudioFields,
   } = useAudioFieldBridge(pendingSourceFieldsRef, sourceMutationQueueRef.current);
   const [textError, setTextError] = useState<string | null>(null);
   const [transformError, setTransformError] = useState<string | null>(null);
@@ -132,6 +134,7 @@ export default function App() {
   const previewObserverRef = useRef<ResizeObserver | null>(null);
   const previewRequestRef = useRef(0);
   const previewVisibilityRequestRef = useRef(0);
+  const installUpdateBusyRef = useRef(false);
 
   useEffect(() => {
     const submitted = latestSubmittedByItemRef.current;
@@ -164,10 +167,16 @@ export default function App() {
       setPickerBusy(false);
       setPickerMessage("Program ist wieder vollständig unsichtbar.");
     });
+    void errorListener.catch((error: unknown) => {
+      if (active) setWindowError(`Fensterauswahl-Listener nicht verfügbar: ${String(error)}`);
+    });
+    void restoredListener.catch((error: unknown) => {
+      if (active) setWindowError(`Fensterauswahl-Listener nicht verfügbar: ${String(error)}`);
+    });
     return () => {
       active = false;
-      void errorListener.then((unlisten) => unlisten());
-      void restoredListener.then((unlisten) => unlisten());
+      void errorListener.then((unlisten) => unlisten(), () => undefined);
+      void restoredListener.then((unlisten) => unlisten(), () => undefined);
     };
   }, []);
 
@@ -175,38 +184,80 @@ export default function App() {
     let active = true;
     let clearTimer: ReturnType<typeof setTimeout> | null = null;
     let detachListener: (() => void) | null = null;
+    let eventRevision = 0;
+    let queryStarted = false;
+    let eventObservedBeforeQuery = false;
     const showStatus = (payload: UpdateStatusEvent) => {
       if (!active) return;
-      if (clearTimer) clearTimeout(clearTimer);
-      setUpdateStatus(updateStatusMessage(payload));
+      if (!queryStarted) eventObservedBeforeQuery = true;
+      eventRevision += 1;
+      if (clearTimer) {
+        clearTimeout(clearTimer);
+        clearTimer = null;
+      }
+      setUpdateStatus(payload);
       if (payload.status === "up_to_date") {
+        const statusRevision = eventRevision;
         clearTimer = setTimeout(() => {
-          if (active) setUpdateStatus(null);
+          if (active && eventRevision === statusRevision) setUpdateStatus(null);
+          clearTimer = null;
         }, 5_000);
       }
     };
-    const unlisten = listen<UpdateStatusEvent>("updater-status", ({ payload }) => {
-      showStatus(payload);
-    });
-    void unlisten.then(async (detach) => {
-      if (!active) {
-        detach();
-        return;
-      }
-      detachListener = detach;
-      try {
-        const current = await invoke<UpdateStatusEvent | null>("updater_status");
-        if (current) showStatus(current);
-      } catch (error) {
-        if (active) setUpdateStatus(`Aktualisierungsstatus nicht verfügbar: ${String(error)}`);
+    const listenerPromise = Promise.resolve().then(() =>
+      listen<UpdateStatusEvent>("updater-status", ({ payload }) => {
+        showStatus(payload);
+      }),
+    );
+    void listenerPromise.then(
+      (detach) => {
+        if (!active) {
+          detach();
+          return;
+        }
+        detachListener = detach;
+        queryStarted = true;
+        const revisionAtQuery = eventRevision;
+        void invoke<UpdateStatusEvent | null>("updater_status").then(
+          (current) => {
+            if (active && current && !eventObservedBeforeQuery && eventRevision === revisionAtQuery) showStatus(current);
+          },
+          (error: unknown) => {
+            if (active && !eventObservedBeforeQuery && eventRevision === revisionAtQuery) {
+              showStatus({
+                status: "error",
+                message: `Status nicht verfügbar: ${String(error)}`,
+              });
+            }
+          },
+        );
+      },
+      (error: unknown) => {
+        if (active) {
+          showStatus({
+            status: "error",
+            message: `Listener nicht verfügbar: ${String(error)}`,
+          });
+        }
+      },
+    ).catch((error: unknown) => {
+      if (active) {
+        showStatus({
+          status: "error",
+          message: `Status nicht verfügbar: ${String(error)}`,
+        });
       }
     });
     return () => {
       active = false;
-      if (clearTimer) clearTimeout(clearTimer);
+      if (clearTimer) {
+        clearTimeout(clearTimer);
+        clearTimer = null;
+      }
       detachListener?.();
     };
   }, []);
+
   useEffect(() => {
     if (!project) return;
     prunePendingFields(project);
@@ -534,9 +585,11 @@ export default function App() {
     const attempted = textarea.value;
     setTextError(null);
     void updateSource(source.id, { text: attempted }).catch((error: unknown) => {
+      // A selection change unmounts this keyed textarea; a newer edit also
+      // changes its value. Neither stale failure may overwrite the new
+      // source's error state or its current text.
+      if (!textarea.isConnected || textarea.value !== attempted) return;
       setTextError(String(error));
-      // Nur zurücksetzen, wenn keine neuere lokale Eingabe dazwischen liegt.
-      if (textarea.value !== attempted) return;
       const authoritative = engineStore.getSnapshot().project?.sources.find((entry) => entry.id === source.id);
       textarea.value = authoritative && authoritative.type === "text" ? authoritative.text : "";
     });
@@ -665,12 +718,60 @@ export default function App() {
     setSettingsOpen(open);
     if (!open) requestAnimationFrame(() => settingsButton.current?.focus());
   }, []);
+  const installUpdate = useCallback(() => {
+    if (installUpdateBusyRef.current || updateStatus?.status !== "ready") return;
+    // Set the ref before any blur or promise turn so repeated activation
+    // cannot queue two installers.
+    installUpdateBusyRef.current = true;
+    setInstallUpdateBusy(true);
+    setInstallUpdateError(null);
+
+    const focused = document.activeElement;
+    if (focused instanceof HTMLInputElement || focused instanceof HTMLTextAreaElement) {
+      focused.blur();
+    }
+
+    let installerStarted = false;
+    void Promise.resolve()
+      .then(() => {
+        // Flush rAF-coalesced mixer edits before taking the queue snapshot.
+        // The hook cancels the scheduled frame, preventing a duplicate IPC.
+        flushPendingAudioFields();
+        return sourceMutationQueueRef.current.waitForIdle();
+      })
+      .then(() => {
+        installerStarted = true;
+        return invoke("install_update");
+      })
+      .then(
+        () => {
+          installUpdateBusyRef.current = false;
+          setInstallUpdateBusy(false);
+        },
+        (error: unknown) => {
+          installUpdateBusyRef.current = false;
+          setInstallUpdateBusy(false);
+          setInstallUpdateError(
+            installerStarted
+              ? String(error)
+              : `Änderungen konnten vor der Installation nicht gespeichert werden: ${String(error)}. Bitte prüfen und erneut versuchen.`,
+          );
+        },
+      );
+  }, [flushPendingAudioFields, updateStatus]);
 
   if (!project) {
     return (
       <main className="loading">
         <h1>Hooviestar</h1>
         <p role="status">{status}</p>
+        <StatusBar
+          status={null}
+          updateStatus={updateStatus}
+          onInstallUpdate={installUpdate}
+          installUpdateBusy={installUpdateBusy}
+          installUpdateError={installUpdateError}
+        />
       </main>
     );
   }
@@ -877,9 +978,12 @@ export default function App() {
           onSetPlaying={setMediaPlaying}
         />
       </div>
-
       <StatusBar
-        status={transformError ?? windowError ?? previewVisibilityError ?? previewBoundsError ?? pickerMessage ?? updateStatus ?? status}
+        status={transformError ?? windowError ?? previewVisibilityError ?? previewBoundsError ?? pickerMessage ?? status}
+        updateStatus={updateStatus}
+        onInstallUpdate={installUpdate}
+        installUpdateBusy={installUpdateBusy}
+        installUpdateError={installUpdateError}
         output={project.output}
         sceneCount={project.scenes.length}
         sourceCount={project.sources.length}

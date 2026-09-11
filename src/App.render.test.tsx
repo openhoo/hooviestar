@@ -5,10 +5,11 @@
  * Die Tauri-Grenze wird gemockt; das Projekt-Fixture ist dasselbe shared
  * Rust-Fixture wie in contracts.test.ts.
  */
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fixture from "../contracts/project-v1.json";
 import { parseProjectV1 } from "./types";
+import { StatusBar } from "./components/StatusBar";
 
 const dispatchedCommands: Array<Record<string, unknown>> = [];
 const invokedCommands: Array<{ command: string; args?: Record<string, unknown> }> = [];
@@ -16,10 +17,24 @@ let rejectedDispatchType: string | null = null;
 let rejectedInvokeCommand: string | null = null;
 let deferSetTransformDispatch = false;
 let pendingSetTransformResolve: (() => void) | null = null;
-
+const updaterListeners = new Set<(event: { payload: unknown }) => void>();
+let updaterStatusSnapshot: unknown = null;
+let deferUpdaterStatus = false;
+let pendingUpdaterStatusResolve: (() => void) | null = null;
+let deferUpdateSourceDispatch = false;
+let pendingUpdateSourceResolve: (() => void) | null = null;
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(async (command: string, args?: Record<string, unknown>) => {
     invokedCommands.push({ command, args });
+    if (command === "updater_status") {
+      if (deferUpdaterStatus) {
+        await new Promise<void>((resolve) => {
+          pendingUpdaterStatusResolve = resolve;
+        });
+        pendingUpdaterStatusResolve = null;
+      }
+      return updaterStatusSnapshot === null ? null : structuredClone(updaterStatusSnapshot);
+    }
     if (command === rejectedInvokeCommand) throw new Error("invoke failed");
     if (command === "get_snapshot") return structuredClone(fixture);
     if (command === "enumerate_sources") {
@@ -29,6 +44,12 @@ vi.mock("@tauri-apps/api/core", () => ({
     if (command === "dispatch") {
       const dispatched = (args?.command ?? {}) as Record<string, unknown>;
       dispatchedCommands.push(dispatched);
+      if (dispatched.type === "update_source" && deferUpdateSourceDispatch) {
+        await new Promise<void>((resolve) => {
+          pendingUpdateSourceResolve = resolve;
+        });
+        pendingUpdateSourceResolve = null;
+      }
       if (dispatched.type === rejectedDispatchType) throw new Error("dispatch failed");
       if (dispatched.type === "set_transform" && deferSetTransformDispatch) {
         await new Promise<void>((resolve) => {
@@ -42,7 +63,13 @@ vi.mock("@tauri-apps/api/core", () => ({
   }),
 }));
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn(async () => () => undefined),
+  listen: vi.fn(async (event: string, callback: (event: { payload: unknown }) => void) => {
+    if (event === "updater-status") {
+      updaterListeners.add(callback);
+      return () => updaterListeners.delete(callback);
+    }
+    return () => undefined;
+  }),
 }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: vi.fn(async () => null),
@@ -53,6 +80,9 @@ vi.mock("@tauri-apps/api/window", () => ({
 
 const { default: App } = await import("./App");
 const project = parseProjectV1(fixture)!;
+function emitUpdaterStatus(payload: unknown) {
+  updaterListeners.forEach((listener) => listener({ payload }));
+}
 async function renderStudio() {
   render(<App />);
   // Engine-Start ist asynchron; warten bis das Szenen-Dock gerendert ist.
@@ -95,6 +125,14 @@ describe("studio shell", () => {
     deferSetTransformDispatch = false;
     pendingSetTransformResolve?.();
     pendingSetTransformResolve = null;
+    deferUpdateSourceDispatch = false;
+    pendingUpdateSourceResolve?.();
+    pendingUpdateSourceResolve = null;
+    deferUpdaterStatus = false;
+    pendingUpdaterStatusResolve?.();
+    pendingUpdaterStatusResolve = null;
+    updaterStatusSnapshot = null;
+    updaterListeners.clear();
   });
   afterEach(cleanup);
 
@@ -463,5 +501,140 @@ describe("studio shell", () => {
     fireEvent.click(removeButton);
     await Promise.resolve();
     expect(dispatchedCommands.filter((command) => command.type === "remove_scene")).toHaveLength(0);
+  });
+  it("ignoriert einen veralteten updater_status-Snapshot nach einem neueren Ereignis", async () => {
+    updaterStatusSnapshot = { status: "ready", version: "0.1.13" };
+    deferUpdaterStatus = true;
+    await renderStudio();
+    await waitFor(() => expect(pendingUpdaterStatusResolve).toBeTruthy());
+
+    await act(async () => {
+      emitUpdaterStatus({ status: "downloading", version: "0.1.14", progress: 42 });
+      await Promise.resolve();
+    });
+    const progress = screen.getByRole("progressbar", { name: /0\.1\.14/ });
+    expect(progress.getAttribute("value")).toBe("42");
+    expect(screen.queryByRole("button", { name: "Installieren und neu starten" })).toBeNull();
+
+    await act(async () => {
+      pendingUpdaterStatusResolve?.();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(pendingUpdaterStatusResolve).toBeNull());
+    expect(progress.getAttribute("value")).toBe("42");
+  });
+
+  it("zeigt Engine- und Aktualisierungsfehler unabhängig voneinander", () => {
+    render(
+      <StatusBar
+        status="Engine-Fehler: Renderer"
+        updateStatus={{ status: "error", message: "offline" }}
+        onInstallUpdate={vi.fn()}
+        installUpdateBusy={false}
+      />,
+    );
+
+    expect(screen.getByText("Engine-Fehler: Renderer")).toBeTruthy();
+    const updaterAlert = screen.getByRole("alert");
+    expect(updaterAlert.textContent).toContain("offline");
+    const update = screen.getByRole("group", { name: "Aktualisierungsstatus" });
+    expect(update.textContent).toContain("offline");
+  });
+
+  it("bietet die bestätigte Aktualisierung erst nach dem Download an", async () => {
+    await renderStudio();
+    await waitFor(() => expect(updaterListeners.size).toBeGreaterThan(0));
+
+    await act(async () => {
+      emitUpdaterStatus({ status: "downloading", version: "0.1.14", progress: 42 });
+      await Promise.resolve();
+    });
+    expect(screen.queryByRole("button", { name: "Installieren und neu starten" })).toBeNull();
+    expect(invokedCommands.filter(({ command }) => command === "install_update")).toHaveLength(0);
+
+    await act(async () => {
+      emitUpdaterStatus({ status: "ready", version: "0.1.14" });
+      await Promise.resolve();
+    });
+    const button = screen.getByRole("button", { name: "Installieren und neu starten" });
+    expect(invokedCommands.filter(({ command }) => command === "install_update")).toHaveLength(0);
+
+    await act(async () => {
+      fireEvent.click(button);
+      await Promise.resolve();
+    });
+    expect(invokedCommands.filter(({ command }) => command === "install_update")).toHaveLength(1);
+  });
+  it("wartet vor der Installation auf die letzte Quelländerung", async () => {
+    await renderStudio();
+    await waitFor(() => expect(updaterListeners.size).toBeGreaterThan(0));
+    await act(async () => {
+      emitUpdaterStatus({ status: "ready", version: "0.1.14" });
+      await Promise.resolve();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Text" }));
+    const textarea = screen.getByRole("textbox", { name: "Text" }) as HTMLTextAreaElement;
+    const finalText = "final entered project text";
+    deferUpdateSourceDispatch = true;
+    textarea.focus();
+    fireEvent.change(textarea, { target: { value: finalText } });
+
+    const button = screen.getByRole("button", { name: "Installieren und neu starten" });
+    fireEvent.click(button);
+    await waitFor(() => expect(pendingUpdateSourceResolve).toBeTruthy());
+    expect(invokedCommands.filter(({ command }) => command === "install_update")).toHaveLength(0);
+    expect(dispatchedCommands).toContainEqual(
+      expect.objectContaining({
+        type: "update_source",
+        source: expect.objectContaining({ text: finalText }),
+      }),
+    );
+
+    await act(async () => {
+      pendingUpdateSourceResolve?.();
+      await Promise.resolve();
+    });
+    await waitFor(() => {
+      expect(invokedCommands.filter(({ command }) => command === "install_update")).toHaveLength(1);
+    });
+    const sourceDispatchIndex = invokedCommands.findIndex(({ command, args }) =>
+      command === "dispatch"
+      && (args?.command as Record<string, unknown> | undefined)?.type === "update_source",
+    );
+    const installIndex = invokedCommands.findIndex(({ command }) => command === "install_update");
+    expect(installIndex).toBeGreaterThan(sourceDispatchIndex);
+  });
+
+  it("blockiert Installation nach einer abgelehnten Quelländerung und erlaubt Wiederholung", async () => {
+    await renderStudio();
+    await waitFor(() => expect(updaterListeners.size).toBeGreaterThan(0));
+    await act(async () => {
+      emitUpdaterStatus({ status: "ready", version: "0.1.14" });
+      await Promise.resolve();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Text" }));
+    const textarea = screen.getByRole("textbox", { name: "Text" }) as HTMLTextAreaElement;
+    rejectedDispatchType = "update_source";
+    textarea.focus();
+    fireEvent.change(textarea, { target: { value: "rejected project text" } });
+    fireEvent.click(screen.getByRole("button", { name: "Installieren und neu starten" }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/Änderungen konnten vor der Installation nicht gespeichert werden/)).toBeTruthy();
+    });
+    expect(invokedCommands.filter(({ command }) => command === "install_update")).toHaveLength(0);
+    expect(screen.getByRole("button", { name: "Installieren und neu starten" })).toBeTruthy();
+
+    rejectedDispatchType = null;
+    fireEvent.change(textarea, { target: { value: "resolved project text" } });
+    await waitFor(() => {
+      expect(dispatchedCommands.filter((command) => command.type === "update_source")).toHaveLength(2);
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Installieren und neu starten" }));
+    await waitFor(() => {
+      expect(invokedCommands.filter(({ command }) => command === "install_update")).toHaveLength(1);
+    });
   });
 });

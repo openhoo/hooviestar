@@ -620,7 +620,8 @@ pub fn run() {
             set_preview_overlay,
             set_preview_visible,
             prepare_stream_picker,
-            updater::updater_status
+            updater::updater_status,
+            updater::install_update
         ])
         .setup(move |app| {
             let setup_result: Result<(), String> = (|| {

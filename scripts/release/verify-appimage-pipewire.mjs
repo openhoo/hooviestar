@@ -1,5 +1,14 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 
@@ -64,6 +73,80 @@ for (const path of requiredFiles) {
   if (!existsSync(path)) {
     throw new Error(`required packaged PipeWire file is missing: ${path}`);
   }
+}
+const appRun = join(appDir, "AppRun");
+const appRunShell = join(appDir, "AppRun.shell");
+const appRunWrapped = join(appDir, "AppRun.wrapped");
+for (const [path, description] of [
+  [appRun, "static AppRun bootstrap"],
+  [appRunShell, "generated AppRun shell"],
+  [appRunWrapped, "wrapped native AppRun"],
+]) {
+  if (!existsSync(path) || (statSync(path).mode & 0o111) === 0) {
+    throw new Error(`${description} is missing or not executable: ${path}`);
+  }
+}
+if (!readFileSync(appRun).subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46]))) {
+  throw new Error(`AppRun is not a native ELF bootstrap: ${appRun}`);
+}
+const programHeaders = execFileSync("readelf", ["-l", appRun], { encoding: "utf8" });
+if (/\bINTERP\b/.test(programHeaders)) {
+  throw new Error(`AppRun bootstrap is dynamically linked: ${appRun}`);
+}
+const generatedShell = readFileSync(appRunShell, "utf8");
+if (!generatedShell.includes("AppRun.wrapped")) {
+  throw new Error(`generated AppRun shell no longer delegates to AppRun.wrapped: ${appRunShell}`);
+}
+
+const bootstrapProbeDir = mkdtempSync(join(tmpdir(), "hooviestar-apprun-bootstrap-"));
+try {
+  const probeAppRun = join(bootstrapProbeDir, "AppRun");
+  const probeShell = join(bootstrapProbeDir, "AppRun.shell");
+  copyFileSync(appRun, probeAppRun);
+  chmodSync(probeAppRun, 0o755);
+  writeFileSync(
+    probeShell,
+    '#!/bin/sh\nprintf "%s\\n%s\\n%s\\n%s\\n" "${APPDIR-}" "${LD_LIBRARY_PATH-unset}" "${APPIMAGE-}" "$1"\n',
+    { mode: 0o755 },
+  );
+  const expectedAppImage = "/tmp/hooviestar-old.AppImage";
+  const poisonedEnvironment = {
+    ...process.env,
+    APPDIR: "/tmp/old-hooviestar-mount",
+    APPIMAGE: expectedAppImage,
+    LD_LIBRARY_PATH: appLib,
+  };
+  const inheritedOutput = execFileSync(probeAppRun, ["preserved-argument"], {
+    encoding: "utf8",
+    env: poisonedEnvironment,
+  })
+    .trimEnd()
+    .split("\n");
+  if (
+    inheritedOutput[0] !== bootstrapProbeDir ||
+    inheritedOutput[1] !== "unset" ||
+    inheritedOutput[2] !== expectedAppImage ||
+    inheritedOutput[3] !== "preserved-argument"
+  ) {
+    throw new Error(`AppRun bootstrap did not derive/sanitize the inherited environment: ${inheritedOutput}`);
+  }
+  const { APPDIR: _ignoredAppDir, ...withoutAppDir } = poisonedEnvironment;
+  const fallbackOutput = execFileSync(probeAppRun, ["fallback-argument"], {
+    encoding: "utf8",
+    env: withoutAppDir,
+  })
+    .trimEnd()
+    .split("\n");
+  if (
+    fallbackOutput[0] !== bootstrapProbeDir ||
+    fallbackOutput[1] !== "unset" ||
+    fallbackOutput[2] !== expectedAppImage ||
+    fallbackOutput[3] !== "fallback-argument"
+  ) {
+    throw new Error(`AppRun bootstrap did not derive APPDIR or preserve arguments: ${fallbackOutput}`);
+  }
+} finally {
+  rmSync(bootstrapProbeDir, { recursive: true, force: true });
 }
 
 const plugin = join(appDir, "usr/lib/gstreamer-1.0/libgstfluidsynthmidi.so");

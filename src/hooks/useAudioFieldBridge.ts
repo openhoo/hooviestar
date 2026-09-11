@@ -43,8 +43,11 @@ export function useAudioFieldBridge(
     }
   }
 
-  const flushAudioFields = useCallback(() => {
-    audioFlushFrameRef.current = null;
+  const flushPendingAudioFields = useCallback(() => {
+    if (audioFlushFrameRef.current !== null) {
+      cancelAnimationFrame(audioFlushFrameRef.current);
+      audioFlushFrameRef.current = null;
+    }
     const batch = audioPendingDispatchRef.current;
     if (batch.size === 0) return;
     audioPendingDispatchRef.current = new Map();
@@ -63,18 +66,15 @@ export function useAudioFieldBridge(
         : { type: "set_audio_muted", sourceId, muted: value as boolean },
     );
     if (audioFlushFrameRef.current === null) {
-      audioFlushFrameRef.current = requestAnimationFrame(flushAudioFields);
+      audioFlushFrameRef.current = requestAnimationFrame(flushPendingAudioFields);
     }
-  }, [flushAudioFields, pendingSourceFieldsRef]);
+  }, [flushPendingAudioFields, pendingSourceFieldsRef]);
 
   // Ausstehende Audio-Befehle beim Aushängen synchron flushen, damit die
   // letzten Lautstärke-/Stumm-Änderungen nicht mit dem rAF verloren gehen.
   useEffect(() => () => {
-    if (audioFlushFrameRef.current !== null) cancelAnimationFrame(audioFlushFrameRef.current);
-    const batch = audioPendingDispatchRef.current;
-    audioPendingDispatchRef.current = new Map();
-    dispatchAudioBatch(batch);
-  }, [pendingSourceFieldsRef, sourceMutationQueue]);
+    flushPendingAudioFields();
+  }, [flushPendingAudioFields]);
 
   const pendingField = useCallback(<T,>(sourceId: string, field: string, fallback: T): T => {
     const pending = pendingSourceFieldsRef.current.get(sourceId)?.[field];
@@ -112,5 +112,5 @@ export function useAudioFieldBridge(
     }
   }, [pendingSourceFieldsRef]);
 
-  return { audioError, setAudioField, toggleMixerMute, setMixerVolume, pendingField, prunePendingFields };
+  return { audioError, setAudioField, toggleMixerMute, setMixerVolume, pendingField, prunePendingFields, flushPendingAudioFields };
 }
