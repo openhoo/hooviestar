@@ -581,6 +581,8 @@ fn show_startup_failure(message: &str) {
 fn show_startup_failure(_message: &str) {}
 
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    platform::configure_pipewire_bundle_paths();
     platform::configure_graphics_backend();
     let resources = Arc::new(RuntimeResources::new());
     let setup_resources = resources.clone();

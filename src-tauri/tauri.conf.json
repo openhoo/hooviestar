@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Hooviestar",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "identifier": "xyz.openhoo.hooviestar",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run build && node scripts/release/stage-pipewire-appimage.mjs",
     "frontendDist": "../dist"
   },
   "app": {
@@ -55,7 +55,11 @@
     },
     "linux": {
       "appimage": {
-        "bundleMediaFramework": true
+        "bundleMediaFramework": true,
+        "files": {
+          "usr/lib": "resources/pipewire/usr/lib",
+          "usr/share": "resources/pipewire/usr/share"
+        }
       },
       "deb": {
         "depends": [

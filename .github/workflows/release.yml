@@ -132,7 +132,7 @@ jobs:
           cache-on-failure: false
       - name: Install Linux bundle dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils libpipewire-0.3-dev libvulkan-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad libclang-dev
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils libpipewire-0.3-dev libspa-0.2-modules pipewire-bin libjack-jackd2-0 libvulkan-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad libclang-dev
       - run: npm ci
       - name: Import and validate Windows code-signing certificate
         if: runner.os == 'Windows'
@@ -251,6 +251,7 @@ jobs:
           )
           test -x "$extract_dir/squashfs-root/AppRun"
           test -x "$extract_dir/squashfs-root/usr/bin/hooviestar"
+          node scripts/release/verify-appimage-pipewire.mjs "$extract_dir/squashfs-root"
       - name: Sign and upload Debian updater artifact
         if: runner.os == 'Linux'
         env:

@@ -1,4 +1,4 @@
-use std::{os::unix::process::CommandExt, process::Command, sync::Arc};
+use std::{os::unix::process::CommandExt, path::PathBuf, process::Command, sync::Arc};
 
 use super::PreviewOverlayPayload;
 use gtk::prelude::WidgetExt;
@@ -48,6 +48,35 @@ pub fn configure_graphics_backend() {
         }
         let error = command.exec();
         panic!("Hooviestar could not restart with its graphics environment: {error}");
+    }
+}
+
+/// Points PipeWire's client-side dlopen lookups at the matching runtime
+/// shipped in an AppImage.  A normal development executable has no staged
+/// tree and keeps the host configuration unchanged.
+pub fn configure_pipewire_bundle_paths() {
+    let Some(app_dir) = std::env::var_os("APPDIR") else {
+        return;
+    };
+    let root = PathBuf::from(app_dir);
+    let spa_dir = root.join("usr/lib/spa-0.2");
+    let module_dir = root.join("usr/lib/pipewire-0.3");
+    let config_dir = root.join("usr/share/pipewire");
+    if !spa_dir.is_dir()
+        || !module_dir.is_dir()
+        || !config_dir.is_dir()
+        || !config_dir.join("client.conf").is_file()
+    {
+        return;
+    }
+
+    // This is called before Tauri/GTK starts any threads.  On Unix,
+    // environment mutation after threads exist is unsafe, while PipeWire
+    // must read these variables before the first context is constructed.
+    unsafe {
+        std::env::set_var("SPA_PLUGIN_DIR", &spa_dir);
+        std::env::set_var("PIPEWIRE_MODULE_DIR", &module_dir);
+        std::env::set_var("PIPEWIRE_CONFIG_DIR", &config_dir);
     }
 }
 

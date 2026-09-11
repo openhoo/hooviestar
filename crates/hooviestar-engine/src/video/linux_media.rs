@@ -606,10 +606,49 @@ fn run_pipeline_once(
     // stopped state. The Stop arm sets NULL itself; the guard's extra
     // transition is a harmless no-op.
     let _pipeline_guard = PipelineNullGuard(&pipeline);
-    pipeline
+    let decode = pipeline
         .by_name("decode")
-        .ok_or_else(|| "uridecodebin missing".to_string())?
-        .set_property("uri", uri);
+        .ok_or_else(|| "uridecodebin missing".to_string())?;
+    decode.set_property("uri", uri);
+    // uridecodebin reports a failed delayed link only as a Warning. That
+    // leaves an MP4's audio branch playing while its required video branch
+    // silently receives no samples. Check the actual negotiated source pads
+    // after no-more-pads instead of treating arbitrary warnings as fatal.
+    let video_link_failed = Arc::new(AtomicBool::new(false));
+    if !audio_only {
+        let unknown_video_for_decode = Arc::new(AtomicBool::new(false));
+        let unknown_video = unknown_video_for_decode.clone();
+        decode.connect("unknown-type", false, move |values| {
+            let caps = values
+                .get(2)
+                .and_then(|value| value.get::<gst::Caps>().ok())?;
+            if caps
+                .iter()
+                .any(|structure| structure.name().as_str().starts_with("video/"))
+            {
+                unknown_video.store(true, Ordering::Release);
+            }
+            None
+        });
+        let failed_for_decode = video_link_failed.clone();
+        decode.connect_no_more_pads(move |decode| {
+            let mut saw_video = unknown_video_for_decode.load(Ordering::Acquire);
+            let mut linked_video = false;
+            for pad in decode.src_pads() {
+                let Some(caps) = pad.current_caps() else {
+                    continue;
+                };
+                if caps
+                    .iter()
+                    .any(|structure| structure.name().as_str().starts_with("video/"))
+                {
+                    saw_video = true;
+                    linked_video |= pad.is_linked();
+                }
+            }
+            failed_for_decode.store(saw_video && !linked_video, Ordering::Release);
+        });
+    }
     let video = pipeline
         .by_name("video_sink")
         .map(|element| {
@@ -856,6 +895,17 @@ fn run_pipeline_once(
                     return Ok(MediaAttempt::Finished);
                 }
             }
+        }
+        if video_link_failed.load(Ordering::Acquire) {
+            send_unsupported_once(
+                unsupported_latch,
+                notices,
+                generation,
+                source_id,
+                "Videostream konnte nicht als DMA-BUF/NV12 verbunden werden".into(),
+            );
+            ring.lock().set_active(false);
+            break;
         }
         if let Some(message) = bus.timed_pop(Some(gst::ClockTime::from_mseconds(10))) {
             use gst::MessageView;

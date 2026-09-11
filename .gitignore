@@ -13,3 +13,4 @@ src-tauri/gen/
 !.env.example
 Thumbs.db
 VP_VULKANINFO_*.json
+src-tauri/resources/pipewire/

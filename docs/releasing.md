@@ -85,6 +85,22 @@ CI and release checkouts do not persist their GitHub token in Git configuration.
 
 If a job fails while the release is still a draft, fix the workflow or credentials and rerun the failed workflow. Never recreate or move the tag. After publication, assets and the tag are immutable. Any defect requires a new patch version and release; do not delete and try to reuse the old tag name.
 
+## Linux AppImage runtime staging and gate
+
+The Linux Tauri build runs `node scripts/release/stage-pipewire-appimage.mjs` as its `beforeBuildCommand`. On Linux, the hook uses `pkg-config` metadata from `libpipewire-0.3` and `libspa-0.2` to locate the library, prefix, PipeWire module, and SPA plugin directories. It fails before bundling unless those directories contain `spa-0.2/support/libspa-support.so`, `pipewire-0.3/libpipewire-module-protocol-native.so`, and `share/pipewire/client.conf`. It then stages every `libpipewire-0.3.so*` and `libjack.so*` file (including the required `libjack.so.0`), the complete SPA and PipeWire module trees, and the PipeWire config under `src-tauri/resources/pipewire/usr/lib` and `src-tauri/resources/pipewire/usr/share`. The hook is a no-op on non-Linux hosts.
+
+The AppImage bundle maps those staged `usr/lib` and `usr/share` trees into the extracted AppDir. Before Tauri/GTK startup creates threads, Linux startup checks `APPDIR` and only then, when `usr/lib/spa-0.2`, `usr/lib/pipewire-0.3`, and `usr/share/pipewire/client.conf` are present, sets `SPA_PLUGIN_DIR`, `PIPEWIRE_MODULE_DIR`, and `PIPEWIRE_CONFIG_DIR`. A missing `APPDIR` or incomplete tree leaves the host configuration unchanged; development runs therefore do not consume or modify the staged paths.
+
+The Linux release job extracts the AppImage and runs:
+
+```bash
+node scripts/release/verify-appimage-pipewire.mjs "$extract_dir/squashfs-root"
+```
+
+The gate requires the AppImage executable, `usr/lib/libpipewire-0.3.so.0`, `usr/lib/libjack.so.0`, `usr/lib/spa-0.2/support/libspa-support.so`, `usr/lib/pipewire-0.3/libpipewire-module-protocol-native.so`, `usr/share/pipewire/client.conf`, and `usr/lib/gstreamer-1.0/libgstfluidsynthmidi.so`. It then compiles a temporary probe and runs it with the AppDir paths, creating a PipeWire main loop/context using `client.conf` and loading the bundled GStreamer plugin with `dlopen`. This checks runtime linkage and initialization rather than only checking file names.
+
+Video-bearing local media remains GPU-backed: on Linux, the GStreamer path requires DMA-BUF/NV12 negotiation. An unavailable or incompatible video decoder reports `Unsupported` instead of silently continuing with audio-only playback; no CPU/system-memory video fallback is promised.
+
 ## Automatic updates
 
 Packaged builds check `https://github.com/openhoo/hooviestar/releases/latest/download/latest.json` on startup with a 30-second metadata timeout. When a newer signed version exists, Hooviestar downloads it with a bounded 30-minute timeout, verifies the Tauri signature, installs it, and restarts. Development builds never check for updates.

@@ -8,7 +8,7 @@ Native GPU scene compositing for a clean Discord screen-share window on Windows 
 
 Hooviestar keeps scene setup, source controls, audio mixing, and preview tooling in one visible studio window. In Discord, select the virtual **Hooviestar – Program** app: it stays mapped for capture but outside the physical desktop, so controls and setup dialogs never become part of the shared output.
 
-> **Status:** Hooviestar is at version 0.1.12 and under active development. Build it from source and expect the project format and platform integration to evolve.
+> **Status:** Hooviestar is at version 0.1.13 and under active development. Build it from source and expect the project format and platform integration to evolve.
 
 ![Hooviestar studio with a text source selected](docs/screenshots/studio-with-source.png)
 
@@ -47,6 +47,8 @@ The screenshots show the Linux Tauri application. On Hyprland, Hooviestar uses X
 | Preview | Embedded native child surface | Hidden native Vulkan surface |
 | Bundle | NSIS installer | AppImage and Debian package |
 
+Local media with video stays on the native GPU path. On Linux, GStreamer must negotiate DMA-BUF/NV12 surfaces; if a video decoder is unavailable or incompatible, Hooviestar reports `Unsupported` instead of silently playing only the audio track. No CPU/system-memory video fallback is promised.
+
 ## Requirements
 
 - Node.js 24.x. The repository declares `>=24 <25`.
@@ -61,15 +63,16 @@ Linux additionally needs:
 - PipeWire and a desktop-specific xdg-desktop-portal implementation.
 - GStreamer with the base, good, and bad plugin sets.
 - WebKitGTK 4.1 and the native development headers used by Tauri.
+- `pkg-config` and the PipeWire development metadata used by AppImage staging.
 
 Ubuntu 24.04 and related distributions can install the build and runtime dependencies with:
 
 ```sh
 sudo apt update
 sudo apt install \
-  build-essential curl wget file libssl-dev libxdo-dev \
+  build-essential curl wget file pkg-config libssl-dev libxdo-dev \
   libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf \
-  libpipewire-0.3-dev libvulkan-dev libclang-dev \
+  libpipewire-0.3-dev libspa-0.2-modules pipewire-bin libjack-jackd2-0 libvulkan-dev libclang-dev \
   libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
   gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad
 ```
@@ -78,8 +81,8 @@ On Arch Linux, install the equivalent packages:
 
 ```sh
 sudo pacman -S --needed \
-  base-devel webkit2gtk-4.1 librsvg patchelf clang \
-  pipewire libpipewire vulkan-headers vulkan-icd-loader \
+  base-devel webkit2gtk-4.1 librsvg patchelf pkgconf clang \
+  pipewire pipewire-jack libpipewire vulkan-headers vulkan-icd-loader \
   gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad
 ```
 
@@ -159,6 +162,10 @@ npm run tauri build -- --bundles nsis --target x86_64-pc-windows-msvc --no-sign 
 ```
 
 The local override disables updater artifacts, so ordinary developers do not need the protected release signing key. `NO_STRIP=1` avoids the older `linuxdeploy` strip tool failing on modern `DT_RELR` libraries; `GSTREAMER_INCLUDE_BAD_PLUGINS=1` includes the runtime plugins Hooviestar uses. Windows also uses `--no-sign`; only the tag workflow produces publisher-signed release installers. Bundles are written below `target/<target>/release/bundle/`.
+
+On Linux, the Tauri `beforeBuildCommand` runs `node scripts/release/stage-pipewire-appimage.mjs`. It uses `pkg-config` to resolve the matching PipeWire and SPA directories, fails if required runtime directories or `spa-0.2/support/libspa-support.so`, `pipewire-0.3/libpipewire-module-protocol-native.so`, or `share/pipewire/client.conf` are missing, and stages every `libpipewire-0.3.so*` and `libjack.so*` file (including `libjack.so.0`), the SPA plugins, PipeWire modules, and config under `src-tauri/resources/pipewire`.
+
+At startup, Linux enables those staged paths only when `APPDIR` points to an AppImage tree containing `usr/lib/spa-0.2`, `usr/lib/pipewire-0.3`, and `usr/share/pipewire/client.conf`; it then sets `SPA_PLUGIN_DIR`, `PIPEWIRE_MODULE_DIR`, and `PIPEWIRE_CONFIG_DIR`. Development and other non-AppImage runs leave the host PipeWire configuration unchanged. The release gate extracts the AppImage and runs `scripts/release/verify-appimage-pipewire.mjs`, which checks the packaged runtime and exercises a PipeWire client-context plus bundled GStreamer-plugin loading probe.
 
 ## Test and qualify
 
