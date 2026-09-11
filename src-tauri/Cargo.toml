@@ -25,11 +25,12 @@ tauri = { version = "2.8", features = ["unstable"] }
 tauri-plugin-dialog = "2.4"
 tauri-plugin-global-shortcut = "2.3"
 tauri-plugin-single-instance = "2.4.4"
-tauri-plugin-updater = "2.10.1"
+tauri-plugin-updater = "2.11.0"
 tauri-plugin-window-state = "2.4.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 raw-window-handle = "0.6"
+gtk = { version = "0.18", features = ["v3_24"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.61", features = [

@@ -1,4 +1,4 @@
-import { memo, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import type { MediaRuntimeState, MediaSource, Source } from "../types";
 import { runGuarded } from "../guarded";
 
@@ -16,11 +16,30 @@ function MediaInspectorImpl({ source, mediaState, onUpdateSource, onSeek, onSetP
   const [positionError, setPositionError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const positionBaselineRef = useRef<string | null>(null);
+  const sourceIdRef = useRef(source.id);
+  sourceIdRef.current = source.id;
+
+  // Local input/error state belongs to one media source. Without resetting it
+  // on selection changes, a failed seek/action and an in-progress position
+  // draft leak into the next selected source.
+  useEffect(() => {
+    positionBaselineRef.current = null;
+    setPositionEditing(false);
+    setPositionDraft(String(Math.round(mediaState?.positionSeconds ?? 0)));
+    setPositionError(null);
+    setActionError(null);
+  }, [source.id]);
 
   // Macht Rejektionen der Sofort-Aktionen sichtbar, statt sie unbehandelt zu
   // lassen; die Meldung wird beim nächsten Versuch verworfen (Helfer: ../guarded).
   function guardAction(flow: Promise<unknown>) {
-    void runGuarded(() => flow, setActionError);
+    const sourceId = source.id;
+    void runGuarded(
+      () => flow,
+      (message) => {
+        if (sourceIdRef.current === sourceId) setActionError(message);
+      },
+    );
   }
 
   function togglePlaying() {
@@ -52,7 +71,10 @@ function MediaInspectorImpl({ source, mediaState, onUpdateSource, onSeek, onSetP
     positionBaselineRef.current = null;
     setPositionEditing(false);
     if (positionDraft.trim() === "" || !Number.isFinite(seconds) || seconds < 0 || unchanged) return;
-    onSeek(source.id, seconds).catch((error: unknown) => setPositionError(String(error)));
+    const sourceId = source.id;
+    onSeek(sourceId, seconds).catch((error: unknown) => {
+      if (sourceIdRef.current === sourceId) setPositionError(String(error));
+    });
   }
 
   function setLoop(checked: boolean) {

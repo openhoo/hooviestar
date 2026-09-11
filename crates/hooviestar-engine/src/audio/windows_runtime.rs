@@ -753,17 +753,39 @@ fn synchronize_sources(
             DesiredInput::Application(binding) => Some(binding),
             DesiredInput::Media => None,
         };
-        if let Some(handle) = handles.get_mut(source_id)
-            && handle.binding.as_ref() == desired_binding
-        {
-            if let Some(shared) = live.lock().get(source_id) {
-                if (handle.target_volume - *volume).abs() > f32::EPSILON {
-                    shared.gain.lock().set(*volume, 480);
-                    handle.target_volume = *volume;
+        let binding_matches = handles
+            .get(source_id)
+            .is_some_and(|handle| handle.binding.as_ref() == desired_binding);
+        if binding_matches {
+            let shared = live.lock().get(source_id).cloned();
+            let media_ring_matches = match desired_input {
+                DesiredInput::Media => shared.as_ref().is_some_and(|shared| {
+                    media_audio
+                        .lock()
+                        .get(source_id)
+                        .is_some_and(|current| Arc::ptr_eq(&shared.ring, current))
+                }),
+                DesiredInput::Application(_) => true,
+            };
+            if media_ring_matches {
+                if let (Some(handle), Some(shared)) = (handles.get_mut(source_id), shared) {
+                    if (handle.target_volume - *volume).abs() > f32::EPSILON {
+                        shared.gain.lock().set(*volume, 480);
+                        handle.target_volume = *volume;
+                    }
+                    shared.muted.store(*muted, Ordering::Relaxed);
                 }
-                shared.muted.store(*muted, Ordering::Relaxed);
+                continue;
             }
-            continue;
+            if matches!(desired_input, DesiredInput::Media) {
+                // The renderer replaced or removed the media ring. Do not
+                // keep mixing a detached old file while the new ring is
+                // opening; the next branch binds it when published.
+                handles.remove(source_id);
+                live.lock().remove(source_id);
+                last_overruns.remove(source_id);
+                stale_rings.remove(source_id);
+            }
         }
         // Neue Quelle oder geänderte Bindung: Der alte Capture bleibt bis
         // zur Fertigstellung des neuen bestehen — kein selbst verursachter

@@ -97,16 +97,22 @@ impl MediaVideoFrame {
 
 #[derive(Debug)]
 pub enum MediaNotice {
-    Video(MediaVideoFrame),
+    Video {
+        generation: u64,
+        frame: MediaVideoFrame,
+    },
     State {
+        generation: u64,
         source_id: Uuid,
         state: MediaRuntimeState,
     },
     Unsupported {
+        generation: u64,
         source_id: Uuid,
         reason: String,
     },
     SeekFailed {
+        generation: u64,
         source_id: Uuid,
         reason: String,
     },
@@ -141,6 +147,7 @@ pub struct LinuxMedia {
     commands: Arc<StdMutex<HashMap<Uuid, MediaWorker>>>,
     notice_tx: mpsc::SyncSender<MediaNotice>,
     notices: Arc<StdMutex<mpsc::Receiver<MediaNotice>>>,
+    next_generation: Arc<AtomicU64>,
 }
 impl LinuxMedia {
     pub fn start(_events: mpsc::Sender<EngineEvent>) -> Result<Self, String> {
@@ -150,6 +157,7 @@ impl LinuxMedia {
             commands: Arc::new(StdMutex::new(HashMap::new())),
             notice_tx,
             notices: Arc::new(StdMutex::new(notice_rx)),
+            next_generation: Arc::new(AtomicU64::new(1)),
         })
     }
     pub fn open(
@@ -158,14 +166,24 @@ impl LinuxMedia {
         path: &str,
         looped: bool,
         audio: &MediaAudioBus,
-    ) -> Result<(), String> {
+    ) -> Result<u64, String> {
         let uri = gst::glib::filename_to_uri(Path::new(path), None)
             .map_err(|e| format!("media URI: {e}"))?;
+        // A replacement must join the previous worker before the new one is
+        // spawned.  Otherwise an old appsink callback can publish its ring
+        // into the shared bus after the new worker has taken over the UUID.
+        let previous = self
+            .commands
+            .lock()
+            .map_err(|_| "media command lock poisoned".to_string())?
+            .remove(&source_id);
+        drop(previous);
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel();
         // Windows-Paritaet: existiert fuer die Quelle bereits ein
         // Bus-Ring (Sitzung ohne remove() neu eroeffnet), wird er
         // wiederverwendet statt einen neuen zu praegen; der Mixer
-        // behaelt seine Ring-Identitaet. Stale PCM wird beim Binden
+        // behaelt seine Ring-Identitaet. Stale PCM wird beim Binden,
         // verworfen, der Ring startet stumm.
         let ring = audio
             .lock()
@@ -184,7 +202,7 @@ impl LinuxMedia {
             .name(format!("gstreamer-media-{source_id}"))
             .spawn(move || {
                 if let Err(reason) = run_pipeline(
-                    source_id,
+                    (source_id, generation),
                     &uri,
                     looped,
                     rx,
@@ -192,7 +210,14 @@ impl LinuxMedia {
                     audio_bus,
                     notice_tx.clone(),
                 ) {
-                    send_control(&notice_tx, MediaNotice::Unsupported { source_id, reason });
+                    send_control(
+                        &notice_tx,
+                        MediaNotice::Unsupported {
+                            generation,
+                            source_id,
+                            reason,
+                        },
+                    );
                 }
             })
             .map_err(|error| error.to_string())?;
@@ -217,7 +242,7 @@ impl LinuxMedia {
         // Replacing a worker joins its thread. Never do that while holding
         // the command-map mutex: the renderer must remain responsive.
         drop(replaced);
-        Ok(())
+        Ok(generation)
     }
     pub fn command(&self, source_id: Uuid, command: MediaCommand) {
         if let Ok(commands) = self.commands.lock()
@@ -337,6 +362,7 @@ fn pace(pacer: &Mutex<MediaPacer>, pts_ns: u64, discont: bool) {
 fn send_unsupported_once(
     latch: &AtomicBool,
     notices: &mpsc::SyncSender<MediaNotice>,
+    generation: u64,
     source_id: Uuid,
     reason: String,
 ) {
@@ -344,7 +370,14 @@ fn send_unsupported_once(
     // video-frame try_sends cannot deadlock teardown, yet survives a full
     // channel long enough for the drain to catch up.
     if !latch.swap(true, Ordering::AcqRel) {
-        send_control(notices, MediaNotice::Unsupported { source_id, reason });
+        send_control(
+            notices,
+            MediaNotice::Unsupported {
+                generation,
+                source_id,
+                reason,
+            },
+        );
     }
 }
 
@@ -462,7 +495,7 @@ enum MediaAttempt {
 }
 
 fn run_pipeline(
-    source_id: Uuid,
+    (source_id, generation): (Uuid, u64),
     uri: &str,
     mut looped: bool,
     commands: mpsc::Receiver<MediaCommand>,
@@ -482,6 +515,7 @@ fn run_pipeline(
         budget.begin_attempt();
         let outcome = run_pipeline_once(
             source_id,
+            generation,
             uri,
             &mut looped,
             &commands,
@@ -503,6 +537,7 @@ fn run_pipeline(
                     send_unsupported_once(
                         &unsupported_latch,
                         &notices,
+                        generation,
                         source_id,
                         "Medium wiederholt fehlgeschlagen (wiederholtes Nachladen)".to_string(),
                     );
@@ -514,6 +549,7 @@ fn run_pipeline(
                     send_control(
                         &notices,
                         MediaNotice::State {
+                            generation,
                             source_id,
                             state: MediaRuntimeState {
                                 playing: false,
@@ -536,6 +572,7 @@ fn run_pipeline(
 #[allow(clippy::too_many_arguments)]
 fn run_pipeline_once(
     source_id: Uuid,
+    generation: u64,
     uri: &str,
     looped: &mut bool,
     commands: &mpsc::Receiver<MediaCommand>,
@@ -606,6 +643,7 @@ fn run_pipeline_once(
                         send_unsupported_once(
                             &unsupported_for_video,
                             &notice_for_video,
+                            generation,
                             source_id,
                             "Software-/Systemspeicher-Videodecoder abgelehnt; DMA-BUF erforderlich"
                                 .into(),
@@ -626,16 +664,19 @@ fn run_pipeline_once(
                     // First delivered DMA-BUF frame of this attempt: start
                     // the clean-stretch clock even for audio-less sources.
                     budget_for_video.note_sample();
-                    let _ = notice_for_video.try_send(MediaNotice::Video(MediaVideoFrame {
-                        source_id,
-                        sequence: sequence_for_video.fetch_add(1, Ordering::Relaxed),
-                        sample,
-                        width: info.width(),
-                        height: info.height(),
-                        timestamp_ns,
-                        drm_format: info.fourcc(),
-                        modifier: info.modifier(),
-                    }));
+                    let _ = notice_for_video.try_send(MediaNotice::Video {
+                        generation,
+                        frame: MediaVideoFrame {
+                            source_id,
+                            sequence: sequence_for_video.fetch_add(1, Ordering::Relaxed),
+                            sample,
+                            width: info.width(),
+                            height: info.height(),
+                            timestamp_ns,
+                            drm_format: info.fourcc(),
+                            modifier: info.modifier(),
+                        },
+                    });
                     Ok(gst::FlowSuccess::Ok)
                 })
                 .build(),
@@ -764,6 +805,7 @@ fn run_pipeline_once(
                         send_control(
                             notices,
                             MediaNotice::State {
+                                generation,
                                 source_id,
                                 state: MediaRuntimeState {
                                     playing: false,
@@ -800,6 +842,7 @@ fn run_pipeline_once(
                             send_control(
                                 notices,
                                 MediaNotice::SeekFailed {
+                                    generation,
                                     source_id,
                                     reason: format!("Seek fehlgeschlagen: {error:?}"),
                                 },
@@ -830,6 +873,7 @@ fn run_pipeline_once(
                             send_control(
                                 notices,
                                 MediaNotice::SeekFailed {
+                                    generation,
                                     source_id,
                                     reason: format!("Wiederholungs-Seek fehlgeschlagen: {error:?}"),
                                 },
@@ -891,7 +935,13 @@ fn run_pipeline_once(
                                 format!("DMA-BUF-Videounterhandlung fehlgeschlagen: {detail}")
                             }
                         };
-                        send_unsupported_once(unsupported_latch, notices, source_id, reason);
+                        send_unsupported_once(
+                            unsupported_latch,
+                            notices,
+                            generation,
+                            source_id,
+                            reason,
+                        );
                         ring.lock().set_active(false);
                         break;
                     }
@@ -922,6 +972,7 @@ fn run_pipeline_once(
         // Pipelines erzeugen sonst 25 Events/s ohne jeden Informationsgewinn.
         if last_state != Some(state) {
             let notice = MediaNotice::State {
+                generation,
                 source_id,
                 state: MediaRuntimeState {
                     playing,
@@ -945,6 +996,7 @@ fn run_pipeline_once(
     send_control(
         notices,
         MediaNotice::State {
+            generation,
             source_id,
             state: MediaRuntimeState {
                 playing: false,

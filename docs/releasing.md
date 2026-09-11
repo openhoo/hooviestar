@@ -79,13 +79,17 @@ git tag -a v0.2.0 -m 'Hooviestar v0.2.0'
 git push origin v0.2.0
 ```
 
-`.github/workflows/release.yml` verifies that the exact tagged commit belongs to `main` and that each stable version is newer than the currently published stable release. It builds both supported platforms, creates a draft, and publishes it only after the final verification job succeeds. The final job verifies each updater signature against the committed public key, then creates `latest.json` once from the complete uploaded installer/signature set, avoiding concurrent matrix updates to shared metadata. A failure deliberately leaves a draft rather than exposing a partial release.
+`.github/workflows/release.yml` verifies that the exact tagged commit belongs to `main` and that each stable version is newer than the currently published stable release. All release tags share one non-cancelling concurrency group, so an older, slower run cannot replace a newer stable release as `latest`. It builds both supported platforms and creates a draft. The final job verifies each updater signature against the committed public key, then creates `latest.json` once from the complete uploaded installer/signature set, avoiding concurrent matrix updates to shared metadata. Failures before publication leave a draft. Live download URLs and the immutable GitHub release attestation are verified after publication; a failure at that stage requires investigation and, for an asset defect, a new patch release.
+
+CI and release checkouts do not persist their GitHub token in Git configuration. Authenticated publication steps receive their token explicitly; dependency installation and build scripts do not inherit checkout credentials.
 
 If a job fails while the release is still a draft, fix the workflow or credentials and rerun the failed workflow. Never recreate or move the tag. After publication, assets and the tag are immutable. Any defect requires a new patch version and release; do not delete and try to reuse the old tag name.
 
 ## Automatic updates
 
 Packaged builds check `https://github.com/openhoo/hooviestar/releases/latest/download/latest.json` on startup with a 30-second metadata timeout. When a newer signed version exists, Hooviestar downloads it with a bounded 30-minute timeout, verifies the Tauri signature, installs it, and restarts. Development builds never check for updates.
+
+After the download has passed signature verification, the updater flushes pending project writes before starting installation. A failed flush aborts installation without stopping the running engine. Windows also performs a final best-effort flush in the installer exit hook; the updater dependency reports immediate installer-launch failures instead of unconditionally exiting. That hook cannot reject installation, so edits accepted after the successful barrier are not guaranteed durable if the final flush fails or the process exits before another save.
 
 Automatic update assets are the Windows NSIS installer, Linux AppImage, and Debian package. Tauri detects the package type embedded by the bundler, verifies the matching signature, and uses the matching `windows-x86_64-nsis`, `linux-x86_64-appimage`, or `linux-x86_64-deb` manifest entry. Debian upgrades request system authorization before running `dpkg -i`; users on desktops without a supported privilege prompt can still download and install the signed `.deb` manually.
 

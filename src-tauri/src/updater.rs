@@ -110,7 +110,21 @@ pub fn spawn(_app: AppHandle) {}
 #[cfg(not(debug_assertions))]
 async fn update(app: AppHandle) -> tauri_plugin_updater::Result<()> {
     emit(&app, UpdateStatus::Checking);
-    let updater = app.updater_builder().timeout(CHECK_TIMEOUT).build()?;
+    let hook_app = app.clone();
+    let updater = app
+        .updater_builder()
+        .timeout(CHECK_TIMEOUT)
+        // Windows installers can terminate the process directly, before
+        // Tauri emits RunEvent::Exit. Flush only: this hook runs before the
+        // installer is launched and an installation error must leave the
+        // running engine usable.
+        .on_before_exit(move || {
+            let resources = hook_app.state::<std::sync::Arc<crate::RuntimeResources>>();
+            if let Err(error) = resources.flush_for_updater() {
+                eprintln!("[hooviestar] updater pre-exit project flush failed: {error}");
+            }
+        })
+        .build()?;
     let Some(mut update) = updater.check().await? else {
         emit(&app, UpdateStatus::UpToDate);
         return Ok(());
@@ -133,11 +147,9 @@ async fn update(app: AppHandle) -> tauri_plugin_updater::Result<()> {
     );
     let download_app = app.clone();
     let download_version = version.clone();
-    let install_app = app.clone();
-    let install_version = version.clone();
     let mut downloaded = 0_u64;
-    update
-        .download_and_install(
+    let bytes = update
+        .download(
             move |chunk_length, content_length| {
                 downloaded = downloaded.saturating_add(chunk_length as u64);
                 emit(
@@ -148,18 +160,27 @@ async fn update(app: AppHandle) -> tauri_plugin_updater::Result<()> {
                     },
                 );
             },
-            move || {
-                emit(
-                    &install_app,
-                    UpdateStatus::Installing {
-                        version: install_version,
-                    },
-                );
-            },
+            || {},
         )
         .await?;
+
+    // Refuse to launch an installer when the durable project barrier failed.
+    // The pre-exit hook below is intentionally best-effort because the
+    // updater API cannot return a hook error; this check keeps a running app
+    // alive on persistence failure instead of handing it to the installer.
+    let resources = app.state::<std::sync::Arc<crate::RuntimeResources>>();
+    resources
+        .flush_for_updater()
+        .map_err(std::io::Error::other)?;
+    emit(
+        &app,
+        UpdateStatus::Installing {
+            version: version.clone(),
+        },
+    );
+    update.install(bytes)?;
     emit(&app, UpdateStatus::Installed { version });
-    app.restart();
+    app.restart()
 }
 
 #[cfg(any(not(debug_assertions), test))]

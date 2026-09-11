@@ -39,7 +39,9 @@ use super::{
 };
 use crate::{
     audio::MediaAudioBus,
-    engine::{DeviceRecoveryPhase, EngineEvent, NativeSurfaceKind, NativeSurfaces},
+    engine::{
+        DeviceRecoveryPhase, EngineEvent, MediaRuntimeState, NativeSurfaceKind, NativeSurfaces,
+    },
     project::{OutputConfig, ProjectV1, Scene, Source, Transform},
 };
 
@@ -1778,6 +1780,52 @@ struct MediaRuntimeBinding {
     opened: bool,
     retry_after: Option<Instant>,
     control_epoch: u64,
+    generation: u64,
+}
+
+/// A media notice is valid only for the worker incarnation that owns the
+/// current binding.  Notice delivery is asynchronous: a removed worker can
+/// leave State/Video/Unsupported messages queued while a replacement with the
+/// same source UUID is already running.
+fn media_notice_is_current(
+    notice: &MediaNotice,
+    media_sources: &HashMap<Uuid, MediaRuntimeBinding>,
+) -> bool {
+    let (source_id, generation) = match notice {
+        MediaNotice::Video { generation, frame } => (frame.source_id, *generation),
+        MediaNotice::State {
+            generation,
+            source_id,
+            ..
+        }
+        | MediaNotice::Unsupported {
+            generation,
+            source_id,
+            ..
+        }
+        | MediaNotice::SeekFailed {
+            generation,
+            source_id,
+            ..
+        } => (*source_id, *generation),
+    };
+    media_sources
+        .get(&source_id)
+        .is_some_and(|runtime| runtime.opened && runtime.generation == generation)
+}
+
+fn pause_media_control_if_current(
+    source_id: Uuid,
+    runtime: &MediaRuntimeBinding,
+    media_control: &MediaControlBus,
+) -> bool {
+    let mut bus = media_control.write();
+    let entry = bus.entry(source_id).or_default();
+    if entry.epoch != runtime.control_epoch {
+        return false;
+    }
+    entry.playing = false;
+    true
 }
 
 #[derive(Debug)]
@@ -2556,14 +2604,14 @@ fn reconcile_media_state(
             media_frames.remove(id);
         }
         if !media_sources.contains_key(id) {
-            let opened = match media.open(*id, path, *looped, media_audio) {
-                Ok(()) => true,
+            let (opened, generation) = match media.open(*id, path, *looped, media_audio) {
+                Ok(generation) => (true, generation),
                 Err(reason) => {
                     let _ = events.send(EngineEvent::UnsupportedMedia {
                         source_id: *id,
                         reason,
                     });
-                    false
+                    (false, 0)
                 }
             };
             media_sources.insert(
@@ -2580,6 +2628,7 @@ fn reconcile_media_state(
                         Some(Instant::now() + MEDIA_RETRY_COOLDOWN)
                     },
                     control_epoch: 0,
+                    generation,
                 },
             );
         }
@@ -2632,8 +2681,13 @@ fn reconcile_media_state(
         }
     }
     for notice in media.drain_notices() {
+        if !media_notice_is_current(&notice, media_sources) {
+            continue;
+        }
         match notice {
-            MediaNotice::State { source_id, state } => {
+            MediaNotice::State {
+                source_id, state, ..
+            } => {
                 if let Some(runtime) = media_sources.get_mut(&source_id) {
                     runtime.playing = state.playing;
                     // Windows-Paritaet: das vom Worker selbst
@@ -2652,18 +2706,34 @@ fn reconcile_media_state(
                 }
                 let _ = events.send(EngineEvent::MediaState { source_id, state });
             }
-            MediaNotice::Unsupported { source_id, reason } => {
+            MediaNotice::Unsupported {
+                source_id, reason, ..
+            } => {
                 media.remove(source_id, media_audio);
                 if let Some(runtime) = media_sources.get_mut(&source_id) {
+                    let _ = pause_media_control_if_current(source_id, runtime, media_control);
                     runtime.opened = false;
                     runtime.playing = false;
                     runtime.retry_after = Some(Instant::now() + MEDIA_RETRY_COOLDOWN);
                 }
                 media_frames.remove(&source_id);
                 available.remove(&source_id);
+                // Preserve the terminal state even though the worker's
+                // queued State(false) follows this Unsupported notice and
+                // the binding is already marked closed by this arm.
+                let _ = events.send(EngineEvent::MediaState {
+                    source_id,
+                    state: MediaRuntimeState {
+                        playing: false,
+                        position_seconds: 0.0,
+                        duration_seconds: None,
+                    },
+                });
                 let _ = events.send(EngineEvent::UnsupportedMedia { source_id, reason });
             }
-            MediaNotice::SeekFailed { source_id, reason } => {
+            MediaNotice::SeekFailed {
+                source_id, reason, ..
+            } => {
                 // Windows-Paritaet: ein fehlgeschlagener Seek
                 // meldet den Grund als UnsupportedMedia-Event,
                 // ohne die Sitzung zu verwerfen. Ein separater
@@ -2673,7 +2743,7 @@ fn reconcile_media_state(
                 // ohnehin, sodass das nächste State-Event fließt.
                 let _ = events.send(EngineEvent::UnsupportedMedia { source_id, reason });
             }
-            MediaNotice::Video(frame) => {
+            MediaNotice::Video { frame, .. } => {
                 let source_id = frame.source_id;
                 media_frames.insert(source_id, frame);
                 if available.insert(source_id) && !import_failures.contains_key(&source_id) {
@@ -4289,5 +4359,80 @@ mod tests {
         ));
         assert!(!static_texture_budget_allows(0, 1, 1));
         assert!(!static_texture_budget_allows(usize::MAX, 0, 1));
+    }
+    #[test]
+    fn stale_media_notice_is_rejected_after_same_source_reopen() {
+        let source_id = Uuid::from_u128(1);
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            source_id,
+            MediaRuntimeBinding {
+                path: "new.wav".into(),
+                looped: false,
+                visible: true,
+                playing: true,
+                opened: true,
+                retry_after: None,
+                control_epoch: 0,
+                generation: 2,
+            },
+        );
+        let stale = MediaNotice::Unsupported {
+            generation: 1,
+            source_id,
+            reason: "old worker".into(),
+        };
+        let current = MediaNotice::State {
+            generation: 2,
+            source_id,
+            state: MediaRuntimeState {
+                playing: false,
+                position_seconds: 0.0,
+                duration_seconds: None,
+            },
+        };
+        let current_playing = MediaNotice::State {
+            generation: 2,
+            source_id,
+            state: MediaRuntimeState {
+                playing: true,
+                position_seconds: 0.0,
+                duration_seconds: None,
+            },
+        };
+        assert!(!media_notice_is_current(&stale, &bindings));
+        assert!(media_notice_is_current(&current, &bindings));
+        bindings.get_mut(&source_id).unwrap().opened = false;
+        // Unsupported already emits the terminal state; queued worker
+        // notices must not clear its warning or revive the closed binding.
+        assert!(!media_notice_is_current(&current, &bindings));
+        assert!(!media_notice_is_current(&current_playing, &bindings));
+        let media_control = crate::video::media_control_bus();
+        media_control.write().insert(
+            source_id,
+            crate::video::MediaControl {
+                playing: true,
+                seek_seconds: None,
+                epoch: 0,
+            },
+        );
+        assert!(pause_media_control_if_current(
+            source_id,
+            bindings.get(&source_id).unwrap(),
+            &media_control
+        ));
+        assert!(!media_control.read().get(&source_id).unwrap().playing);
+        {
+            let mut bus = media_control.write();
+            let entry = bus.get_mut(&source_id).unwrap();
+            entry.playing = true;
+            entry.epoch = 1;
+        }
+        assert!(!pause_media_control_if_current(
+            source_id,
+            bindings.get(&source_id).unwrap(),
+            &media_control
+        ));
+        assert!(media_control.read().get(&source_id).unwrap().playing);
     }
 }

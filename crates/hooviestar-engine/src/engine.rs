@@ -429,6 +429,14 @@ impl EngineHandle {
         let _ = self.events.send(EngineEvent::Snapshot { project: next });
         Ok(())
     }
+    /// Persist all project changes without tearing down audio or rendering.
+    ///
+    /// The transition lock makes the barrier linear with commands: a flush
+    /// cannot overtake a concurrent snapshot mutation.
+    pub fn flush(&self) -> Result<(), EngineError> {
+        let _transition = self.transition.lock();
+        self.store.flush().map_err(Into::into)
+    }
     /// Teardown in fester Reihenfolge:
     /// 1) Audio-Runtime stoppen und Sitzungen wiederherstellen,
     /// 2) Renderer samt Swapchains abbauen,

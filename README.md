@@ -8,7 +8,7 @@ Native GPU scene compositing for a clean Discord screen-share window on Windows 
 
 Hooviestar keeps scene setup, source controls, audio mixing, and preview tooling in one visible studio window. In Discord, select the virtual **Hooviestar – Program** app: it stays mapped for capture but outside the physical desktop, so controls and setup dialogs never become part of the shared output.
 
-> **Status:** Hooviestar is at version 0.1.11 and under active development. Build it from source and expect the project format and platform integration to evolve.
+> **Status:** Hooviestar is at version 0.1.12 and under active development. Build it from source and expect the project format and platform integration to evolve.
 
 ![Hooviestar studio with a text source selected](docs/screenshots/studio-with-source.png)
 
@@ -105,6 +105,8 @@ The app creates three surfaces, but only the Studio is visible on the physical d
 3. **Hooviestar – Preview** is an internal native Linux render target. Windows renders the preview inside Studio.
 
 Do not minimize or reveal the Program surface. Hooviestar keeps it mapped and rendered automatically: in a hidden Hyprland special workspace on Wayland, outside the virtual desktop on X11 and Windows. This is necessary because a genuinely hidden/unmapped window is not available in Discord's application picker.
+
+Use **Studio beenden** or close the Studio window to exit the whole application. Hooviestar flushes the project and shuts down the capture/audio engine and both internal output surfaces; closing Studio does not leave an invisible background instance.
 
 On first start, Hooviestar creates three scenes:
 

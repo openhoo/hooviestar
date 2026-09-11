@@ -19,7 +19,6 @@ use hooviestar_engine::{
     SourceEnumeration,
 };
 use platform::NativePreview;
-#[cfg(target_os = "linux")]
 use tauri::WindowEvent;
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, window::WindowBuilder};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
@@ -109,6 +108,24 @@ impl RuntimeResources {
             visibility.cleanup();
         }
         self.portal.clear();
+    }
+    /// Persist the latest project before an updater can terminate the
+    /// process without sending Tauri's normal `RunEvent::Exit`.
+    ///
+    /// This deliberately does not stop the engine: the updater hook runs
+    /// before the installer is launched and the plugin may return from that
+    /// path on an installation error. The Windows audio watchdog handles
+    /// session restoration after the process is terminated.
+    #[cfg(not(debug_assertions))]
+    fn flush_for_updater(&self) -> Result<(), String> {
+        let engine = self
+            .engine
+            .lock()
+            .expect("engine mutex poisoned")
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "Engine ist noch nicht initialisiert".to_string())?;
+        engine.flush().map_err(|error| error.to_string())
     }
 }
 
@@ -781,6 +798,11 @@ pub fn run() {
     let run_resources = resources.clone();
     app.run(move |handle, event| match event {
         RunEvent::ExitRequested { .. } | RunEvent::Exit => run_resources.cleanup(handle),
+        RunEvent::WindowEvent {
+            label,
+            event: WindowEvent::Destroyed,
+            ..
+        } if label == "studio" => handle.exit(0),
         #[cfg(target_os = "linux")]
         RunEvent::WindowEvent {
             label,

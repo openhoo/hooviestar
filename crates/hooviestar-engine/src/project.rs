@@ -239,6 +239,15 @@ impl ProjectV1 {
             if source.name().trim().is_empty() {
                 return Err("source name is empty".into());
             }
+            // The wire parser rejects only truly empty paths (`str`), not
+            // whitespace. Keep persisted Rust projects on that same boundary
+            // so a malformed image/media source cannot reach the renderer.
+            if matches!(
+                source,
+                Source::Image { path, .. } | Source::Media { path, .. } if path.is_empty()
+            ) {
+                return Err("source path is empty".into());
+            }
             if let Source::Text {
                 color,
                 background_color,
@@ -436,6 +445,32 @@ mod tests {
             _ => unreachable!("test pushed an ApplicationAudio source"),
         }
         project.validate().unwrap();
+    }
+
+    #[test]
+    fn empty_image_and_media_paths_are_rejected() {
+        let sources = [
+            Source::Image {
+                id: Uuid::new_v4(),
+                name: "Bild".into(),
+                path: String::new(),
+            },
+            Source::Media {
+                id: Uuid::new_v4(),
+                name: "Video".into(),
+                path: String::new(),
+                looped: true,
+                continue_when_hidden: false,
+                restart_on_show: false,
+                volume: 1.0,
+                muted: false,
+            },
+        ];
+        for source in sources {
+            let mut project = ProjectV1::empty();
+            project.sources.push(source);
+            assert!(project.validate().is_err());
+        }
     }
 
     #[test]

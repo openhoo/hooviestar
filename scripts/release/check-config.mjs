@@ -160,7 +160,6 @@ expect(
   "second launch does not fully restore and focus Studio",
 );
 expect(tauriRuntime.includes("updater::spawn"), "automatic updater is not started");
-expect(updaterRuntime.includes("download_and_install"), "automatic update installation is missing");
 expect(updaterRuntime.includes("download_percentage"), "updater download progress is missing");
 expect(updaterRuntime.includes("UpdateStatus::Installing"), "updater install phase is missing");
 expect(taskbarRuntime.includes("set_progress_bar"), "native taskbar progress is missing");

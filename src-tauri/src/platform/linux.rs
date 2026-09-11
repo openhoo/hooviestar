@@ -1,6 +1,7 @@
 use std::{os::unix::process::CommandExt, process::Command, sync::Arc};
 
 use super::PreviewOverlayPayload;
+use gtk::prelude::WidgetExt;
 
 use hooviestar_engine::{
     NativeSurfaceKind, NativeSurfaces, SourceCandidate, SourceEnumeration,
@@ -104,15 +105,19 @@ impl OutputVisibility {
             VisibilityMode::HyprlandSpecialWorkspace => Ok(()),
             VisibilityMode::OffscreenX11 => {
                 let raw = window
-                    .window_handle()
+                    .display_handle()
                     .map_err(|error| error.to_string())?
                     .as_raw();
-                if !matches!(raw, RawWindowHandle::Xlib(_)) {
+                if !matches!(raw, RawDisplayHandle::Xlib(_)) {
                     return Err(
                         "Unsichtbare Discord-App-Ausgabe wird unter Wayland derzeit nur mit Hyprland unterstützt"
                             .into(),
                     );
                 }
+                window
+                    .gtk_window()
+                    .map_err(|error| error.to_string())?
+                    .realize();
                 window
                     .set_position(PhysicalPosition::new(-32_768, -32_768))
                     .map_err(|error| {
