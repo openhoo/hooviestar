@@ -317,6 +317,7 @@ fn set_preview_overlay(
     output_width: f64,
     output_height: f64,
     selection: Option<platform::PreviewOverlaySelection>,
+    hover: Option<platform::PreviewOverlaySelection>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let payload = platform::PreviewOverlayPayload {
@@ -324,6 +325,7 @@ fn set_preview_overlay(
         output_width,
         output_height,
         selection,
+        hover,
     };
     payload.validate()?;
     platform::set_preview_overlay(state.inner().preview, payload)

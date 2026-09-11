@@ -16,26 +16,30 @@ use windows::{
         Graphics::Gdi::{
             AC_SRC_ALPHA, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CreateCompatibleDC,
             CreateDIBSection, CreatePen, CreateSolidBrush, DIB_RGB_COLORS, DeleteDC, DeleteObject,
-            GdiFlush, HBRUSH, LineTo, MoveToEx, PS_DASH, PS_SOLID, RoundRect, SelectObject,
-            ValidateRect,
+            GdiFlush, HBRUSH, LineTo, MoveToEx, PS_DASH, PS_SOLID, RoundRect, ScreenToClient,
+            SelectObject, ValidateRect,
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
+            HiDpi::GetDpiForWindow,
             Input::KeyboardAndMouse::{
-                GetCapture, GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_MENU, VK_SHIFT,
+                GetCapture, GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT,
+                TrackMouseEvent, VK_CONTROL, VK_MENU, VK_SHIFT,
             },
             WindowsAndMessaging::{
                 CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW,
-                DestroyWindow, GW_HWNDPREV, GWLP_USERDATA, GetClientRect, GetSystemMetrics,
-                GetWindow, GetWindowLongPtrW, GetWindowRect, HTCLIENT, HTNOWHERE, HWND_BOTTOM,
-                HWND_TOP, IsIconic, IsWindowVisible, MA_ACTIVATE, RegisterClassExW,
-                SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-                SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-                SWP_SHOWWINDOW, SetWindowLongPtrW, SetWindowPos, ULW_ALPHA, UpdateLayeredWindow,
-                WINDOW_EX_STYLE, WM_CANCELMODE, WM_CAPTURECHANGED, WM_ERASEBKGND, WM_LBUTTONDOWN,
-                WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY,
-                WM_NCHITTEST, WM_PAINT, WM_SIZE, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN,
-                WS_CLIPSIBLINGS, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_VISIBLE,
+                DestroyWindow, GW_HWNDPREV, GWLP_USERDATA, GetClientRect, GetCursorPos,
+                GetSystemMetrics, GetWindow, GetWindowLongPtrW, GetWindowRect, HTCLIENT, HTNOWHERE,
+                HWND_BOTTOM, HWND_TOP, IDC_ARROW, IDC_NO, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS,
+                IDC_SIZENWSE, IDC_SIZEWE, IsIconic, IsWindowVisible, LoadCursorW, MA_NOACTIVATE,
+                RegisterClassExW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+                SM_YVIRTUALSCREEN, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+                SWP_NOZORDER, SWP_SHOWWINDOW, SetCursor, SetWindowLongPtrW, SetWindowPos,
+                ULW_ALPHA, UpdateLayeredWindow, WINDOW_EX_STYLE, WM_CANCELMODE, WM_CAPTURECHANGED,
+                WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE,
+                WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_SETCURSOR, WM_SIZE,
+                WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_LAYERED,
+                WS_EX_NOACTIVATE, WS_VISIBLE, WindowFromPoint,
             },
         },
     },
@@ -292,6 +296,10 @@ fn window_is_above(upper: HWND, lower: HWND) -> bool {
 const PREVIEW_INITIAL_WIDTH: i32 = 16;
 const PREVIEW_INITIAL_HEIGHT: i32 = 9;
 const OVERLAY_CLASS_NAME: windows::core::PCWSTR = w!("HooviestarNativePreviewOverlay");
+const WM_MOUSELEAVE_MESSAGE: u32 = 0x02a3;
+const HANDLE_HIT_TARGET_CSS_PX: f64 = 24.0;
+const HANDLE_GRIP_SIZE_CSS_PX: f64 = 10.0;
+const DEFAULT_DPI: f64 = 96.0;
 
 #[derive(Clone)]
 struct OverlayModel {
@@ -299,10 +307,12 @@ struct OverlayModel {
     output_width: f64,
     output_height: f64,
     selection: Option<super::PreviewOverlaySelection>,
+    hover: Option<super::PreviewOverlaySelection>,
 }
 
 struct PointerTracker {
     active: bool,
+    inside: bool,
     x: f64,
     y: f64,
 }
@@ -396,17 +406,48 @@ fn signed_word(value: isize, shift: u32) -> i32 {
     ((value as u32).wrapping_shr(shift) as u16 as i16) as i32
 }
 
-fn normalized_pointer(hwnd: HWND, lparam: LPARAM, state: &OverlayState) -> (f64, f64) {
-    let client_x = signed_word(lparam.0, 0);
-    let client_y = signed_word(lparam.0, 16);
+fn client_dimensions(hwnd: HWND) -> (f64, f64) {
     let mut client = RECT::default();
     let _ = unsafe { GetClientRect(hwnd, &mut client) };
-    let client_width = client.right.saturating_sub(client.left).max(1) as f64;
-    let client_height = client.bottom.saturating_sub(client.top).max(1) as f64;
+    (
+        client.right.saturating_sub(client.left).max(1) as f64,
+        client.bottom.saturating_sub(client.top).max(1) as f64,
+    )
+}
+
+fn normalized_from_client(
+    hwnd: HWND,
+    client_x: f64,
+    client_y: f64,
+    state: &OverlayState,
+) -> (f64, f64) {
+    let (client_width, client_height) = client_dimensions(hwnd);
     let model = state.model.lock().expect("preview model mutex poisoned");
-    let x = client_x as f64 / client_width * model.output_width;
-    let y = client_y as f64 / client_height * model.output_height;
-    (x, y)
+    (
+        client_x / client_width * model.output_width,
+        client_y / client_height * model.output_height,
+    )
+}
+
+fn normalized_pointer(hwnd: HWND, lparam: LPARAM, state: &OverlayState) -> (f64, f64) {
+    let client_x = signed_word(lparam.0, 0) as f64;
+    let client_y = signed_word(lparam.0, 16) as f64;
+    normalized_from_client(hwnd, client_x, client_y, state)
+}
+fn lparam_inside(hwnd: HWND, lparam: LPARAM) -> bool {
+    let client_x = signed_word(lparam.0, 0) as f64;
+    let client_y = signed_word(lparam.0, 16) as f64;
+    let (client_width, client_height) = client_dimensions(hwnd);
+    client_x >= 0.0 && client_x < client_width && client_y >= 0.0 && client_y < client_height
+}
+
+fn cursor_client_position(hwnd: HWND) -> Option<(f64, f64)> {
+    let mut point = POINT::default();
+    unsafe { GetCursorPos(&mut point).ok()? };
+    if unsafe { ScreenToClient(hwnd, &mut point) }.0 == 0 {
+        return None;
+    }
+    Some((point.x as f64, point.y as f64))
 }
 
 fn pointer_cancel(state: &OverlayState) -> Option<(f64, f64)> {
@@ -479,6 +520,297 @@ fn selection_points(
         )
     })
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResizeHandle {
+    NorthWest,
+    North,
+    NorthEast,
+    East,
+    SouthEast,
+    South,
+    SouthWest,
+    West,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PointerTarget {
+    None,
+    Move,
+    Resize(ResizeHandle),
+    Locked,
+}
+
+fn point_to_local(x: f64, y: f64, transform: &PreviewTransform) -> (f64, f64) {
+    let center_x = transform.x + transform.width * 0.5;
+    let center_y = transform.y + transform.height * 0.5;
+    let angle = transform.rotation_degrees.to_radians();
+    let cosine = angle.cos();
+    let sine = angle.sin();
+    (
+        cosine * (x - center_x) + sine * (y - center_y) + transform.width * 0.5,
+        -sine * (x - center_x) + cosine * (y - center_y) + transform.height * 0.5,
+    )
+}
+
+fn pointer_target_for_selection(
+    x: f64,
+    y: f64,
+    selection: &super::PreviewOverlaySelection,
+    hit_x: f64,
+    hit_y: f64,
+) -> PointerTarget {
+    let transform = &selection.transform;
+    let (local_x, local_y) = point_to_local(x, y, transform);
+    let inside = local_x >= 0.0
+        && local_x <= transform.width
+        && local_y >= 0.0
+        && local_y <= transform.height;
+    if selection.locked {
+        return if inside {
+            PointerTarget::Locked
+        } else {
+            PointerTarget::None
+        };
+    }
+    let near_left = local_x.abs() <= hit_x;
+    let near_right = (local_x - transform.width).abs() <= hit_x;
+    let near_top = local_y.abs() <= hit_y;
+    let near_bottom = (local_y - transform.height).abs() <= hit_y;
+    let within_horizontal_edge = local_x >= -hit_x && local_x <= transform.width + hit_x;
+    let within_vertical_edge = local_y >= -hit_y && local_y <= transform.height + hit_y;
+    let handle = if near_top && near_left {
+        Some(ResizeHandle::NorthWest)
+    } else if near_top && near_right {
+        Some(ResizeHandle::NorthEast)
+    } else if near_bottom && near_right {
+        Some(ResizeHandle::SouthEast)
+    } else if near_bottom && near_left {
+        Some(ResizeHandle::SouthWest)
+    } else if near_top && within_horizontal_edge {
+        Some(ResizeHandle::North)
+    } else if near_right && within_vertical_edge {
+        Some(ResizeHandle::East)
+    } else if near_bottom && within_horizontal_edge {
+        Some(ResizeHandle::South)
+    } else if near_left && within_vertical_edge {
+        Some(ResizeHandle::West)
+    } else {
+        None
+    };
+    handle.map_or_else(
+        || {
+            if inside {
+                PointerTarget::Move
+            } else {
+                PointerTarget::None
+            }
+        },
+        PointerTarget::Resize,
+    )
+}
+
+fn dpi_scale(hwnd: HWND) -> f64 {
+    let dpi = unsafe { GetDpiForWindow(hwnd) };
+    if dpi == 0 {
+        1.0
+    } else {
+        dpi as f64 / DEFAULT_DPI
+    }
+}
+
+fn pointer_target(hwnd: HWND, state: &OverlayState) -> PointerTarget {
+    let Some((client_x, client_y)) = cursor_client_position(hwnd) else {
+        return PointerTarget::None;
+    };
+    let (client_width, client_height) = client_dimensions(hwnd);
+    let (x, y) = normalized_from_client(hwnd, client_x, client_y, state);
+    let model = state.model.lock().expect("preview model mutex poisoned");
+    if !model.visible || !state.native_visible.load(Ordering::Acquire) {
+        return PointerTarget::None;
+    }
+    let hit_px = HANDLE_HIT_TARGET_CSS_PX * dpi_scale(hwnd) * 0.5;
+    let hit_x = hit_px / client_width * model.output_width;
+    let hit_y = hit_px / client_height * model.output_height;
+    let selected_target = model
+        .selection
+        .as_ref()
+        .map_or(PointerTarget::None, |selection| {
+            pointer_target_for_selection(x, y, selection, hit_x, hit_y)
+        });
+    if matches!(selected_target, PointerTarget::Resize(_)) {
+        return selected_target;
+    }
+    let hover_target =
+        model.hover.as_ref().map_or(
+            PointerTarget::None,
+            |hover| match pointer_target_for_selection(x, y, hover, hit_x, hit_y) {
+                PointerTarget::Locked => PointerTarget::Locked,
+                PointerTarget::None => PointerTarget::None,
+                PointerTarget::Move | PointerTarget::Resize(_) => PointerTarget::Move,
+            },
+        );
+    if hover_target != PointerTarget::None {
+        return hover_target;
+    }
+    selected_target
+}
+
+fn resize_cursor(handle: ResizeHandle, rotation_degrees: f64) -> windows::core::PCWSTR {
+    let local_angle = match handle {
+        ResizeHandle::East | ResizeHandle::West => 0.0,
+        ResizeHandle::NorthWest | ResizeHandle::SouthEast => 45.0,
+        ResizeHandle::North | ResizeHandle::South => 90.0,
+        ResizeHandle::NorthEast | ResizeHandle::SouthWest => 135.0,
+    };
+    let axis = ((local_angle + rotation_degrees).rem_euclid(180.0) / 45.0).round() as usize % 4;
+    [IDC_SIZEWE, IDC_SIZENWSE, IDC_SIZENS, IDC_SIZENESW][axis]
+}
+
+fn set_preview_cursor(hwnd: HWND, state: &OverlayState) -> LRESULT {
+    let target = pointer_target(hwnd, state);
+    let cursor = match target {
+        PointerTarget::Resize(handle) => {
+            let rotation_degrees = state
+                .model
+                .lock()
+                .expect("preview model mutex poisoned")
+                .selection
+                .as_ref()
+                .map_or(0.0, |selection| selection.transform.rotation_degrees);
+            resize_cursor(handle, rotation_degrees)
+        }
+        PointerTarget::Move => IDC_SIZEALL,
+        PointerTarget::Locked => IDC_NO,
+        PointerTarget::None => IDC_ARROW,
+    };
+    if let Ok(cursor) = unsafe { LoadCursorW(None, cursor) } {
+        unsafe {
+            SetCursor(Some(cursor));
+        }
+    }
+    LRESULT(1)
+}
+
+fn cursor_over_window(hwnd: HWND) -> bool {
+    let mut point = POINT::default();
+    if unsafe { GetCursorPos(&mut point) }.is_err() {
+        return false;
+    }
+    unsafe { WindowFromPoint(point) == hwnd }
+}
+
+fn refresh_preview_cursor(hwnd: HWND, state: &OverlayState) {
+    let owns_capture = unsafe { GetCapture() == hwnd };
+    if owns_capture || cursor_over_window(hwnd) {
+        let _ = set_preview_cursor(hwnd, state);
+    }
+}
+
+fn track_mouse_leave(hwnd: HWND) {
+    let mut tracking = TRACKMOUSEEVENT {
+        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+        dwFlags: TME_LEAVE,
+        hwndTrack: hwnd,
+        dwHoverTime: 0,
+    };
+    let _ = unsafe { TrackMouseEvent(&mut tracking) };
+}
+fn draw_guide(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    selection: &super::PreviewOverlaySelection,
+    output_size: (f64, f64),
+    client_size: (i32, i32),
+    dpi: f64,
+    selected: bool,
+) {
+    let (output_width, output_height) = output_size;
+    let (client_width, client_height) = client_size;
+    let line_color = if selected {
+        if selection.locked {
+            rgb(255, 178, 46)
+        } else {
+            rgb(155, 132, 255)
+        }
+    } else {
+        rgb(54, 225, 255)
+    };
+    let grip_fill = if selection.locked {
+        rgb(111, 72, 20)
+    } else {
+        rgb(255, 255, 255)
+    };
+    let dashed = selection.locked;
+    let draw_handles = selected && !selection.locked;
+    let points = selection_points(
+        &selection.transform,
+        output_width,
+        output_height,
+        client_width as f64,
+        client_height as f64,
+    );
+    let outline_color = rgb(2, 8, 18);
+    let outline_width = rounded_i32((2.0 * dpi).max(1.0));
+    let line_width = rounded_i32(dpi.max(1.0));
+    let outline_pen = unsafe { CreatePen(PS_SOLID, outline_width, outline_color) };
+    let line_pen = unsafe {
+        CreatePen(
+            if dashed { PS_DASH } else { PS_SOLID },
+            line_width,
+            line_color,
+        )
+    };
+    let previous_pen = unsafe { SelectObject(hdc, outline_pen.into()) };
+    unsafe {
+        let _ = MoveToEx(hdc, points[0].0, points[0].1, None);
+        for point in points.iter().skip(1).chain(std::iter::once(&points[0])) {
+            let _ = LineTo(hdc, point.0, point.1);
+        }
+        let _ = SelectObject(hdc, line_pen.into());
+        let _ = MoveToEx(hdc, points[0].0, points[0].1, None);
+        for point in points.iter().skip(1).chain(std::iter::once(&points[0])) {
+            let _ = LineTo(hdc, point.0, point.1);
+        }
+        let _ = SelectObject(hdc, previous_pen);
+        let _ = DeleteObject(outline_pen.into());
+        let _ = DeleteObject(line_pen.into());
+    }
+    if !draw_handles {
+        return;
+    }
+    let grip_half = rounded_i32((HANDLE_GRIP_SIZE_CSS_PX * dpi * 0.5).max(1.0));
+    let grip_outline = unsafe { CreatePen(PS_SOLID, line_width, outline_color) };
+    let grip_brush = unsafe { CreateSolidBrush(grip_fill) };
+    let previous_pen = unsafe { SelectObject(hdc, grip_outline.into()) };
+    let previous_brush = unsafe { SelectObject(hdc, grip_brush.into()) };
+    let clamp_center = |value: i32, extent: i32| {
+        let min = grip_half.min(extent.saturating_sub(1).max(0));
+        let max = extent.saturating_sub(grip_half).max(min);
+        value.clamp(min, max)
+    };
+    unsafe {
+        for (raw_x, raw_y) in points {
+            if raw_x < 0 || raw_x > client_width || raw_y < 0 || raw_y > client_height {
+                continue;
+            }
+            let x = clamp_center(raw_x, client_width);
+            let y = clamp_center(raw_y, client_height);
+            let _ = RoundRect(
+                hdc,
+                x.saturating_sub(grip_half),
+                y.saturating_sub(grip_half),
+                x.saturating_add(grip_half),
+                y.saturating_add(grip_half),
+                grip_half.min(4),
+                grip_half.min(4),
+            );
+        }
+        let _ = SelectObject(hdc, previous_pen);
+        let _ = SelectObject(hdc, previous_brush);
+        let _ = DeleteObject(grip_outline.into());
+        let _ = DeleteObject(grip_brush.into());
+    }
+}
+
 fn update_layered_overlay(hwnd: HWND, state: &OverlayState) -> Result<(), String> {
     let mut client = RECT::default();
     unsafe {
@@ -535,52 +867,27 @@ fn update_layered_overlay(hwnd: HWND, state: &OverlayState) -> Result<(), String
         .lock()
         .expect("preview model mutex poisoned")
         .clone();
-    if model.visible
-        && let Some(selection) = model.selection
-    {
-        let points = selection_points(
-            &selection.transform,
-            model.output_width,
-            model.output_height,
-            width as f64,
-            height as f64,
-        );
-        let line_color = if selection.locked {
-            rgb(255, 178, 46)
-        } else {
-            rgb(127, 118, 255)
-        };
-        let handle_fill = if selection.locked {
-            rgb(111, 72, 20)
-        } else {
-            rgb(35, 29, 92)
-        };
-        let pen_style = if selection.locked { PS_DASH } else { PS_SOLID };
-        let pen = unsafe { CreatePen(pen_style, 2, line_color) };
-        let brush = unsafe { CreateSolidBrush(handle_fill) };
-        let previous_pen = unsafe { SelectObject(hdc, pen.into()) };
-        let previous_brush = unsafe { SelectObject(hdc, brush.into()) };
-        unsafe {
-            let _ = MoveToEx(hdc, points[0].0, points[0].1, None);
-            for point in points.iter().skip(1).chain(std::iter::once(&points[0])) {
-                let _ = LineTo(hdc, point.0, point.1);
-            }
-            for (x, y) in points {
-                let half = 4;
-                let _ = RoundRect(
-                    hdc,
-                    x.saturating_sub(half),
-                    y.saturating_sub(half),
-                    x.saturating_add(half),
-                    y.saturating_add(half),
-                    3,
-                    3,
-                );
-            }
-            let _ = SelectObject(hdc, previous_pen);
-            let _ = SelectObject(hdc, previous_brush);
-            let _ = DeleteObject(pen.into());
-            let _ = DeleteObject(brush.into());
+    if model.visible {
+        let dpi = dpi_scale(hwnd);
+        if let Some(hover) = &model.hover {
+            draw_guide(
+                hdc,
+                hover,
+                (model.output_width, model.output_height),
+                (width, height),
+                dpi,
+                false,
+            );
+        }
+        if let Some(selection) = &model.selection {
+            draw_guide(
+                hdc,
+                selection,
+                (model.output_width, model.output_height),
+                (width, height),
+                dpi,
+                true,
+            );
         }
     }
     unsafe {
@@ -659,7 +966,8 @@ unsafe extern "system" fn preview_overlay_wndproc(
             };
             LRESULT(hit_test as isize)
         }
-        WM_MOUSEACTIVATE => LRESULT(MA_ACTIVATE as isize),
+        WM_SETCURSOR => set_preview_cursor(hwnd, state),
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
         WM_ERASEBKGND => LRESULT(1),
         WM_PAINT => {
             unsafe {
@@ -677,6 +985,7 @@ unsafe extern "system" fn preview_overlay_wndproc(
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
+            track_mouse_leave(hwnd);
             let (x, y) = normalized_pointer(hwnd, lparam, state);
             {
                 let mut pointer = state
@@ -684,6 +993,7 @@ unsafe extern "system" fn preview_overlay_wndproc(
                     .lock()
                     .expect("preview pointer mutex poisoned");
                 pointer.active = true;
+                pointer.inside = true;
                 pointer.x = x;
                 pointer.y = y;
             }
@@ -694,22 +1004,36 @@ unsafe extern "system" fn preview_overlay_wndproc(
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
+            track_mouse_leave(hwnd);
+            let (x, y) = normalized_pointer(hwnd, lparam, state);
+            {
+                let mut pointer = state
+                    .pointer
+                    .lock()
+                    .expect("preview pointer mutex poisoned");
+                pointer.inside = lparam_inside(hwnd, lparam);
+                pointer.x = x;
+                pointer.y = y;
+            }
+            emit_pointer_event(state, "move", x, y, wparam);
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE_MESSAGE => {
             let event = {
                 let mut pointer = state
                     .pointer
                     .lock()
                     .expect("preview pointer mutex poisoned");
-                if !pointer.active {
+                let was_inside = pointer.inside;
+                pointer.inside = false;
+                if pointer.active || !was_inside {
                     None
                 } else {
-                    let (x, y) = normalized_pointer(hwnd, lparam, state);
-                    pointer.x = x;
-                    pointer.y = y;
-                    Some((x, y))
+                    Some((pointer.x, pointer.y))
                 }
             };
             if let Some((x, y)) = event {
-                emit_pointer_event(state, "move", x, y, wparam);
+                emit_pointer_event(state, "leave", x, y, wparam);
             }
             LRESULT(0)
         }
@@ -723,16 +1047,24 @@ unsafe extern "system" fn preview_overlay_wndproc(
                     let (x, y) = normalized_pointer(hwnd, lparam, state);
                     pointer.x = x;
                     pointer.y = y;
+                    let inside = lparam_inside(hwnd, lparam);
+                    pointer.inside = inside;
+                    let leave = !inside;
                     pointer.active = false;
-                    Some((x, y))
+                    Some((x, y, leave))
                 } else {
                     None
                 }
             };
-            if let Some((x, y)) = event {
+            if let Some((x, y, leave)) = event {
                 emit_pointer_event(state, "up", x, y, wparam);
                 unsafe {
-                    let _ = ReleaseCapture();
+                    if GetCapture() == hwnd {
+                        let _ = ReleaseCapture();
+                    }
+                }
+                if leave {
+                    emit_pointer_event(state, "leave", x, y, wparam);
                 }
             }
             LRESULT(0)
@@ -794,9 +1126,11 @@ impl NativePreview {
                 output_width: PREVIEW_INITIAL_WIDTH as f64,
                 output_height: PREVIEW_INITIAL_HEIGHT as f64,
                 selection: None,
+                hover: None,
             }),
             pointer: Mutex::new(PointerTracker {
                 active: false,
+                inside: false,
                 x: 0.0,
                 y: 0.0,
             }),
@@ -1034,6 +1368,7 @@ pub fn set_preview_overlay(hwnd: usize, payload: PreviewOverlayPayload) -> Resul
             output_width: payload.output_width,
             output_height: payload.output_height,
             selection: payload.selection,
+            hover: payload.hover,
         };
     }
     let overlay_visible = payload.visible && entry.state.native_visible.load(Ordering::Acquire);
@@ -1056,6 +1391,7 @@ pub fn set_preview_overlay(hwnd: usize, payload: PreviewOverlayPayload) -> Resul
             format!("Preview-Overlay-Sichtbarkeit konnte nicht geändert werden: {error}")
         })?;
     }
+    refresh_preview_cursor(HWND(entry.overlay as *mut _), &entry.state);
     update_layered_overlay(HWND(entry.overlay as *mut _), &entry.state)
 }
 pub fn set_preview_visible(hwnd: usize, visible: bool) -> Result<(), String> {
@@ -1121,6 +1457,17 @@ pub fn set_preview_visible(hwnd: usize, visible: bool) -> Result<(), String> {
 mod tests {
     use super::{offscreen_program_position, rectangles_contain};
     use windows::Win32::Foundation::RECT;
+
+    #[test]
+    fn rotated_resize_cursors_cross_between_edge_and_diagonal_axes() {
+        use super::{
+            IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, ResizeHandle, resize_cursor,
+        };
+        assert_eq!(resize_cursor(ResizeHandle::East, 45.0), IDC_SIZENWSE);
+        assert_eq!(resize_cursor(ResizeHandle::SouthEast, 45.0), IDC_SIZENS);
+        assert_eq!(resize_cursor(ResizeHandle::North, 90.0), IDC_SIZEWE);
+        assert_eq!(resize_cursor(ResizeHandle::East, -45.0), IDC_SIZENESW);
+    }
 
     #[test]
     fn program_is_placed_left_of_single_monitor_desktop() {

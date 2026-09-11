@@ -33,6 +33,7 @@ pub struct PreviewOverlayPayload {
     pub output_width: f64,
     pub output_height: f64,
     pub selection: Option<PreviewOverlaySelection>,
+    pub hover: Option<PreviewOverlaySelection>,
 }
 
 impl PreviewOverlayPayload {
@@ -44,7 +45,7 @@ impl PreviewOverlayPayload {
         {
             return Err("Preview-Ausgabeabmessungen müssen endlich und positiv sein".into());
         }
-        if let Some(selection) = &self.selection {
+        for selection in [&self.selection, &self.hover].into_iter().flatten() {
             let transform = &selection.transform;
             if !transform.x.is_finite()
                 || !transform.y.is_finite()

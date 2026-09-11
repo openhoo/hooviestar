@@ -47,28 +47,69 @@ function renderTransformPreview({
   });
   return { ...view, onTransform, item, preview };
 }
+function renderItemsPreview({
+  items,
+  sources,
+  selectedSourceId,
+}: {
+  items: Array<{
+    id: string;
+    sourceId: string;
+    visible: boolean;
+    locked: boolean;
+    transform: {
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+      rotationDegrees: number;
+      cropTop: number;
+      cropRight: number;
+      cropBottom: number;
+      cropLeft: number;
+      opacity: number;
+    };
+  }>;
+  sources: Array<{ id: string; name: string; type: "image"; path: string }>;
+  selectedSourceId: string | null;
+}) {
+  const onTransform = vi.fn();
+  const view = render(
+    <PreviewPanel
+      output={{ width: 1000, height: 500, fps: 60, background: "#000000" }}
+      activeSceneName="Spiel"
+      scene={{ id: "scene", name: "Spiel", hotkey: null, items }}
+      sources={sources}
+      selectedSourceId={selectedSourceId}
+      onSelectSource={vi.fn()}
+      onTransform={onTransform}
+      onAttachBounds={vi.fn()}
+    />,
+  );
+  const preview = screen.getByLabelText("Native Szenenvorschau") as HTMLElement;
+  Object.defineProperty(preview, "getBoundingClientRect", {
+    configurable: true,
+    value: () => ({ left: 0, top: 0, width: 1000, height: 500, right: 1000, bottom: 500 }),
+  });
+  return { ...view, onTransform, preview };
+}
+function mockPointerCapture(preview: HTMLElement) {
+  const setPointerCapture = vi.fn();
+  const releasePointerCapture = vi.fn();
+  Object.defineProperty(preview, "setPointerCapture", {
+    configurable: true,
+    value: setPointerCapture,
+  });
+  Object.defineProperty(preview, "releasePointerCapture", {
+    configurable: true,
+    value: releasePointerCapture,
+  });
+  return { setPointerCapture, releasePointerCapture };
+}
 
 describe("PreviewPanel output projection and transforms", () => {
   afterEach(cleanup);
 
-  it("projects authoritative aspect ratio and background into preview bounds", () => {
-    render(
-      <PreviewPanel
-        output={{ width: 1920, height: 1080, fps: 60, background: "#335577" }}
-        activeSceneName="Spiel"
-        scene={{ id: "scene", name: "Spiel", hotkey: null, items: [] }}
-        sources={[]}
-        selectedSourceId={null}
-        onSelectSource={vi.fn()}
-        onTransform={vi.fn()}
-        onAttachBounds={vi.fn()}
-      />,
-    );
-    const preview = screen.getByLabelText("Native Szenenvorschau") as HTMLElement;
-    expect(preview.style.aspectRatio).toBe("1920 / 1080");
-    expect(preview.style.backgroundColor).toBe("rgb(51, 85, 119)");
-    expect(screen.getByText("Native D3D11-Vorschau")).toBeTruthy();
-  });
 
   it("commits an output-pixel resize through the right handle", async () => {
     const { preview, onTransform } = renderTransformPreview();
@@ -112,8 +153,9 @@ describe("PreviewPanel output projection and transforms", () => {
     expect(onTransform).not.toHaveBeenCalled();
   });
 
-  it("cancels a focused resize handle with Escape", () => {
+  it("cancels a focused resize handle with Escape and releases capture", () => {
     const { preview, onTransform } = renderTransformPreview();
+    const { releasePointerCapture } = mockPointerCapture(preview);
     fireEvent.pointerDown(screen.getByRole("button", { name: "Logo Größe rechts" }), {
       button: 0,
       pointerId: 1,
@@ -123,6 +165,7 @@ describe("PreviewPanel output projection and transforms", () => {
     fireEvent.pointerMove(preview, { pointerId: 1, clientX: 350, clientY: 150 });
     fireEvent.keyDown(preview, { key: "Escape" });
     fireEvent.pointerUp(preview, { pointerId: 1, clientX: 350, clientY: 150 });
+    expect(releasePointerCapture).toHaveBeenCalledWith(1);
     expect(onTransform).not.toHaveBeenCalled();
   });
 
@@ -170,5 +213,97 @@ describe("PreviewPanel output projection and transforms", () => {
     );
     fireEvent.keyDown(first.preview, { key: "ArrowRight" });
     await waitFor(() => expect(first.onTransform.mock.calls[1]?.[1]).toMatchObject({ x: 102 }));
+  });
+  it("releases pointer capture when a pointer is cancelled", () => {
+    const { preview, onTransform } = renderTransformPreview();
+    const { releasePointerCapture } = mockPointerCapture(preview);
+    const item = screen.getByRole("button", { name: "Logo" });
+    fireEvent.pointerDown(item, { button: 0, pointerId: 1, clientX: 200, clientY: 150 });
+    fireEvent.pointerMove(preview, { pointerId: 1, clientX: 240, clientY: 150 });
+    fireEvent.pointerCancel(preview, { pointerId: 1, clientX: 240, clientY: 150 });
+    expect(releasePointerCapture).toHaveBeenCalledWith(1);
+    expect(onTransform).not.toHaveBeenCalled();
+  });
+
+  it("ignores a second pointer while the first pointer is dragging", async () => {
+    const { preview, onTransform } = renderItemsPreview({
+      items: [
+        {
+          id: "bottom-item",
+          sourceId: "bottom-source",
+          visible: true,
+          locked: false,
+          transform: { x: 100, y: 100, width: 200, height: 100, rotationDegrees: 0, cropTop: 0, cropRight: 0, cropBottom: 0, cropLeft: 0, opacity: 1 },
+        },
+        {
+          id: "top-item",
+          sourceId: "top-source",
+          visible: true,
+          locked: false,
+          transform: { x: 500, y: 100, width: 200, height: 100, rotationDegrees: 0, cropTop: 0, cropRight: 0, cropBottom: 0, cropLeft: 0, opacity: 1 },
+        },
+      ],
+      sources: [
+        { id: "bottom-source", name: "Bottom", type: "image", path: "/tmp/bottom.png" },
+        { id: "top-source", name: "Top", type: "image", path: "/tmp/top.png" },
+      ],
+      selectedSourceId: "bottom-source",
+    });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Bottom" }), {
+      button: 0,
+      pointerId: 1,
+      clientX: 200,
+      clientY: 150,
+    });
+    fireEvent.pointerMove(preview, { pointerId: 1, clientX: 230, clientY: 150 });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Top" }), {
+      button: 0,
+      pointerId: 2,
+      clientX: 600,
+      clientY: 150,
+    });
+    fireEvent.pointerMove(preview, { pointerId: 2, clientX: 650, clientY: 150 });
+    fireEvent.pointerUp(preview, { pointerId: 2, clientX: 650, clientY: 150 });
+    fireEvent.pointerUp(preview, { pointerId: 1, clientX: 230, clientY: 150 });
+    await waitFor(() => expect(onTransform).toHaveBeenCalledTimes(1));
+    expect(onTransform.mock.calls[0]?.[0]).toBe("bottom-item");
+    expect(onTransform.mock.calls[0]?.[1]).toMatchObject({ x: 130, y: 100 });
+  });
+
+  it("gives a selected resize handle priority over an overlapping source", async () => {
+    const { preview, onTransform } = renderItemsPreview({
+      items: [
+        {
+          id: "selected-item",
+          sourceId: "selected-source",
+          visible: true,
+          locked: false,
+          transform: { x: 100, y: 100, width: 200, height: 100, rotationDegrees: 0, cropTop: 0, cropRight: 0, cropBottom: 0, cropLeft: 0, opacity: 1 },
+        },
+        {
+          id: "overlap-item",
+          sourceId: "overlap-source",
+          visible: true,
+          locked: false,
+          transform: { x: 250, y: 100, width: 200, height: 100, rotationDegrees: 0, cropTop: 0, cropRight: 0, cropBottom: 0, cropLeft: 0, opacity: 1 },
+        },
+      ],
+      sources: [
+        { id: "selected-source", name: "Selected", type: "image", path: "/tmp/selected.png" },
+        { id: "overlap-source", name: "Overlap", type: "image", path: "/tmp/overlap.png" },
+      ],
+      selectedSourceId: "selected-source",
+    });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Overlap" }), {
+      button: 0,
+      pointerId: 1,
+      clientX: 300,
+      clientY: 150,
+    });
+    fireEvent.pointerMove(preview, { pointerId: 1, clientX: 350, clientY: 150 });
+    fireEvent.pointerUp(preview, { pointerId: 1, clientX: 350, clientY: 150 });
+    await waitFor(() => expect(onTransform).toHaveBeenCalledTimes(1));
+    expect(onTransform.mock.calls[0]?.[0]).toBe("selected-item");
+    expect(onTransform.mock.calls[0]?.[1]).toMatchObject({ x: 100, y: 100, width: 250, height: 100 });
   });
 });

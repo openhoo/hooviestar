@@ -1,12 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
+import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
 import type { OutputConfig, Scene, SceneItem, Source, Transform } from "../types";
 import { isWindowsPlatform } from "../platform";
 
 interface NativePointerPayload {
-  phase: "down" | "move" | "up" | "cancel";
+  phase: "down" | "move" | "up" | "cancel" | "leave";
   pointerId: number;
   x: number;
   y: number;
@@ -45,6 +45,7 @@ interface Interaction {
   handle: ResizeHandle | null;
   start: OutputPoint;
   initial: Transform;
+  dragging: boolean;
 }
 
 interface DraftTransform {
@@ -53,7 +54,9 @@ interface DraftTransform {
 }
 
 const MIN_SIZE = 1;
-const HANDLE_HIT_SIZE = 14;
+/** Half of the 24 CSS-pixel handle hit target. */
+const HANDLE_HIT_SIZE = 12;
+const DRAG_THRESHOLD_CSS = 3;
 
 const HANDLE_NAMES: Record<ResizeHandle, string> = {
   nw: "oben links",
@@ -65,6 +68,14 @@ const HANDLE_NAMES: Record<ResizeHandle, string> = {
   sw: "unten links",
   w: "links",
 };
+function resizeCursorFor(handle: ResizeHandle, rotationDegrees: number): CSSProperties["cursor"] {
+  const localAngle = handle.length === 2
+    ? (handle === "nw" || handle === "se" ? 45 : 135)
+    : (handle === "n" || handle === "s" ? 90 : 0);
+  const normalized = ((localAngle + rotationDegrees) % 180 + 180) % 180;
+  const axis = Math.round(normalized / 45) % 4;
+  return ["ew-resize", "nwse-resize", "ns-resize", "nesw-resize"][axis] as CSSProperties["cursor"];
+}
 
 function tauriRuntimeAvailable(): boolean {
   return typeof window !== "undefined"
@@ -197,6 +208,11 @@ function isEditableTarget(target: EventTarget | null): boolean {
 function sourceIsVisual(source: Source | undefined): boolean {
   return Boolean(source && source.type !== "application_audio");
 }
+function formatPixel(value: number): string {
+  if (!Number.isFinite(value)) return "—";
+  const rounded = Math.round(value * 100) / 100;
+  return String(rounded);
+}
 
 function PreviewPanelImpl({
   output,
@@ -222,9 +238,18 @@ function PreviewPanelImpl({
   const onSelectSourceRef = useRef(onSelectSource);
   const onTransformRef = useRef(onTransform);
   const onTransformErrorRef = useRef(onTransformError);
-  const [draft, setDraft] = useState<DraftTransform | null>(null);
+  const [, setDraft] = useState<DraftTransform | null>(null);
   const [hoveredItemId, setHoveredItemId] = useState<string | null>(null);
+  const [interactingItemId, setInteractingItemId] = useState<string | null>(null);
   const [interactionError, setInteractionError] = useState<string | null>(null);
+
+  const releasePointerCapture = useCallback((pointerId: number) => {
+    try {
+      frameRef.current?.releasePointerCapture?.(pointerId);
+    } catch {
+      // Pointer capture is unavailable in jsdom and optional on embedded WebViews.
+    }
+  }, []);
 
   useEffect(() => {
     sceneRef.current = scene;
@@ -241,20 +266,29 @@ function PreviewPanelImpl({
     [scene.items, sources],
   );
   const selectedItem = scene.items.find((item) => item.sourceId === selectedSourceId) ?? null;
+  const selectedVisualItem = selectedItem
+    && selectedItem.visible
+    && sourceIsVisual(sources.find((source) => source.id === selectedItem.sourceId))
+    ? selectedItem
+    : null;
+
   useEffect(() => {
     const current = draftRef.current;
     if (current && !scene.items.some((item) => item.id === current.itemId)) {
       draftRef.current = null;
       setDraft(null);
     }
-    if (interactionRef.current && !scene.items.some((item) => item.id === interactionRef.current?.itemId)) {
+    const active = interactionRef.current;
+    if (active && !scene.items.some((item) => item.id === active.itemId)) {
       interactionRef.current = null;
+      releasePointerCapture(active.pointerId);
+      setInteractingItemId(null);
     }
     // A pointer-down may select a different source and start a drag in the
     // same event. Never clear that live interaction just because selection
     // changed; selection changes outside an interaction reset keyboard undo.
     if (!interactionRef.current) keyboardBaseRef.current = null;
-  }, [scene.id, selectedSourceId]);
+  }, [releasePointerCapture, scene.id, selectedSourceId]);
 
   useEffect(() => {
     const active = interactionRef.current;
@@ -263,6 +297,8 @@ function PreviewPanelImpl({
       : null;
     if (active && (!activeItem || !sameTransform(activeItem.transform, active.initial))) {
       interactionRef.current = null;
+      releasePointerCapture(active.pointerId);
+      setInteractingItemId(null);
       draftRef.current = null;
       setDraft(null);
       keyboardBaseRef.current = null;
@@ -291,7 +327,7 @@ function PreviewPanelImpl({
       setDraft(null);
       keyboardBaseRef.current = null;
     }
-  }, [scene.id, scene.items]);
+  }, [releasePointerCapture, scene.id, scene.items]);
 
   const setDraftValue = useCallback((next: DraftTransform | null) => {
     draftRef.current = next;
@@ -360,24 +396,53 @@ function PreviewPanelImpl({
     ) return HANDLE_HIT_SIZE;
     const scale = Math.min(rect.width / outputWidth, rect.height / outputHeight);
     return Number.isFinite(scale) && scale > 0
-      ? Math.max(HANDLE_HIT_SIZE, 12 / scale)
+      ? HANDLE_HIT_SIZE / scale
       : HANDLE_HIT_SIZE;
+  }, []);
+
+  const dragThreshold = useCallback(() => {
+    const rect = frameRef.current?.getBoundingClientRect();
+    const outputWidth = outputRef.current.width;
+    const outputHeight = outputRef.current.height;
+    if (
+      !rect
+      || rect.width <= 0
+      || rect.height <= 0
+      || outputWidth <= 0
+      || outputHeight <= 0
+    ) return DRAG_THRESHOLD_CSS;
+    const scale = Math.min(rect.width / outputWidth, rect.height / outputHeight);
+    return Number.isFinite(scale) && scale > 0
+      ? DRAG_THRESHOLD_CSS / scale
+      : DRAG_THRESHOLD_CSS;
   }, []);
 
   const itemAtPoint = useCallback((point: OutputPoint): SceneItem | null => {
     const currentScene = sceneRef.current;
     const currentSources = sourcesRef.current;
-    for (const item of [...currentScene.items].reverse()) {
-      if (!item.visible || !sourceIsVisual(currentSources.find((source) => source.id === item.sourceId))) continue;
+    for (let index = currentScene.items.length - 1; index >= 0; index -= 1) {
+      const item = currentScene.items[index];
+      if (!item || !item.visible || !sourceIsVisual(currentSources.find((source) => source.id === item.sourceId))) continue;
       if (itemContainsPoint(point, displayTransform(item))) return item;
     }
     return null;
   }, [displayTransform]);
 
+  const itemForHover = useCallback((point: OutputPoint): SceneItem | null => {
+    const item = itemAtPoint(point);
+    return item && item.sourceId !== selectedSourceIdRef.current ? item : null;
+  }, [itemAtPoint]);
+
+  const updateHover = useCallback((point: OutputPoint | null) => {
+    setHoveredItemId(point ? itemForHover(point)?.id ?? null : null);
+  }, [itemForHover]);
+
   const finishInteraction = useCallback((cancelled: boolean, pointerId?: number) => {
     const interaction = interactionRef.current;
     if (!interaction || (pointerId !== undefined && interaction.pointerId !== pointerId)) return;
     interactionRef.current = null;
+    setInteractingItemId(null);
+    releasePointerCapture(interaction.pointerId);
     const current = draftRef.current;
     const changed = current?.itemId === interaction.itemId
       && !sameTransform(current.transform, interaction.initial);
@@ -389,18 +454,20 @@ function PreviewPanelImpl({
     clearError();
     keyboardBaseRef.current = null;
     commitTransform(interaction.itemId, current.transform, interaction.initial);
-  }, [clearError, commitTransform, setDraftValue]);
+  }, [clearError, commitTransform, releasePointerCapture, setDraftValue]);
 
   const beginInteraction = useCallback((
     item: SceneItem,
     point: OutputPoint,
     pointerId: number,
     handle: ResizeHandle | null,
-  ) => {
+  ): boolean => {
+    if (interactionRef.current) return false;
     const initial = displayTransform(item);
     onSelectSourceRef.current(item.sourceId);
     clearError();
-    if (item.locked) return;
+    setHoveredItemId(null);
+    if (item.locked) return false;
     keyboardBaseRef.current = null;
     interactionRef.current = {
       itemId: item.id,
@@ -409,13 +476,20 @@ function PreviewPanelImpl({
       handle,
       start: point,
       initial,
+      dragging: false,
     };
+    setInteractingItemId(item.id);
+    return true;
   }, [clearError, displayTransform]);
 
   const moveInteraction = useCallback((point: OutputPoint, pointerId: number) => {
     const interaction = interactionRef.current;
     if (!interaction || interaction.pointerId !== pointerId || !finitePoint(point)) return;
     const delta = { x: point.x - interaction.start.x, y: point.y - interaction.start.y };
+    if (!interaction.dragging) {
+      if (Math.hypot(delta.x, delta.y) < dragThreshold()) return;
+      interaction.dragging = true;
+    }
     const transform = interaction.kind === "move"
       ? moveTransform(interaction.initial, delta)
       : resizeTransform(interaction.initial, interaction.handle!, delta);
@@ -424,85 +498,140 @@ function PreviewPanelImpl({
       return;
     }
     setDraftValue({ itemId: interaction.itemId, transform });
-  }, [setDraftValue]);
+  }, [dragThreshold, setDraftValue]);
 
   const handlePointerDown = useCallback((event: ReactPointerEvent<HTMLElement>) => {
-    if (event.button !== 0) return;
+    if (event.button !== 0 || interactionRef.current) return;
     const point = pointFromClient(event.clientX, event.clientY);
     if (!point) return;
     const itemElement = event.target instanceof Element ? event.target.closest<HTMLElement>("[data-preview-item]") : null;
     const itemId = itemElement?.dataset.previewItem;
-    const item = itemId
-      ? sceneRef.current.items.find((entry) => entry.id === itemId) ?? null
-      : itemAtPoint(point);
+    const currentSelected = sceneRef.current.items.find((item) =>
+      item.sourceId === selectedSourceIdRef.current
+      && item.visible
+      && sourceIsVisual(sourcesRef.current.find((source) => source.id === item.sourceId)),
+    );
+    const selectedHandle = currentSelected && !currentSelected.locked
+      ? handleAtPoint(point, displayTransform(currentSelected), handleHitSize())
+      : null;
+    const item = selectedHandle
+      ? currentSelected
+      : itemId
+        ? sceneRef.current.items.find((entry) => entry.id === itemId) ?? null
+        : itemAtPoint(point);
     if (!item) {
       onSelectSourceRef.current(null);
+      setHoveredItemId(null);
       return;
     }
     event.preventDefault();
     event.stopPropagation();
     frameRef.current?.focus({ preventScroll: true });
-    const handle = itemElement?.dataset.resize as ResizeHandle | undefined;
-    beginInteraction(item, point, event.pointerId, handle ?? null);
+    const targetHandle = itemElement?.dataset.resize as ResizeHandle | undefined;
+    const handle = selectedHandle ?? (item === currentSelected ? targetHandle ?? null : null);
+    const started = beginInteraction(item, point, event.pointerId, handle);
+    if (!started) return;
     try {
       frameRef.current?.setPointerCapture(event.pointerId);
     } catch {
       // Pointer capture is unavailable in jsdom and optional on embedded WebViews.
     }
-  }, [beginInteraction, itemAtPoint, pointFromClient]);
+  }, [beginInteraction, displayTransform, handleHitSize, itemAtPoint, pointFromClient]);
+
   const handlePointerMove = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
     const point = pointFromClient(event.clientX, event.clientY);
-    if (point) moveInteraction(point, event.pointerId);
-  }, [moveInteraction, pointFromClient]);
+    if (!point) return;
+    if (interactionRef.current) {
+      moveInteraction(point, event.pointerId);
+    } else {
+      updateHover(point);
+    }
+  }, [moveInteraction, pointFromClient, updateHover]);
 
   const handlePointerUp = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
     const point = pointFromClient(event.clientX, event.clientY);
-    if (point) moveInteraction(point, event.pointerId);
-    finishInteraction(false, event.pointerId);
-    try {
-      frameRef.current?.releasePointerCapture(event.pointerId);
-    } catch {
-      // Pointer capture is unavailable in jsdom and optional on embedded WebViews.
+    const interaction = interactionRef.current;
+    if (interaction?.pointerId === event.pointerId) {
+      if (point) moveInteraction(point, event.pointerId);
+      finishInteraction(false, event.pointerId);
+      updateHover(point);
+    } else if (!interaction && point) {
+      updateHover(point);
     }
-  }, [finishInteraction, moveInteraction, pointFromClient]);
+  }, [finishInteraction, moveInteraction, pointFromClient, updateHover]);
 
   const handlePointerCancel = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const interaction = interactionRef.current;
+    if (interaction?.pointerId !== event.pointerId) return;
     finishInteraction(true, event.pointerId);
+    setHoveredItemId(null);
   }, [finishInteraction]);
 
   const handleLostPointerCapture = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const interaction = interactionRef.current;
+    if (interaction?.pointerId !== event.pointerId) return;
     finishInteraction(true, event.pointerId);
+    setHoveredItemId(null);
   }, [finishInteraction]);
 
   const processNativePointer = useCallback((payload: NativePointerPayload) => {
+    if (payload.phase === "leave") {
+      if (!interactionRef.current) setHoveredItemId(null);
+      return;
+    }
     if (!Number.isFinite(payload.x) || !Number.isFinite(payload.y)) return;
     const point = { x: payload.x, y: payload.y };
     if (payload.phase === "down") {
+      if (interactionRef.current) return;
       frameRef.current?.focus({ preventScroll: true });
       const selected = sceneRef.current.items.find((item) =>
         item.sourceId === selectedSourceIdRef.current
         && item.visible
         && sourceIsVisual(sourcesRef.current.find((source) => source.id === item.sourceId)),
       );
-      const selectedHandle = selected ? handleAtPoint(point, displayTransform(selected), handleHitSize()) : null;
+      const selectedHandle = selected && !selected.locked
+        ? handleAtPoint(point, displayTransform(selected), handleHitSize())
+        : null;
       const item = selectedHandle ? selected : itemAtPoint(point);
       if (!item) {
         onSelectSourceRef.current(null);
+        setHoveredItemId(null);
         return;
       }
       const handle = item === selected ? selectedHandle : null;
       beginInteraction(item, point, payload.pointerId, handle);
       return;
     }
+    const interaction = interactionRef.current;
     if (payload.phase === "move") {
-      moveInteraction(point, payload.pointerId);
+      if (interaction) {
+        moveInteraction(point, payload.pointerId);
+      } else {
+        updateHover(point);
+      }
     } else if (payload.phase === "up") {
-      moveInteraction(point, payload.pointerId);
-      finishInteraction(false, payload.pointerId);
+      if (interaction?.pointerId === payload.pointerId) {
+        moveInteraction(point, payload.pointerId);
+        finishInteraction(false, payload.pointerId);
+        updateHover(point);
+      } else if (!interaction) {
+        updateHover(point);
+      }
     } else if (payload.phase === "cancel") {
-      finishInteraction(true, payload.pointerId);
+      if (!interaction || interaction.pointerId === payload.pointerId) {
+        finishInteraction(true, payload.pointerId);
+        setHoveredItemId(null);
+      }
     }
-  }, [beginInteraction, displayTransform, finishInteraction, handleHitSize, itemAtPoint, moveInteraction]);
+  }, [
+    beginInteraction,
+    displayTransform,
+    finishInteraction,
+    handleHitSize,
+    itemAtPoint,
+    moveInteraction,
+    updateHover,
+  ]);
 
   useEffect(() => {
     if (!isWindowsPlatform() || !tauriRuntimeAvailable()) return;
@@ -521,35 +650,44 @@ function PreviewPanelImpl({
     };
   }, [processNativePointer, reportError]);
 
-  const overlayTransform = selectedItem
-    ? (draft?.itemId === selectedItem.id ? draft.transform : selectedItem.transform)
+  const overlayTransform = selectedVisualItem ? displayTransform(selectedVisualItem) : null;
+  const hoveredItem = !interactingItemId && hoveredItemId
+    ? visualItems.find((item) => item.id === hoveredItemId) ?? null
     : null;
+  const hoverTransform = hoveredItem ? displayTransform(hoveredItem) : null;
   useEffect(() => {
     if (!isWindowsPlatform() || !tauriRuntimeAvailable()) return;
-    const selection = selectedItem
-      && selectedItem.visible
-      && overlayTransform
-      && sourceIsVisual(sources.find((source) => source.id === selectedItem.sourceId))
-      ? { transform: overlayTransform, locked: selectedItem.locked }
+    const selection = selectedVisualItem && overlayTransform
+      ? { transform: overlayTransform, locked: selectedVisualItem.locked }
+      : null;
+    const hover = hoveredItem
+      && hoverTransform
+      && hoveredItem.sourceId !== selectedSourceIdRef.current
+      ? { transform: hoverTransform, locked: hoveredItem.locked }
       : null;
     void invoke("set_preview_overlay", {
       visible: nativeOverlayVisible,
       outputWidth: output.width,
       outputHeight: output.height,
       selection,
+      hover,
     }).catch(reportError);
   }, [
+    hoverTransform,
+    hoveredItem,
     nativeOverlayVisible,
     output.height,
     output.width,
     overlayTransform,
     reportError,
-    selectedItem,
-    sources,
+    selectedVisualItem,
   ]);
 
   useEffect(() => {
-    const cancelOnWindowBlur = () => finishInteraction(true);
+    const cancelOnWindowBlur = () => {
+      finishInteraction(true);
+      setHoveredItemId(null);
+    };
     window.addEventListener("blur", cancelOnWindowBlur);
     return () => window.removeEventListener("blur", cancelOnWindowBlur);
   }, [finishInteraction]);
@@ -579,7 +717,14 @@ function PreviewPanelImpl({
       }
       return;
     }
-    if (!selected || selected.locked || event.ctrlKey || event.metaKey) return;
+    if (
+      !selected
+      || !selected.visible
+      || selected.locked
+      || !sourceIsVisual(sourcesRef.current.find((source) => source.id === selected.sourceId))
+      || event.ctrlKey
+      || event.metaKey
+    ) return;
     const movement = event.key === "ArrowLeft"
       ? { x: -1, y: 0 }
       : event.key === "ArrowRight"
@@ -611,12 +756,19 @@ function PreviewPanelImpl({
     onAttachBounds(node);
   }, [onAttachBounds]);
 
+  const selectedSourceName = selectedVisualItem
+    ? sources.find((source) => source.id === selectedVisualItem.sourceId)?.name ?? "Quelle"
+    : null;
+  const hasSelectionDetails = Boolean(selectedVisualItem && overlayTransform && selectedSourceName);
+  const canvasStyle = { "--preview-aspect": String(output.width / output.height) } as CSSProperties;
+
   return (
     <section className="preview-stage">
+      <div className="preview-canvas-area" style={canvasStyle}>
       <div
         id="native-preview-bounds"
         ref={setFrameRef}
-        className="preview-frame"
+        className={["preview-frame", interactingItemId ? "is-interacting" : ""].filter(Boolean).join(" ")}
         role="application"
         tabIndex={0}
         style={{
@@ -647,7 +799,6 @@ function PreviewPanelImpl({
               width: `${(transform.width / output.width) * 100}%`,
               height: `${(transform.height / output.height) * 100}%`,
               transform: `translate(-50%, -50%) rotate(${transform.rotationDegrees}deg)`,
-              opacity: Math.max(0.05, Math.min(1, transform.opacity)),
             };
             return (
               <div
@@ -657,6 +808,7 @@ function PreviewPanelImpl({
                   selected ? "selected" : "",
                   item.locked ? "locked" : "",
                   hoveredItemId === item.id ? "hovered" : "",
+                  interactingItemId === item.id ? "is-interacting" : "",
                 ].filter(Boolean).join(" ")}
                 data-preview-item={item.id}
                 style={style}
@@ -664,8 +816,11 @@ function PreviewPanelImpl({
                 tabIndex={selected ? 0 : -1}
                 aria-label={`${sourceName}${item.locked ? " (gesperrt)" : ""}`}
                 aria-pressed={selected}
+                aria-disabled={item.locked}
                 onFocus={() => onSelectSourceRef.current(item.sourceId)}
-                onMouseEnter={() => setHoveredItemId(item.id)}
+                onMouseEnter={() => {
+                  if (!interactionRef.current && !selected) setHoveredItemId(item.id);
+                }}
                 onMouseLeave={() => setHoveredItemId((current) => current === item.id ? null : current)}
               >
                 {selected && (
@@ -678,6 +833,7 @@ function PreviewPanelImpl({
                     key={handle}
                     type="button"
                     className={`preview-handle preview-handle-${handle}`}
+                    style={{ cursor: resizeCursorFor(handle, transform.rotationDegrees) }}
                     tabIndex={-1}
                     data-preview-item={item.id}
                     data-resize={handle}
@@ -693,10 +849,29 @@ function PreviewPanelImpl({
           })}
         </div>
         {interactionError && <p className="preview-error" role="alert">{interactionError}</p>}
-        <p className="preview-key-help">
-          Pfeile: Position · Shift + Pfeile: 10 px · Alt + Pfeile: Größe · Esc: Abbrechen
-        </p>
       </div>
+      </div>
+      <div
+        className="preview-selection-details"
+        data-empty={hasSelectionDetails ? "false" : "true"}
+        aria-label="Auswahl Details"
+        aria-live="polite"
+        aria-hidden={!hasSelectionDetails}
+      >
+        <strong className="preview-selection-name">{selectedSourceName ?? "\u00a0"}</strong>
+        <span className="preview-selection-state">
+          {selectedVisualItem?.locked ? "Gesperrt" : "\u00a0"}
+        </span>
+        <dl className="preview-selection-geometry">
+          <div><dt>X</dt><dd>{overlayTransform ? `${formatPixel(overlayTransform.x)} px` : "\u00a0"}</dd></div>
+          <div><dt>Y</dt><dd>{overlayTransform ? `${formatPixel(overlayTransform.y)} px` : "\u00a0"}</dd></div>
+          <div><dt>Breite</dt><dd>{overlayTransform ? `${formatPixel(overlayTransform.width)} px` : "\u00a0"}</dd></div>
+          <div><dt>Höhe</dt><dd>{overlayTransform ? `${formatPixel(overlayTransform.height)} px` : "\u00a0"}</dd></div>
+        </dl>
+      </div>
+      <p className="preview-editor-help preview-key-help">
+        Ziehen: verschieben · Griffe: Größe ändern · Pfeile: 1 px · Shift + Pfeile: 10 px · Alt + Pfeile: Größe · Esc: Abbrechen
+      </p>
     </section>
   );
 }

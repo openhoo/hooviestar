@@ -116,7 +116,9 @@ The default hotkeys also identify these roles when Hooviestar places newly added
 
 ### Editing scenes and sources
 
-Click a source in the preview or source dock to select it. The selection outline and eight resize handles identify the editable item; drag its body to move it or a handle to resize it. Rotated resizing keeps the opposite handle fixed. Locked items remain selectable but cannot be moved or resized, and their inspector fields are disabled.
+Click a source in the preview or source dock to select it. Hover highlights the source under the pointer; the selected item has a high-contrast outline and eight resize handles with 24-pixel interaction targets. Drag its body to move it or a handle to resize it. Rotated resizing keeps the opposite handle fixed. Locked items remain selectable but show no resize handles, cannot be moved or resized, and have disabled inspector fields.
+
+The preview fits the available space without changing the output aspect ratio. The source name, lock state, position, and dimensions remain visible below the canvas, including during a drag. Selection does not change the canvas geometry, and editing guides stay opaque even for transparent sources. A click without dragging does not change the transform; `Escape`, loss of focus, or pointer cancellation discards an unfinished drag.
 
 | Control | Action |
 | --- | --- |
